@@ -124,6 +124,7 @@ pub struct CaptureCallbacks {
     /// ~30 Hz RMS level in 0…1.
     pub on_level: Option<LevelFn>,
     /// Fired when the input device changed mid-recording (informational).
+    /// Receives the name of the new recording device.
     pub on_device_change: Option<MessageFn>,
     /// Fired once when disk writes fail persistently — captured audio up to that
     /// point is preserved; the coordinator should finalize early.
@@ -456,7 +457,7 @@ fn run_engine(args: EngineArgs, ready: SyncSender<Result<(), CaptureError>>) -> 
                     Ok(rebuilt) => {
                         stream = Some(rebuilt);
                         if let Some(on_device_change) = &callbacks.lock().on_device_change {
-                            on_device_change(format!("Switched to {name}"));
+                            on_device_change(name.clone());
                         }
                     }
                     Err(error) => {

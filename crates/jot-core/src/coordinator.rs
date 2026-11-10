@@ -75,7 +75,14 @@ pub const CANCEL_KEEP_THRESHOLD: f64 = 10.0;
 /// How often the trailing-capture loop re-reads the level.
 const TRAILING_POLL: Duration = Duration::from_millis(60);
 
-pub const COACH_TIP: &str = "Hold to talk · tap Space while holding for hands-free";
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CoachingHint {
+    HoldToTalk,
+    SecureField,
+    DeviceChanged(String),
+    TimeLimit,
+    MicrophoneStopped,
+}
 
 /// Everything a surface needs to render, pushed rather than polled.
 #[derive(Debug, Clone, PartialEq)]
@@ -84,7 +91,7 @@ pub enum CoordinatorUpdate {
     MicLevel(f32),
     /// A neutral, informational line: a coaching tip, a device change, a
     /// refusal. `None` clears it.
-    CoachingHint(Option<String>),
+    CoachingHint(Option<CoachingHint>),
     /// The text that just landed, for "paste last" and the success badge.
     Result(String),
     SilenceReason(SilenceReason),
@@ -269,14 +276,14 @@ impl DictationCoordinator {
         match state {
             DictationState::Recording { locked: true } => self.finalize_session(),
             DictationState::Warming | DictationState::Recording { .. } => {
-                self.cancel_session(Some(COACH_TIP.into()));
+                self.cancel_session(Some(CoachingHint::HoldToTalk));
             }
             DictationState::Finalizing
             | DictationState::Transcribing
             | DictationState::Inserting => {
                 tracing::info!("short tap ignored — session in flight");
             }
-            _ => self.emit_hint(Some(COACH_TIP.into())),
+            _ => self.emit_hint(Some(CoachingHint::HoldToTalk)),
         }
     }
 
@@ -313,9 +320,7 @@ impl DictationCoordinator {
         }
         // Never record over a password field.
         if (self.deps.secure_field_focused)() {
-            self.emit_hint(Some(
-                "Can't dictate here — a password field has focus".into(),
-            ));
+            self.emit_hint(Some(CoachingHint::SecureField));
             tracing::info!("begin refused: password field focused");
             return false;
         }
@@ -390,12 +395,12 @@ impl DictationCoordinator {
         }));
 
         let coordinator = self.clone();
-        callbacks.on_device_change = Some(Box::new(move |message| {
-            tracing::info!(message, "device change surfaced");
+        callbacks.on_device_change = Some(Box::new(move |name| {
+            tracing::info!(%name, "device change surfaced");
             // A mid-recording mic switch must be VISIBLE: an auto-connecting
             // headset changes what is being recorded.
             if coordinator.inner.lock().state.is_recording() {
-                coordinator.emit_hint(Some(message));
+                coordinator.emit_hint(Some(CoachingHint::DeviceChanged(name)));
             }
         }));
 
@@ -477,7 +482,7 @@ impl DictationCoordinator {
             crate::runtime::spawn(async move {
                 tokio::time::sleep(RECORDING_WARN).await;
                 if coordinator.inner.lock().state.is_recording() {
-                    coordinator.emit_hint(Some("One minute left — 10-minute limit".into()));
+                    coordinator.emit_hint(Some(CoachingHint::TimeLimit));
                 }
             })
             .abort_handle()
@@ -516,7 +521,7 @@ impl DictationCoordinator {
         }
         tracing::error!(message, "audio engine died mid-recording");
         self.update_meta(|meta| meta.error_code = Some("engine_died".into()));
-        self.emit_hint(Some(format!("{message} — dictating what was captured")));
+        self.emit_hint(Some(CoachingHint::MicrophoneStopped));
         self.finalize_session();
     }
 
@@ -917,7 +922,7 @@ impl DictationCoordinator {
         inner.session = None;
     }
 
-    fn cancel_session(self: &Arc<Self>, hint: Option<String>) {
+    fn cancel_session(self: &Arc<Self>, hint: Option<CoachingHint>) {
         let (engine, was_finalizing) = {
             let mut inner = self.inner.lock();
             let was_finalizing = inner.state == DictationState::Finalizing;
@@ -1022,7 +1027,7 @@ impl DictationCoordinator {
         }
     }
 
-    fn emit_hint(&self, hint: Option<String>) {
+    fn emit_hint(&self, hint: Option<CoachingHint>) {
         let _ = self.updates.send(CoordinatorUpdate::CoachingHint(hint));
     }
 

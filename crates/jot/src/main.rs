@@ -27,6 +27,7 @@ mod file_dialog;
 mod hotkey_hook;
 #[cfg(target_os = "windows")]
 mod hud_validation;
+mod i18n;
 mod pill;
 mod services;
 #[cfg(target_os = "windows")]
@@ -95,6 +96,11 @@ fn main() -> Result<()> {
         !test_settings || jot_core::test_profile::root().is_some(),
         "--test-settings requires an isolated profile"
     );
+    i18n::select(
+        jot_core::settings::SettingsStore::global()
+            .get()
+            .ui_language,
+    );
     #[cfg(target_os = "windows")]
     let _instance = match single_instance::acquire() {
         Ok(instance) => instance,
@@ -140,8 +146,8 @@ fn main() -> Result<()> {
     let app_services = services.clone();
     application().run(move |cx: &mut App| {
         theme::load_fonts(cx);
-        // Jot has no dock presence and no main window: closing the last window
-        // must leave the tray icon and the dictation key working.
+        views::widgets::install_keyboard_navigation(cx);
+        // Closing the workspace leaves the tray icon and dictation running.
         cx.set_quit_mode(gpui::QuitMode::Explicit);
 
         let hud = match open_hud(cx, app_services.settings.get().show_idle_indicator) {
@@ -158,12 +164,12 @@ fn main() -> Result<()> {
         handle_tray(tray_commands, hud, app_services.clone(), cx);
 
         if test_settings {
-            views::open_settings(&app_services, cx);
+            views::open_workspace(views::Route::Settings, &app_services, cx);
             cx.spawn(async move |cx| {
                 cx.background_executor()
                     .timer(Duration::from_secs(60))
                     .await;
-                let _ = cx.update(|cx| cx.quit());
+                cx.update(|cx| cx.quit());
             })
             .detach();
         } else if !app_services.settings.get().has_completed_onboarding {
@@ -319,7 +325,7 @@ fn drive_pill(hud: WindowHandle<PillView>, services: Services, cx: &mut App) {
                     let _ = hud.update(cx, |view, _, cx| {
                         // A hint never overwrites a live recording's waveform.
                         if !matches!(view.state, PillState::Listening { .. }) {
-                            view.state = PillState::Notice(hint.into());
+                            view.state = PillState::Notice(pill::coaching_message(hint));
                             cx.notify();
                         }
                     });
@@ -441,9 +447,15 @@ fn handle_tray(
                         services.coordinator.handle(HotkeyIntent::LockIn);
                     }
                 }
-                TrayCommand::OpenHistory => views::open_history(&services, cx),
-                TrayCommand::OpenDictionary => views::open_dictionary(&services, cx),
-                TrayCommand::OpenSettings => views::open_settings(&services, cx),
+                TrayCommand::OpenHistory => {
+                    views::open_workspace(views::Route::History, &services, cx)
+                }
+                TrayCommand::OpenDictionary => {
+                    views::open_workspace(views::Route::Dictionary, &services, cx)
+                }
+                TrayCommand::OpenSettings => {
+                    views::open_workspace(views::Route::Settings, &services, cx)
+                }
                 TrayCommand::OpenOnboarding => views::open_onboarding(&services, cx),
                 TrayCommand::About => views::open_about(cx),
                 TrayCommand::Quit => cx.quit(),

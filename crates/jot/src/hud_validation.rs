@@ -154,14 +154,16 @@ fn capture(rect: RECT, file: &Path) -> Result<Vec<u8>> {
         let mut bitmap = HBITMAP::default();
         let mut old = HGDIOBJ::default();
         let result = (|| -> Result<Vec<u8>> {
-            let mut info = BITMAPINFO::default();
-            info.bmiHeader = BITMAPINFOHEADER {
-                biSize: 40,
-                biWidth: width,
-                biHeight: -height,
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
+            let info = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: 40,
+                    biWidth: width,
+                    biHeight: -height,
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
                 ..Default::default()
             };
             let mut bits = std::ptr::null_mut();
@@ -310,6 +312,7 @@ pub fn run(directory: PathBuf) -> Result<()> {
     let error = Arc::new(parking_lot::Mutex::new(None));
     let app_error = error.clone();
     let show_idle = !std::env::args().any(|arg| arg == "--initially-hidden");
+    crate::i18n::select(jot_core::settings::UiLanguage::Automatic);
     application().run(move |cx: &mut App| {
         theme::load_fonts(cx);
         cx.set_quit_mode(gpui::QuitMode::Explicit);
@@ -336,8 +339,8 @@ pub fn run(directory: PathBuf) -> Result<()> {
                         ("locked", PillState::Listening { locked: true }),
                         ("processing", PillState::Processing),
                         ("success", PillState::Success { words: 7 }),
-                        ("notice", PillState::Notice("Copied — press Ctrl+V to paste".into())),
-                        ("error", PillState::Error("Validation error".into())),
+                        ("notice", PillState::Notice(crate::i18n::Msg::HudCopied.into())),
+                        ("error", PillState::Error(pill::failure_message(jot_core::state_machine::DictationFailure::Audio))),
                         ("hidden-end", PillState::Hidden),
                     ] {
                         let hwnd = hud.update(cx, |view, window, cx| {
@@ -389,6 +392,9 @@ pub fn run(directory: PathBuf) -> Result<()> {
                         let pill_hit_drawn_pixel = pill_sample != [120,90,60];
                         for (x, y) in [(rect.left + x as i32, rect.top + pill_y as i32), (rect.left + 4, rect.top + 4)] {
                             unsafe {
+                                if GetForegroundWindow() != target.hwnd {
+                                    break;
+                                }
                                 SetCursorPos(x, y)?;
                                 let inputs = [MOUSEEVENTF_LEFTDOWN, MOUSEEVENTF_LEFTUP].map(|flags| INPUT {
                                     r#type: INPUT_MOUSE, Anonymous: INPUT_0 { mi: MOUSEINPUT { dwFlags: flags, ..Default::default() } }
@@ -416,9 +422,11 @@ pub fn run(directory: PathBuf) -> Result<()> {
                             "class":String::from_utf16_lossy(&class[..class_len as usize]),"parent":parent.0 as usize,"owner":owner.0 as usize,"target_pid":target.child.id(),"style":format!("0x{style:08X}"),"ex_style":format!("0x{ex_style:08X}"),
                             "rect":[rect.left,rect.top,rect.right,rect.bottom],"visible_pixels":visible_pixels,
                             "rendered":rendered,"backdrop_ok":backdrop_ok,"pill_click":[rect.left+x as i32,rect.top+pill_y as i32],"pill_sample_bgr":pill_sample,"pill_hit_drawn_pixel":pill_hit_drawn_pixel,"received_clicks":clicks,"expected_clicks":2,"focus_ok":focus_ok,
-                            "topmost":ex_style & WS_EX_TOPMOST.0 != 0});
+                            "topmost":ex_style & WS_EX_TOPMOST.0 != 0,"focus_before_hwnd":focus_before.0 as usize,
+                            "focus_after_hwnd":focus_after.0 as usize});
                         rows.push(row);
                         std::fs::write(directory.join("result.json"), serde_json::to_vec_pretty(&rows)?)?;
+                        ensure!(focus_ok, "HUD validation interrupted: target lost foreground ({name})");
                     }
                 }
                 }
@@ -427,7 +435,7 @@ pub fn run(directory: PathBuf) -> Result<()> {
             }.await;
             if let Err(e) = result { *app_error.lock() = Some(format!("{e:#}")); }
             drop(target);
-            let _ = cx.update(|cx| cx.quit());
+            cx.update(|cx| cx.quit());
         }).detach();
     });
     if let Some(error) = error.lock().take() {

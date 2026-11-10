@@ -28,6 +28,7 @@
 //! against the field rather than the caret, and there is no word-wise motion or
 //! double-click-to-select-word.
 
+use crate::i18n::{Msg, tr};
 use crate::theme::{self, Theme};
 use gpui::{
     Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
@@ -50,6 +51,32 @@ struct Snapshot {
 /// Emitted when the user presses Enter.
 pub struct Submit;
 
+pub enum FieldLabel {
+    Fixed(&'static str),
+    Translated(Msg),
+}
+
+impl FieldLabel {
+    fn text(&self) -> &'static str {
+        match *self {
+            Self::Fixed(text) => text,
+            Self::Translated(message) => tr(message),
+        }
+    }
+}
+
+impl From<&'static str> for FieldLabel {
+    fn from(text: &'static str) -> Self {
+        Self::Fixed(text)
+    }
+}
+
+impl From<Msg> for FieldLabel {
+    fn from(message: Msg) -> Self {
+        Self::Translated(message)
+    }
+}
+
 pub struct TextField {
     /// Stable and unique within its window. Several fields share a pane, and a
     /// duplicate id collapses two of them into one accessibility node.
@@ -60,7 +87,7 @@ pub struct TextField {
     selection: Range<usize>,
     /// Byte range of the in-progress IME composition, if any.
     marked: Option<Range<usize>>,
-    pub placeholder: SharedString,
+    placeholder: FieldLabel,
     /// Renders as bullets and never reaches the clipboard through this field.
     pub masked: bool,
     pub focus_handle: FocusHandle,
@@ -85,7 +112,7 @@ impl Focusable for TextField {
 impl TextField {
     pub fn new(
         id: impl Into<SharedString>,
-        placeholder: impl Into<SharedString>,
+        placeholder: impl Into<FieldLabel>,
         cx: &mut Context<Self>,
     ) -> Self {
         Self {
@@ -95,7 +122,7 @@ impl TextField {
             marked: None,
             placeholder: placeholder.into(),
             masked: false,
-            focus_handle: cx.focus_handle(),
+            focus_handle: cx.focus_handle().tab_index(0).tab_stop(true),
             last_bounds: None,
             undo: Vec::new(),
             redo: Vec::new(),
@@ -544,7 +571,7 @@ impl EntityInputHandler for TextField {
 
 impl Render for TextField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::current(window.appearance(), crate::window_shell::high_contrast());
+        let theme = Theme::ui(window);
         let focused = self.focus_handle.is_focused(window);
         let empty = self.content.is_empty();
 
@@ -599,9 +626,8 @@ impl Render for TextField {
         div()
             .id(self.id.clone())
             .role(Role::TextInput)
-            .aria_label(self.placeholder.clone())
+            .aria_label(self.placeholder.text())
             .track_focus(&self.focus_handle)
-            .tab_stop(true)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(
                 gpui::MouseButton::Left,
@@ -670,7 +696,7 @@ impl Render for TextField {
                     .child(
                         div()
                             .text_color(theme.on_surface_variant)
-                            .child(self.placeholder.clone()),
+                            .child(self.placeholder.text()),
                     )
                     .into_any_element()
             } else {

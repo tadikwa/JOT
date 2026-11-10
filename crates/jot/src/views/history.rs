@@ -19,13 +19,12 @@
 //! dictations, and long cancelled recordings. Everything else was discarded at
 //! the source.
 
+use crate::i18n::{Locale, Msg, locale, tf, tr};
 use crate::services::Services;
 use crate::text_field::{self, Submit, TextField};
 use crate::theme::{self, Theme};
 use crate::views::widgets::{self, ButtonKind, StatusTone};
-use gpui::{
-    Context, Entity, Role, SharedString, Window, div, prelude::*, px, relative, uniform_list,
-};
+use gpui::{Context, Entity, Role, SharedString, Window, div, prelude::*, px, uniform_list};
 use jot_core::history::DictationRecord;
 use jot_core::meta::SessionStatus;
 use jot_core::recovery::RetryOutcome;
@@ -42,13 +41,14 @@ pub struct HistoryView {
     services: Services,
     search: Entity<TextField>,
     records: Vec<DictationRecord>,
-    status: Option<(SharedString, StatusTone)>,
+    pending_delete: Option<String>,
+    status: Option<(Msg, StatusTone)>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
 impl HistoryView {
     pub fn new(services: Services, cx: &mut Context<Self>) -> Self {
-        let search = cx.new(|cx| TextField::new("history-search", "Search your dictations", cx));
+        let search = cx.new(|cx| TextField::new("history-search", Msg::Search, cx));
         let subscription = cx.subscribe(&search, |this: &mut Self, _, _: &Submit, cx| {
             this.reload(cx);
         });
@@ -69,6 +69,7 @@ impl HistoryView {
             services,
             search,
             records: Vec::new(),
+            pending_delete: None,
             status: None,
             _subscriptions: vec![subscription],
         };
@@ -84,33 +85,32 @@ impl HistoryView {
     }
 
     fn retry(&mut self, record: DictationRecord, cx: &mut Context<Self>) {
-        self.status = Some(("Retrying…".into(), StatusTone::Neutral));
+        self.status = Some((Msg::Retrying, StatusTone::Neutral));
         cx.notify();
         let queue = self.services.retry_queue.clone();
         cx.spawn(async move |this, cx| {
             let outcome = queue.retry_single(&record).await;
             // A silent no-op reads as broken, so every outcome says something.
             let status = match outcome {
-                RetryOutcome::Recovered => {
-                    ("Recovered — the text is in this row now", StatusTone::Good)
-                }
-                RetryOutcome::StillOffline => {
-                    ("Still offline — it stays queued", StatusTone::Neutral)
-                }
-                RetryOutcome::Blocked => (
-                    "Your key or quota is blocking this — it stays queued",
-                    StatusTone::Bad,
-                ),
-                RetryOutcome::Failed => ("That one can't be recovered", StatusTone::Bad),
-                RetryOutcome::AlreadyDone => ("Already done", StatusTone::Neutral),
-                RetryOutcome::Busy => ("Another retry is running", StatusTone::Neutral),
+                RetryOutcome::Recovered => (Msg::RetryRecovered, StatusTone::Good),
+                RetryOutcome::StillOffline => (Msg::RetryOffline, StatusTone::Neutral),
+                RetryOutcome::Blocked => (Msg::RetryBlocked, StatusTone::Bad),
+                RetryOutcome::Failed => (Msg::RetryFailed, StatusTone::Bad),
+                RetryOutcome::AlreadyDone => (Msg::RetryAlreadyDone, StatusTone::Neutral),
+                RetryOutcome::Busy => (Msg::RetryBusy, StatusTone::Neutral),
             };
             let _ = this.update(cx, |this, cx| {
-                this.status = Some((status.0.into(), status.1));
+                this.status = Some(status);
                 this.reload(cx);
             });
         })
         .detach();
+    }
+
+    pub fn dismiss_confirmation(&mut self, cx: &mut Context<Self>) {
+        if self.pending_delete.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn row(
@@ -130,15 +130,24 @@ impl HistoryView {
         let subtitle = format!(
             "{} · {}{}",
             format_time(record.started_at),
-            record.target_app_name.as_deref().unwrap_or("Unknown app"),
+            record
+                .target_app_name
+                .as_deref()
+                .unwrap_or(tr(Msg::UnknownApp)),
             record
                 .duration_seconds
-                .map(|seconds| format!(" · {seconds:.1}s"))
+                .map(|seconds| {
+                    let mut value = format!("{seconds:.1}");
+                    if locale() == Locale::Fr {
+                        value = value.replace('.', ",");
+                    }
+                    format!(" · {}", tf(Msg::Duration, &[&value]))
+                })
                 .unwrap_or_default()
         );
 
         let id = record.id.clone();
-        let services = self.services.clone();
+        let confirming = self.pending_delete.as_deref() == Some(id.as_str());
         let record_for_retry = record.clone();
 
         div()
@@ -185,36 +194,47 @@ impl HistoryView {
                     } else {
                         theme.on_surface_variant
                     })
-                    .child(if has_text {
+                    .child(if confirming {
+                        tr(Msg::DeleteDictation).to_string()
+                    } else if has_text {
                         text.clone()
                     } else {
-                        // A row that just repeats its own chip tells the user
-                        // nothing they can act on.
-                        record
-                            .error_message
-                            .clone()
-                            .unwrap_or_else(|| error_summary(record.error_code.as_deref(), status))
+                        error_summary(record.error_code.as_deref(), status)
                     }),
             )
             .child(
                 div()
                     .flex()
                     .gap(theme::spacing::XS)
-                    .when(has_text, |row| {
-                        let text = text.clone();
+                    .when(confirming, |row| {
                         row.child(widgets::button(
-                            SharedString::from(format!("copy-{}", id.clone())),
-                            "Copy",
+                            SharedString::from(format!("cancel-delete-{id}")),
+                            tr(Msg::Cancel),
                             ButtonKind::Secondary,
                             true,
                             theme,
-                            move |_, _, cx| text_field::set_clipboard_text(text.clone(), cx),
+                            cx.listener(|this, _, _, cx| this.dismiss_confirmation(cx)),
                         ))
                     })
-                    .when(retryable, |row| {
+                    .when(has_text && !confirming, |row| {
+                        let text = text.clone();
+                        row.child(widgets::button(
+                            SharedString::from(format!("copy-{}", id.clone())),
+                            tr(Msg::Copy),
+                            ButtonKind::Secondary,
+                            true,
+                            theme,
+                            cx.listener(move |this, _, _, cx| {
+                                text_field::set_clipboard_text(text.clone(), cx);
+                                this.status = Some((Msg::CopiedFeedback, StatusTone::Good));
+                                cx.notify();
+                            }),
+                        ))
+                    })
+                    .when(retryable && !confirming, |row| {
                         row.child(widgets::button(
                             SharedString::from(format!("retry-{}", id.clone())),
-                            "Retry",
+                            tr(Msg::Retry),
                             ButtonKind::Primary,
                             true,
                             theme,
@@ -226,11 +246,20 @@ impl HistoryView {
                     })
                     .child(widgets::button(
                         SharedString::from(format!("delete-{}", id.clone())),
-                        "Delete",
+                        tr(Msg::Delete),
                         ButtonKind::Destructive,
                         true,
                         theme,
-                        move |_, _, _| services.history.delete(&id, true),
+                        cx.listener(move |this, _, _, cx| {
+                            if confirming && this.pending_delete.as_deref() == Some(id.as_str()) {
+                                this.pending_delete = None;
+                                this.services.history.delete(&id, true);
+                                this.reload(cx);
+                            } else {
+                                this.pending_delete = Some(id.clone());
+                                cx.notify();
+                            }
+                        }),
                     )),
             )
     }
@@ -238,27 +267,29 @@ impl HistoryView {
 
 impl Render for HistoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::current(window.appearance(), crate::window_shell::high_contrast());
+        let theme = Theme::ui(window);
         let stats = self.services.history.stats();
         let count = self.records.len();
         let records = self.records.clone();
 
         let summary = if count == 0 && stats.total_dictations == 0 {
-            "Nothing yet — hold the dictation key and say something".to_string()
+            None
         } else if stats.total_dictations == 0 {
-            // Saved, but nothing has come back from the model yet: saying
-            // "nothing yet" above a visible row would be a plain lie.
-            format!("{count} saved · nothing transcribed yet")
+            Some(tf(Msg::SavedPending, &[&count]))
         } else if stats.average_wpm > 0 {
-            format!(
-                "{} dictations · {} words · about {} words per minute",
-                stats.total_dictations, stats.total_words, stats.average_wpm
-            )
+            Some(tf(
+                Msg::HistorySummarySpeed,
+                &[
+                    &stats.total_dictations,
+                    &stats.total_words,
+                    &stats.average_wpm,
+                ],
+            ))
         } else {
-            format!(
-                "{} dictations · {} words",
-                stats.total_dictations, stats.total_words
-            )
+            Some(tf(
+                Msg::HistorySummary,
+                &[&stats.total_dictations, &stats.total_words],
+            ))
         };
 
         let list = if count == 0 {
@@ -269,16 +300,16 @@ impl Render for HistoryView {
                 .justify_center()
                 .text_color(theme.on_surface_variant)
                 .child(if self.search.read(cx).is_empty() {
-                    "No dictations yet."
+                    tr(Msg::HistoryHint)
                 } else {
-                    "Nothing matches that search."
+                    tr(Msg::NoMatches)
                 })
                 .into_any_element()
         } else {
             div()
                 .id("history-list")
                 .role(Role::List)
-                .aria_label("Your dictations")
+                .aria_label(tr(Msg::DictationList))
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
@@ -293,10 +324,7 @@ impl Render for HistoryView {
                         "history-rows",
                         count,
                         cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
-                            let theme = Theme::current(
-                                window.appearance(),
-                                crate::window_shell::high_contrast(),
-                            );
+                            let theme = Theme::ui(window);
                             range
                                 .filter_map(|index| {
                                     records.get(index).map(|record| {
@@ -320,25 +348,23 @@ impl Render for HistoryView {
             .font_family(theme::ui_font())
             .bg(theme.window_background)
             .text_color(theme.on_surface)
-            .child(
-                div()
-                    .id("heading")
-                    .role(Role::Heading)
-                    .aria_level(1)
-                    .text_size(theme::type_scale::HEADLINE)
-                    .font_weight(theme::weight::MEDIUM)
-                    .line_height(relative(theme::line_height::TIGHT))
-                    .child("History"),
-            )
-            .child(
-                div()
-                    .text_size(theme::type_scale::LABEL)
-                    .text_color(theme.on_surface_variant)
-                    .child(summary),
-            )
+            .child(widgets::heading(Msg::History))
+            .when_some(summary, |column, summary| {
+                column.child(
+                    div()
+                        .text_size(theme::type_scale::LABEL)
+                        .text_color(theme.on_surface_variant)
+                        .child(summary),
+                )
+            })
             .child(self.search.clone())
-            .when_some(self.status.clone(), |column, (message, tone)| {
-                column.child(widgets::status_line("history-status", message, tone, theme))
+            .when_some(self.status, |column, (message, tone)| {
+                column.child(widgets::status_line(
+                    "history-status",
+                    tr(message),
+                    tone,
+                    theme,
+                ))
             })
             .child(list)
     }
@@ -348,68 +374,67 @@ fn format_time(at: OffsetDateTime) -> String {
     let local = time::UtcOffset::current_local_offset()
         .map(|offset| at.to_offset(offset))
         .unwrap_or(at);
+    let pattern = match locale() {
+        Locale::En => format_description!("[day] [month repr:short] [hour]:[minute]"),
+        Locale::Fr => format_description!("[day]/[month]/[year] à [hour]:[minute]"),
+    };
     local
-        .format(format_description!(
-            "[day] [month repr:short] [hour]:[minute]"
-        ))
-        .unwrap_or_else(|_| "unknown time".into())
+        .format(pattern)
+        .unwrap_or_else(|_| tr(Msg::UnknownTime).into())
 }
 
 /// The short word that goes in the chip. The row's body line carries the
 /// explanation, so a chip repeating a whole sentence just crowds the row.
 fn status_chip_label(status: SessionStatus) -> &'static str {
     match status {
-        SessionStatus::Inserted => "Inserted",
-        SessionStatus::CopiedToClipboard | SessionStatus::AwaitingChip => "Copied",
-        SessionStatus::HeldSecure => "Held back",
-        SessionStatus::QueuedForRetry => "Queued",
-        SessionStatus::Recovered => "Recovered",
-        SessionStatus::Cancelled => "Cancelled",
-        SessionStatus::Failed => "Failed",
-        SessionStatus::Silent => "No speech",
+        SessionStatus::Inserted => tr(Msg::Inserted),
+        SessionStatus::CopiedToClipboard | SessionStatus::AwaitingChip => tr(Msg::Copied),
+        SessionStatus::HeldSecure => tr(Msg::Held),
+        SessionStatus::QueuedForRetry => tr(Msg::Queued),
+        SessionStatus::Recovered => tr(Msg::Recovered),
+        SessionStatus::Cancelled => tr(Msg::Cancelled),
+        SessionStatus::Failed => tr(Msg::Failed),
+        SessionStatus::Silent => tr(Msg::NoSpeech),
         SessionStatus::Recording | SessionStatus::Recorded | SessionStatus::Transcribing => {
-            "In flight"
+            tr(Msg::InFlight)
         }
     }
 }
 
 fn status_label(status: SessionStatus) -> &'static str {
     match status {
-        SessionStatus::Inserted => "Inserted",
-        SessionStatus::CopiedToClipboard => "Copied to clipboard",
-        SessionStatus::AwaitingChip => "Copied — was ready to paste",
-        SessionStatus::HeldSecure => "Held back from a password field",
-        SessionStatus::QueuedForRetry => "Queued — will send when you reconnect",
-        SessionStatus::Recovered => "Recovered — it was never put on the clipboard",
-        SessionStatus::Cancelled => "Cancelled — the recording is kept",
-        SessionStatus::Failed => "Failed",
-        SessionStatus::Silent => "No speech",
+        SessionStatus::Inserted => tr(Msg::Inserted),
+        SessionStatus::CopiedToClipboard => tr(Msg::CopiedClipboard),
+        SessionStatus::AwaitingChip => tr(Msg::CopiedReady),
+        SessionStatus::HeldSecure => tr(Msg::HeldPassword),
+        SessionStatus::QueuedForRetry => tr(Msg::QueuedDetail),
+        SessionStatus::Recovered => tr(Msg::RecoveredDetail),
+        SessionStatus::Cancelled => tr(Msg::CancelledDetail),
+        SessionStatus::Failed => tr(Msg::Failed),
+        SessionStatus::Silent => tr(Msg::NoSpeech),
         SessionStatus::Recording | SessionStatus::Recorded | SessionStatus::Transcribing => {
-            "In flight"
+            tr(Msg::InFlight)
         }
     }
 }
 
-/// Human copy for a stored error code, so a row explains itself even when the
-/// API gave no message.
+/// Display copy for stored error codes. Raw API diagnostics stay in the record.
 fn error_summary(code: Option<&str>, status: SessionStatus) -> String {
     match code {
-        Some("offline") => "You were offline — it will send when you reconnect",
-        Some("network") => "Couldn't reach Gemini",
-        Some("timeout") => "Gemini took too long to answer",
-        Some("auth") => "No usable API key — add one in Settings",
-        Some("model") => "Your key can't use this model — see Settings → Advanced",
-        Some("quota") => "Daily quota reached",
-        Some("rate_limit") => "Rate limited — try again in a moment",
-        Some("bad_request") => "Gemini refused the request",
-        Some("safety") => "Gemini declined to transcribe this",
-        Some("empty") => "Nothing came back from the model",
-        Some("tooNoisy") => "Too noisy to make out any speech",
-        Some("disk_write") => "Writing the recording failed — check free space",
-        Some("engine_died") => "The microphone stopped mid-recording",
-        Some("audio_purged") | Some("no_audio_file") => {
-            "The recording is gone, so this can't be transcribed"
-        }
+        Some("offline") => tr(Msg::HistoryOffline),
+        Some("network") => tr(Msg::HistoryNetwork),
+        Some("timeout") => tr(Msg::HistoryTimeout),
+        Some("auth") => tr(Msg::Auth),
+        Some("model") => tr(Msg::ModelAccess),
+        Some("quota") => tr(Msg::Quota),
+        Some("rate_limit") => tr(Msg::HistoryRate),
+        Some("bad_request") => tr(Msg::HistoryBadRequest),
+        Some("safety") => tr(Msg::HistorySafety),
+        Some("empty") => tr(Msg::HistoryEmpty),
+        Some("tooNoisy") => tr(Msg::HistoryNoise),
+        Some("disk_write") => tr(Msg::HistoryDisk),
+        Some("engine_died") => tr(Msg::HistoryMic),
+        Some("audio_purged") | Some("no_audio_file") => tr(Msg::HistoryNoAudio),
         _ => status_label(status),
     }
     .to_string()

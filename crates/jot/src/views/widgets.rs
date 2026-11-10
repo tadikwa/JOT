@@ -19,6 +19,7 @@
 //! open-coded per pane: an accessible control copied five times is an
 //! inaccessible control four times.
 
+use crate::i18n::{Msg, tf, tr};
 use crate::theme::{self, Theme};
 use gpui::{
     AnyElement, Bounds, ClickEvent, Div, ElementId, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
@@ -27,6 +28,23 @@ use gpui::{
 };
 use std::cell::Cell;
 use std::rc::Rc;
+
+pub fn install_keyboard_navigation(cx: &mut gpui::App) {
+    cx.intercept_keystrokes(|event, window, cx| {
+        let key = &event.keystroke;
+        if key.key != "tab" || key.modifiers.control || key.modifiers.alt || key.modifiers.platform
+        {
+            return;
+        }
+        if key.modifiers.shift {
+            window.focus_prev(cx);
+        } else {
+            window.focus_next(cx);
+        }
+        cx.stop_propagation();
+    })
+    .detach();
+}
 
 pub fn with_alpha(color: Rgba, alpha: f32) -> Rgba {
     rgba(
@@ -59,6 +77,8 @@ pub enum ButtonKind {
     Primary,
     /// Everything else.
     Secondary,
+    Navigation,
+    Selected,
     /// Deletes something the user cannot get back.
     Destructive,
 }
@@ -85,6 +105,16 @@ pub fn button(
     let (background, foreground, border) = match kind {
         ButtonKind::Primary => (theme.primary, theme.on_primary, theme.primary),
         ButtonKind::Secondary => (theme.surface, theme.on_surface, theme.outline_variant),
+        ButtonKind::Navigation => (
+            theme.surface_container,
+            theme.on_surface,
+            theme.surface_container,
+        ),
+        ButtonKind::Selected => (
+            theme.primary_container,
+            theme.on_primary_container,
+            theme.primary_container,
+        ),
         ButtonKind::Destructive => (theme.surface, theme.error, theme.error),
     };
     let (background, foreground, border) = if enabled {
@@ -105,11 +135,10 @@ pub fn button(
         .aria_label(if enabled {
             label.clone()
         } else {
-            format!("{label} (unavailable)").into()
+            tf(Msg::Unavailable, &[&label]).into()
         })
-        .tab_stop(enabled)
         .px(theme::spacing::S)
-        .py(px(7.0))
+        .py(px(8.0))
         .rounded(theme::radius::SMALL)
         .border_1()
         .border_color(border)
@@ -122,6 +151,7 @@ pub fn button(
             let hovered = state_layer(background, foreground, theme::state_layer::HOVER);
             let pressed = state_layer(background, foreground, theme::state_layer::PRESSED);
             button
+                .tab_index(0)
                 .cursor_pointer()
                 .hover(move |style| style.bg(hovered))
                 // Press feedback lands on mouse-down, so the button acknowledges
@@ -131,6 +161,41 @@ pub fn button(
                 .on_click(move |event, window, cx| on_click(event, window, cx))
         })
         .child(label)
+}
+
+pub fn navigation_button(
+    id: impl Into<ElementId>,
+    label: &'static str,
+    selected: bool,
+    theme: Theme,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> Stateful<Div> {
+    button(
+        id,
+        label,
+        if selected {
+            ButtonKind::Selected
+        } else {
+            ButtonKind::Navigation
+        },
+        true,
+        theme,
+        on_click,
+    )
+    .role(Role::Tab)
+    .aria_selected(selected)
+}
+
+pub fn heading(label: Msg) -> Stateful<Div> {
+    div()
+        .id("heading")
+        .role(Role::Heading)
+        .aria_label(tr(label))
+        .aria_level(1)
+        .text_size(theme::type_scale::HEADLINE)
+        .font_weight(gpui::FontWeight::SEMIBOLD)
+        .line_height(relative(theme::line_height::TIGHT))
+        .child(tr(label))
 }
 
 /// A labelled on/off switch.
@@ -161,7 +226,7 @@ pub fn toggle(
         } else {
             gpui::Toggled::False
         })
-        .tab_stop(true)
+        .tab_index(0)
         .flex()
         .items_center()
         .justify_between()
@@ -332,6 +397,10 @@ impl PageScroll {
     pub fn new() -> Self {
         Self::default()
     }
+
+    pub fn reset(&self) {
+        self.handle.set_offset(point(px(0.0), px(0.0)));
+    }
 }
 
 /// Widths chosen so the bar is visible against a dark surface without becoming
@@ -352,7 +421,7 @@ pub fn page(
     scroll: &PageScroll,
     children: Vec<AnyElement>,
 ) -> impl IntoElement {
-    let mut column = div()
+    let column = div()
         .id(id)
         .role(Role::ScrollView)
         .size_full()
@@ -360,14 +429,20 @@ pub fn page(
         .track_scroll(&scroll.handle)
         .flex()
         .flex_col()
-        .gap(theme::spacing::M)
+        .items_center()
         .p(theme::spacing::L)
         .font_family(theme::ui_font())
         .line_height(relative(theme::line_height::BODY))
-        .text_color(theme.on_surface);
-    for child in children {
-        column = column.child(child);
-    }
+        .text_color(theme.on_surface)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(theme::spacing::M)
+                .w_full()
+                .max_w(px(780.0))
+                .children(children),
+        );
 
     // The scrolling column and the bar are siblings inside a positioned parent:
     // an absolutely positioned child *inside* the scroll container would scroll

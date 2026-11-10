@@ -19,13 +19,12 @@
 //! the misspelling gets a second, deterministic guarantee applied after the
 //! model, which is the only part that is not a suggestion.
 
+use crate::i18n::{LocalizedText, Msg, tf, tr};
 use crate::services::Services;
 use crate::text_field::{Submit, TextField};
 use crate::theme::{self, Theme};
 use crate::views::widgets::{self, ButtonKind, StatusTone};
-use gpui::{
-    Context, Entity, Role, SharedString, Window, div, prelude::*, px, relative, uniform_list,
-};
+use gpui::{Context, Entity, Role, SharedString, Window, div, prelude::*, px, uniform_list};
 use jot_core::dictionary::{DictionaryEntry, TERM_LENGTH};
 
 const ROW_HEIGHT: f32 = 64.0;
@@ -35,7 +34,7 @@ pub struct DictionaryView {
     term: Entity<TextField>,
     misspelling: Entity<TextField>,
     entries: Vec<DictionaryEntry>,
-    status: Option<(SharedString, StatusTone)>,
+    status: Option<(LocalizedText, StatusTone)>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -44,14 +43,9 @@ impl DictionaryView {
         // Placeholders describe the field rather than showing a specimen term.
         // "Kubernetes" and "cooper netties" read as entries already present,
         // so there was no way to tell an empty field from a filled one.
-        let term = cx.new(|cx| TextField::new("dictionary-term", "Term, spelled correctly", cx));
-        let misspelling = cx.new(|cx| {
-            TextField::new(
-                "dictionary-misspelling",
-                "How it gets misheard (optional)",
-                cx,
-            )
-        });
+        let term = cx.new(|cx| TextField::new("dictionary-term", Msg::Term, cx));
+        let misspelling =
+            cx.new(|cx| TextField::new("dictionary-misspelling", Msg::Misspelling, cx));
         // Enter in either field adds the entry, so the whole flow is keyboard.
         let subscriptions = vec![
             cx.subscribe(&term, |this: &mut Self, _, _: &Submit, cx| this.add(cx)),
@@ -82,12 +76,7 @@ impl DictionaryView {
 
         if !TERM_LENGTH.contains(&term.chars().count()) {
             self.status = Some((
-                format!(
-                    "A term has to be {} to {} characters",
-                    TERM_LENGTH.start(),
-                    TERM_LENGTH.end()
-                )
-                .into(),
+                LocalizedText::with(Msg::TermLength, &[TERM_LENGTH.start(), TERM_LENGTH.end()]),
                 StatusTone::Bad,
             ));
             cx.notify();
@@ -105,10 +94,13 @@ impl DictionaryView {
             self.misspelling.update(cx, |field, _| {
                 field.take_content();
             });
-            (format!("Added {term}").into(), StatusTone::Good)
+            (
+                LocalizedText::with(Msg::TermAdded, &[&term]),
+                StatusTone::Good,
+            )
         } else {
             (
-                format!("{term} is already in your dictionary").into(),
+                LocalizedText::with(Msg::TermExists, &[&term]),
                 StatusTone::Neutral,
             )
         });
@@ -142,23 +134,25 @@ impl DictionaryView {
             .child(
                 div()
                     .flex()
+                    .flex_1()
+                    .min_w_0()
                     .flex_col()
                     .gap(px(2.0))
                     .child(
                         div()
                             .text_size(theme::type_scale::BODY_LARGE)
                             .text_color(theme.on_surface)
+                            .truncate()
                             .child(entry.term.clone()),
                     )
                     .child(
                         div()
                             .text_size(theme::type_scale::LABEL)
                             .text_color(theme.on_surface_variant)
+                            .truncate()
                             .child(match entry.misspelling.as_deref() {
-                                Some(wrong) => {
-                                    format!("always corrects \"{wrong}\"")
-                                }
-                                None => "spelling hint only".to_string(),
+                                Some(wrong) => tf(Msg::AlwaysCorrects, &[&wrong]),
+                                None => tr(Msg::SpellingHint).to_string(),
                             }),
                     ),
             )
@@ -168,9 +162,13 @@ impl DictionaryView {
                     .gap(theme::spacing::XS)
                     .child(widgets::button(
                         SharedString::from(format!("star-{}", id)),
-                        if starred { "Starred" } else { "Star" },
                         if starred {
-                            ButtonKind::Primary
+                            tr(Msg::Starred)
+                        } else {
+                            tr(Msg::Star)
+                        },
+                        if starred {
+                            ButtonKind::Selected
                         } else {
                             ButtonKind::Secondary
                         },
@@ -183,7 +181,7 @@ impl DictionaryView {
                     ))
                     .child(widgets::button(
                         SharedString::from(format!("remove-{}", id)),
-                        "Remove",
+                        tr(Msg::Remove),
                         ButtonKind::Destructive,
                         true,
                         theme,
@@ -198,7 +196,7 @@ impl DictionaryView {
 
 impl Render for DictionaryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::current(window.appearance(), crate::window_shell::high_contrast());
+        let theme = Theme::ui(window);
         let entries = self.entries.clone();
         let count = entries.len();
 
@@ -209,13 +207,13 @@ impl Render for DictionaryView {
                 .items_center()
                 .justify_center()
                 .text_color(theme.on_surface_variant)
-                .child("No terms yet. Add the names and product words Jot keeps getting wrong.")
+                .child(tr(Msg::DictionaryEmpty))
                 .into_any_element()
         } else {
             div()
                 .id("dictionary-list")
                 .role(Role::List)
-                .aria_label("Dictionary terms")
+                .aria_label(tr(Msg::DictionaryList))
                 .flex_1()
                 .min_h_0()
                 .overflow_hidden()
@@ -228,10 +226,7 @@ impl Render for DictionaryView {
                         "dictionary-rows",
                         count,
                         cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
-                            let theme = Theme::current(
-                                window.appearance(),
-                                crate::window_shell::high_contrast(),
-                            );
+                            let theme = Theme::ui(window);
                             range
                                 .filter_map(|index| {
                                     entries
@@ -255,35 +250,28 @@ impl Render for DictionaryView {
             .font_family(theme::ui_font())
             .bg(theme.window_background)
             .text_color(theme.on_surface)
-            .child(
-                div()
-                    .id("heading")
-                    .role(Role::Heading)
-                    .aria_level(1)
-                    .text_size(theme::type_scale::HEADLINE)
-                    .font_weight(theme::weight::MEDIUM)
-                    .line_height(relative(theme::line_height::TIGHT))
-                    .child("Dictionary"),
-            )
+            .child(widgets::heading(Msg::Dictionary))
             .child(
                 div()
                     .text_size(theme::type_scale::LABEL)
                     .text_color(theme.on_surface_variant)
-                    .child(
-                        "Terms are sent with your audio so the model hears them correctly. \
-                         Starred terms are sent first. Adding the misspelling as well makes the \
-                         correction a guarantee rather than a hint.",
-                    ),
+                    .child(tr(Msg::DictionaryHint)),
             )
             .child(
                 div()
                     .flex()
                     .gap(theme::spacing::XS)
-                    .child(div().flex_1().child(self.term.clone()))
-                    .child(div().flex_1().child(self.misspelling.clone()))
+                    .flex_wrap()
+                    .child(div().flex_1().min_w(px(190.0)).child(self.term.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(220.0))
+                            .child(self.misspelling.clone()),
+                    )
                     .child(widgets::button(
                         "add-term",
-                        "Add",
+                        tr(Msg::Add),
                         ButtonKind::Primary,
                         true,
                         theme,
@@ -293,7 +281,7 @@ impl Render for DictionaryView {
             .when_some(self.status.clone(), |column, (message, tone)| {
                 column.child(widgets::status_line(
                     "dictionary-status",
-                    message,
+                    message.render(),
                     tone,
                     theme,
                 ))
@@ -305,37 +293,39 @@ impl Render for DictionaryView {
                     .gap(theme::spacing::XS)
                     .child(widgets::button(
                         "export-csv",
-                        "Export CSV…",
+                        tr(Msg::ExportCsv),
                         ButtonKind::Secondary,
                         count > 0,
                         theme,
-                        {
-                            let services = self.services.clone();
-                            move |_, _, _| {
-                                let Some(path) = crate::file_dialog::save(
-                                    "Export dictionary",
-                                    crate::file_dialog::CSV,
-                                    "jot-dictionary.csv",
-                                ) else {
-                                    return;
-                                };
-                                if let Err(error) =
-                                    std::fs::write(&path, services.dictionary.export_csv())
-                                {
-                                    tracing::error!(%error, "exporting the dictionary failed");
-                                }
-                            }
-                        },
+                        cx.listener(|this, _, _, cx| {
+                            let Some(path) = crate::file_dialog::save(
+                                tr(Msg::ExportDictionary),
+                                crate::file_dialog::CSV,
+                                "jot-dictionary.csv",
+                            ) else {
+                                return;
+                            };
+                            this.status = Some(
+                                match std::fs::write(&path, this.services.dictionary.export_csv()) {
+                                    Ok(()) => (Msg::Exported.into(), StatusTone::Good),
+                                    Err(error) => {
+                                        tracing::error!(%error, "exporting the dictionary failed");
+                                        (Msg::ExportFailed.into(), StatusTone::Bad)
+                                    }
+                                },
+                            );
+                            cx.notify();
+                        }),
                     ))
                     .child(widgets::button(
                         "import-csv",
-                        "Import CSV…",
+                        tr(Msg::ImportCsv),
                         ButtonKind::Secondary,
                         true,
                         theme,
                         cx.listener(|this, _, _, cx| {
                             let Some(path) = crate::file_dialog::open(
-                                "Import dictionary",
+                                tr(Msg::ImportDictionary),
                                 crate::file_dialog::CSV,
                             ) else {
                                 return;
@@ -345,18 +335,16 @@ impl Render for DictionaryView {
                                     let imported = this.services.dictionary.import_csv(&csv);
                                     this.status = Some(if imported > 0 {
                                         (
-                                            format!("Imported {imported} terms").into(),
+                                            LocalizedText::with(Msg::Imported, &[&imported]),
                                             StatusTone::Good,
                                         )
                                     } else {
-                                        ("Nothing new in that file".into(), StatusTone::Neutral)
+                                        (Msg::ImportEmpty.into(), StatusTone::Neutral)
                                     });
                                 }
                                 Err(error) => {
-                                    this.status = Some((
-                                        format!("Couldn't read that file: {error}").into(),
-                                        StatusTone::Bad,
-                                    ));
+                                    tracing::error!(%error, "importing the dictionary failed");
+                                    this.status = Some((Msg::ImportFailed.into(), StatusTone::Bad));
                                 }
                             }
                             this.reload(cx);

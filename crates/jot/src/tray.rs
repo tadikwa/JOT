@@ -19,6 +19,7 @@
 //! entirely independent of GPUI's loop: neither can stall the other, and the
 //! tray keeps working while every Jot window is closed.
 
+use crate::i18n::{Msg, tr};
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -68,17 +69,17 @@ impl TrayCommand {
         match self {
             TrayCommand::ToggleDictation => {
                 if dictating {
-                    "Stop dictation"
+                    tr(Msg::StopDictation)
                 } else {
-                    "Start dictation"
+                    tr(Msg::StartDictation)
                 }
             }
-            TrayCommand::OpenHistory => "History…",
-            TrayCommand::OpenDictionary => "Dictionary…",
-            TrayCommand::OpenSettings => "Settings…",
-            TrayCommand::OpenOnboarding => "Setup guide…",
-            TrayCommand::About => "About Jot",
-            TrayCommand::Quit => "Quit Jot",
+            TrayCommand::OpenHistory => tr(Msg::History),
+            TrayCommand::OpenDictionary => tr(Msg::Dictionary),
+            TrayCommand::OpenSettings => tr(Msg::Settings),
+            TrayCommand::OpenOnboarding => tr(Msg::SetupGuide),
+            TrayCommand::About => tr(Msg::About),
+            TrayCommand::Quit => tr(Msg::Quit),
         }
     }
 }
@@ -112,6 +113,11 @@ fn is_dictating() -> bool {
 }
 
 /// Installs the tray icon and returns the command stream.
+pub fn refresh_tooltip() {
+    #[cfg(windows)]
+    platform::refresh_tooltip();
+}
+
 pub fn install() -> UnboundedReceiver<TrayCommand> {
     let (tx, rx) = unbounded_channel();
     let _ = COMMANDS.set(tx);
@@ -168,21 +174,40 @@ mod platform {
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, TRUE, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Shell::{
-        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NOTIFYICONDATAW, Shell_NotifyIconW,
+        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
+        Shell_NotifyIconW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
-        DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, HICON,
-        LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, MSG, PostQuitMessage, RegisterClassW,
-        SM_CXSMICON, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_RIGHTALIGN, TPM_RIGHTBUTTON,
-        TrackPopupMenu, WINDOW_EX_STYLE, WM_APP, WM_COMMAND, WM_DESTROY, WM_LBUTTONUP,
-        WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+        DestroyMenu, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics,
+        HICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
+        RegisterClassW, SM_CXSMICON, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_RIGHTALIGN,
+        TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_EX_STYLE, WM_APP, WM_COMMAND, WM_DESTROY,
+        WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
     };
     use windows::core::{PCWSTR, w};
 
     /// Our private message id for the notification-area callback.
     const WM_TRAY: u32 = WM_APP + 1;
+    const WM_REFRESH_TOOLTIP: u32 = WM_APP + 2;
     const ICON_ID: u32 = 1;
+
+    pub fn refresh_tooltip() {
+        unsafe {
+            if let Ok(hwnd) = FindWindowW(w!("JotTrayHost"), None) {
+                let _ = PostMessageW(hwnd, WM_REFRESH_TOOLTIP, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
+    fn set_tooltip(data: &mut NOTIFYICONDATAW) {
+        for (slot, unit) in data.szTip.iter_mut().zip(tr(Msg::TrayTip).encode_utf16()) {
+            *slot = unit;
+        }
+        if let Some(last) = data.szTip.last_mut() {
+            *last = 0;
+        }
+    }
 
     fn wide(text: &str) -> Vec<u16> {
         text.encode_utf16().chain(std::iter::once(0)).collect()
@@ -231,8 +256,7 @@ mod platform {
             hIcon: load_icon(),
             ..Default::default()
         };
-        let tip = wide("Jot — hold the dictation key and speak");
-        data.szTip[..tip.len()].copy_from_slice(&tip);
+        set_tooltip(&mut data);
         if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
             tracing::error!("the notification area rejected the icon");
         }
@@ -289,6 +313,18 @@ mod platform {
                     WM_RBUTTONUP => unsafe { show_menu(hwnd) },
                     _ => {}
                 }
+                LRESULT(0)
+            }
+            WM_REFRESH_TOOLTIP => {
+                let mut data = NOTIFYICONDATAW {
+                    cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                    hWnd: hwnd,
+                    uID: ICON_ID,
+                    uFlags: NIF_TIP,
+                    ..Default::default()
+                };
+                set_tooltip(&mut data);
+                let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
                 LRESULT(0)
             }
             WM_COMMAND => {

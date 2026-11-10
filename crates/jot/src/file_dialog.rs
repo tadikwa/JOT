@@ -17,16 +17,17 @@
 //! These block the calling thread while the user decides, so they run on the
 //! shared input thread rather than the one painting the UI.
 
+use crate::i18n::Msg;
 use std::path::PathBuf;
 
 /// A file type offered in the dialog: what the user sees, and the pattern.
 pub struct Filter {
-    pub label: &'static str,
+    pub label: Msg,
     pub pattern: &'static str,
 }
 
 pub const CSV: Filter = Filter {
-    label: "Comma-separated values (*.csv)",
+    label: Msg::CsvFile,
     pattern: "*.csv",
 };
 
@@ -69,7 +70,7 @@ mod platform {
             let title = wide(title);
             let _ = dialog.SetTitle(PCWSTR(title.as_ptr()));
 
-            let label = wide(filter.label);
+            let label = wide(crate::i18n::tr(filter.label));
             let pattern = wide(filter.pattern);
             let specs = [COMDLG_FILTERSPEC {
                 pszName: PCWSTR(label.as_ptr()),

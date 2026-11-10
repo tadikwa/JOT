@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Jot's windows. There is no main window: each of these is a tool the tray
-//! opens, and closing the last one leaves the dictation key working.
+//! Jot’s workspace and auxiliary windows. Closing them leaves dictation available.
 
 pub mod dictionary;
 pub mod history;
@@ -21,12 +20,13 @@ pub mod onboarding;
 pub mod settings;
 pub mod widgets;
 
+use crate::i18n::{Msg, tf, tr};
 use crate::services::Services;
 use crate::theme::{self, Theme};
 use crate::views::widgets::StatusTone;
 use gpui::{
-    AnyWindowHandle, App, Bounds, Render, Role, TitlebarOptions, WindowBounds, WindowOptions, div,
-    prelude::*, px, relative, size,
+    AnyWindowHandle, App, Bounds, Context, Entity, Render, Role, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, div, prelude::*, px, relative, size,
 };
 use parking_lot::Mutex;
 use std::collections::HashMap;
@@ -38,11 +38,11 @@ static OPEN_WINDOWS: LazyLock<Mutex<HashMap<&'static str, AnyWindowHandle>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Opens a tool window, or brings the existing one forward.
-pub fn open_tool_window<V: 'static + Render>(
+fn open_tool_window<V: 'static + Render>(
     key: &'static str,
     title: &'static str,
-    width: f32,
-    height: f32,
+    dimensions: (f32, f32),
+    minimum: Option<(f32, f32)>,
     cx: &mut App,
     build: impl FnOnce(&mut gpui::Window, &mut App) -> gpui::Entity<V>,
 ) {
@@ -53,7 +53,16 @@ pub fn open_tool_window<V: 'static + Render>(
         return;
     }
 
-    let bounds = Bounds::centered(None, size(px(width), px(height)), cx);
+    let (width, height) = dimensions;
+    let mut preferred = size(px(width), px(height));
+    let bounds = if let Some(display) = cx.primary_display() {
+        let area = display.visible_bounds();
+        preferred.width = preferred.width.min(area.size.width);
+        preferred.height = preferred.height.min(area.size.height);
+        Bounds::centered_at(area.center(), preferred)
+    } else {
+        Bounds::centered(None, preferred, cx)
+    };
     let opened = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -64,9 +73,9 @@ pub fn open_tool_window<V: 'static + Render>(
             focus: true,
             show: true,
             app_id: Some("com.ammaar.jot".into()),
-            // Fixed size: every pane already scrolls, and a resizable one just
-            // invites a layout nobody designed.
-            is_resizable: false,
+            is_resizable: minimum.is_some(),
+            window_min_size: minimum
+                .map(|(w, h)| size(px(w).min(preferred.width), px(h).min(preferred.height))),
             is_minimizable: true,
             ..Default::default()
         },
@@ -82,53 +91,216 @@ pub fn open_tool_window<V: 'static + Render>(
     }
 }
 
-pub fn open_settings(services: &Services, cx: &mut App) {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Route {
+    History,
+    Dictionary,
+    Settings,
+}
+
+impl Route {
+    const ALL: [Self; 3] = [Self::History, Self::Dictionary, Self::Settings];
+
+    fn label(self) -> Msg {
+        match self {
+            Self::History => Msg::History,
+            Self::Dictionary => Msg::Dictionary,
+            Self::Settings => Msg::Settings,
+        }
+    }
+}
+
+const WORKSPACE: &str = "workspace";
+
+pub fn open_workspace(route: Route, services: &Services, cx: &mut App) {
+    let existing = OPEN_WINDOWS.lock().get(WORKSPACE).copied();
+    if let Some(handle) = existing.and_then(|handle| handle.downcast::<WorkspaceView>())
+        && handle
+            .update(cx, |view, window, cx| {
+                view.navigate(route, cx);
+                window.activate_window();
+            })
+            .is_ok()
+    {
+        return;
+    }
+
     let services = services.clone();
     open_tool_window(
-        "settings",
-        "Jot Settings",
-        620.0,
-        720.0,
+        WORKSPACE,
+        "Jot",
+        (960.0, 690.0),
+        Some((540.0, 480.0)),
         cx,
-        move |_, cx| cx.new(|cx| settings::SettingsView::new(services, cx)),
+        move |_, cx| cx.new(|cx| WorkspaceView::new(route, services, cx)),
     );
 }
 
-pub fn open_history(services: &Services, cx: &mut App) {
-    let services = services.clone();
-    open_tool_window("history", "Jot History", 760.0, 620.0, cx, move |_, cx| {
-        cx.new(|cx| history::HistoryView::new(services, cx))
-    });
+struct WorkspaceView {
+    route: Route,
+    services: Services,
+    history: Option<Entity<history::HistoryView>>,
+    dictionary: Option<Entity<dictionary::DictionaryView>>,
+    settings: Option<Entity<settings::SettingsView>>,
 }
 
-pub fn open_dictionary(services: &Services, cx: &mut App) {
-    let services = services.clone();
-    open_tool_window(
-        "dictionary",
-        "Jot Dictionary",
-        640.0,
-        540.0,
-        cx,
-        move |_, cx| cx.new(|cx| dictionary::DictionaryView::new(services, cx)),
-    );
+impl WorkspaceView {
+    fn new(route: Route, services: Services, cx: &mut Context<Self>) -> Self {
+        let mut view = Self {
+            route,
+            services,
+            history: None,
+            dictionary: None,
+            settings: None,
+        };
+        view.navigate(route, cx);
+        view
+    }
+
+    fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        if self.route != route {
+            match self.route {
+                Route::History => {
+                    if let Some(view) = &self.history {
+                        view.update(cx, history::HistoryView::dismiss_confirmation);
+                    }
+                }
+                Route::Settings => {
+                    if let Some(view) = &self.settings {
+                        view.update(cx, settings::SettingsView::dismiss_confirmations);
+                    }
+                }
+                Route::Dictionary => {}
+            }
+        }
+        match route {
+            Route::History => {
+                self.history.get_or_insert_with(|| {
+                    cx.new(|cx| history::HistoryView::new(self.services.clone(), cx))
+                });
+            }
+            Route::Dictionary => {
+                self.dictionary.get_or_insert_with(|| {
+                    cx.new(|cx| dictionary::DictionaryView::new(self.services.clone(), cx))
+                });
+            }
+            Route::Settings => {
+                self.settings.get_or_insert_with(|| {
+                    cx.new(|cx| settings::SettingsView::new(self.services.clone(), cx))
+                });
+            }
+        }
+        self.route = route;
+        cx.notify();
+    }
+}
+
+impl Render for WorkspaceView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::ui(window);
+        let wide = window.viewport_size().width >= px(820.0);
+        let entity = cx.entity().downgrade();
+        let navigation = route_tabs(wide, self.route, theme, move |route, cx| {
+            let _ = entity.update(cx, |view, cx| view.navigate(route, cx));
+        });
+        let page = match self.route {
+            Route::History => self.history.as_ref().unwrap().clone().into_any_element(),
+            Route::Dictionary => self.dictionary.as_ref().unwrap().clone().into_any_element(),
+            Route::Settings => self.settings.as_ref().unwrap().clone().into_any_element(),
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .when(!wide, |root| root.flex_col())
+            .bg(theme.window_background)
+            .text_color(theme.on_surface)
+            .font_family(theme::ui_font())
+            .child(
+                div()
+                    .flex()
+                    .flex_none()
+                    .p(theme::spacing::M)
+                    .gap(theme::spacing::M)
+                    .bg(theme.surface_container)
+                    .border_color(theme.outline_variant)
+                    .when(wide, |rail| rail.w(px(184.0)).flex_col().border_r_1())
+                    .when(!wide, |bar| bar.items_center().border_b_1())
+                    .child(
+                        div()
+                            .text_size(px(25.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .child("Jot"),
+                    )
+                    .child(navigation),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(page),
+            )
+    }
+}
+
+fn route_tabs(
+    wide: bool,
+    current: Route,
+    theme: Theme,
+    select: impl Fn(Route, &mut App) + Clone + 'static,
+) -> impl IntoElement {
+    div()
+        .id("main-navigation")
+        .role(Role::TabList)
+        .aria_label(tr(Msg::Navigation))
+        .flex()
+        .gap_2()
+        .when(wide, |bar| bar.flex_col().items_stretch())
+        .children(Route::ALL.into_iter().enumerate().map(|(index, route)| {
+            let select = select.clone();
+            widgets::navigation_button(
+                ("route", index),
+                tr(route.label()),
+                route == current,
+                theme,
+                move |_, _, cx| select(route, cx),
+            )
+        }))
+}
+
+pub fn refresh_language(cx: &mut App) {
+    let windows = OPEN_WINDOWS.lock();
+    for (key, title) in [("onboarding", Msg::Setup), ("about", Msg::About)] {
+        if let Some(handle) = windows.get(key) {
+            let _ = handle.update(cx, |_, window, _| window.set_window_title(tr(title)));
+        }
+    }
+    cx.refresh_windows();
 }
 
 pub fn open_onboarding(services: &Services, cx: &mut App) {
     let services = services.clone();
     open_tool_window(
         "onboarding",
-        "Set up Jot",
-        620.0,
-        440.0,
+        tr(Msg::Setup),
+        (580.0, 490.0),
+        Some((460.0, 380.0)),
         cx,
         move |_, cx| cx.new(|cx| onboarding::OnboardingView::new(services, cx)),
     );
 }
 
 pub fn open_about(cx: &mut App) {
-    open_tool_window("about", "About Jot", 440.0, 340.0, cx, |_, cx| {
-        cx.new(AboutView::new)
-    });
+    open_tool_window(
+        "about",
+        tr(Msg::About),
+        (480.0, 380.0),
+        Some((380.0, 320.0)),
+        cx,
+        |_, cx| cx.new(AboutView::new),
+    );
 }
 
 /// About, which is also where Jot asks whether it is out of date.
@@ -185,25 +357,19 @@ impl AboutView {
         match &self.update {
             UpdateState::Checking => widgets::status_line(
                 "update",
-                "Checking for updates…",
+                tr(Msg::UpdateChecking),
                 StatusTone::Neutral,
                 theme,
             )
             .into_any_element(),
-            UpdateState::UpToDate => widgets::status_line(
-                "update",
-                "You are on the latest version.",
-                StatusTone::Good,
-                theme,
-            )
-            .into_any_element(),
-            UpdateState::Unknown => widgets::status_line(
-                "update",
-                "Could not reach GitHub to check for updates.",
-                StatusTone::Neutral,
-                theme,
-            )
-            .into_any_element(),
+            UpdateState::UpToDate => {
+                widgets::status_line("update", tr(Msg::UpdateCurrent), StatusTone::Good, theme)
+                    .into_any_element()
+            }
+            UpdateState::Unknown => {
+                widgets::status_line("update", tr(Msg::UpdateUnknown), StatusTone::Neutral, theme)
+                    .into_any_element()
+            }
             UpdateState::Available(update) => {
                 let page = update.page.clone();
                 div()
@@ -212,13 +378,13 @@ impl AboutView {
                     .gap_2()
                     .child(widgets::status_line(
                         "update",
-                        format!("Jot {} is available.", update.version),
+                        tf(Msg::UpdateAvailable, &[&update.version]),
                         StatusTone::Good,
                         theme,
                     ))
                     .child(widgets::hug(widgets::button(
                         "open-release",
-                        "Open the download page",
+                        tr(Msg::UpdateDownload),
                         widgets::ButtonKind::Primary,
                         true,
                         theme,
@@ -236,7 +402,7 @@ impl Render for AboutView {
         window: &mut gpui::Window,
         _cx: &mut gpui::Context<Self>,
     ) -> impl IntoElement {
-        let theme = Theme::current(window.appearance(), crate::window_shell::high_contrast());
+        let theme = Theme::ui(window);
         let update = self.update_element(theme);
         widgets::page(
             "about",
@@ -255,26 +421,70 @@ impl Render for AboutView {
                 div()
                     .text_size(theme::type_scale::BODY)
                     .text_color(theme.on_surface_variant)
-                    .child(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                    .child(tf(Msg::Version, &[&env!("CARGO_PKG_VERSION")]))
                     .into_any_element(),
                 update,
                 div()
                     .text_size(theme::type_scale::BODY)
-                    .child(
-                        "Hold the dictation key, say the thing, let go. \
-                         Your voice goes from this PC straight to the Gemini API \
-                         with your key — no middleman server, no account, no analytics.",
-                    )
+                    .child(tr(Msg::AboutDescription))
                     .into_any_element(),
                 div()
                     .text_size(theme::type_scale::LABEL)
                     .text_color(theme.on_surface_variant)
-                    .child(
-                        "Apache 2.0 licensed. Bundled fonts are SIL OFL 1.1. \
-                         This is not an officially supported Google product.",
-                    )
+                    .child(tr(Msg::AboutLicense))
                     .into_any_element(),
             ],
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use gpui::TestAppContext;
+
+    struct TestNavigation(Route);
+
+    impl Render for TestNavigation {
+        fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let entity = cx.entity().downgrade();
+            route_tabs(true, self.0, Theme::light(), move |route, cx| {
+                entity
+                    .update(cx, |view, cx| {
+                        view.0 = route;
+                        cx.notify();
+                    })
+                    .unwrap();
+            })
+        }
+    }
+
+    #[test]
+    fn every_workspace_tab_can_be_activated_from_the_keyboard() {
+        let mut cx = TestAppContext::single();
+        cx.update(widgets::install_keyboard_navigation);
+        let window = cx.add_window(|_, _| TestNavigation(Route::Settings));
+        let handle = window.into();
+        cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+
+        for expected in Route::ALL {
+            cx.simulate_keystrokes(handle, "tab");
+            cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            cx.simulate_keystrokes(handle, "enter");
+            cx.update_window(handle, |_, window, cx| {
+                window.dispatch_event(
+                    gpui::PlatformInput::KeyUp(gpui::KeyUpEvent {
+                        keystroke: gpui::Keystroke::parse("enter").unwrap(),
+                    }),
+                    cx,
+                );
+            })
+            .unwrap();
+            window
+                .update(&mut cx, |view, _, _| assert_eq!(view.0, expected))
+                .unwrap();
+        }
     }
 }

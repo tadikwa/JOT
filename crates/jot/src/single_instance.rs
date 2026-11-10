@@ -1,4 +1,5 @@
 //! One full app at a time: two global hooks would both process the dictation key.
+use crate::i18n::{Msg, tf, tr};
 use anyhow::{Result, bail};
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Diagnostics::ToolHelp::*;
@@ -20,7 +21,7 @@ pub fn acquire() -> Result<Instance> {
         let already_exists = GetLastError() == ERROR_ALREADY_EXISTS;
         let guard = Instance(handle);
         if already_exists {
-            bail!("Jot is already running. Close it normally before starting another copy.");
+            bail!("{}", tr(Msg::AlreadyRunning));
         }
         // Older builds do not have the mutex. A portable test must also refuse
         // to install its global hook alongside those builds.
@@ -57,9 +58,14 @@ pub fn acquire() -> Result<Instance> {
                                 &mut len,
                             )?;
                             bail!(
-                                "Jot PID {} is already running at {}. Close it normally before testing this portable build.",
-                                process.th32ProcessID,
-                                String::from_utf16_lossy(&path[..len as usize])
+                                "{}",
+                                tf(
+                                    Msg::PortableAlreadyRunning,
+                                    &[
+                                        &process.th32ProcessID,
+                                        &String::from_utf16_lossy(&path[..len as usize]),
+                                    ]
+                                )
                             );
                         }
                         next = Process32NextW(snapshot.0, &mut process);

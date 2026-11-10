@@ -21,8 +21,10 @@
 //! focus from the app the text is about to land in. Stopping a hands-free
 //! session is the dictation key, or "Stop dictation" in the notification area.
 
+use crate::i18n::{LocalizedText, Msg, tf, tr};
 use crate::theme::{self, Theme};
 use gpui::{Context, Rgba, SharedString, Window, div, prelude::*, px, rgba};
+use jot_core::coordinator::CoachingHint;
 use jot_core::state_machine::{DictationOutcome, DictationState, SilenceReason};
 use std::time::{Duration, Instant};
 
@@ -40,9 +42,9 @@ pub enum PillState {
         words: usize,
     },
     /// Neutral informational chip (coaching hint, copied-to-clipboard, offline).
-    Notice(SharedString),
+    Notice(LocalizedText),
     /// Error styling: an error-container surface and "saved to History" framing.
-    Error(SharedString),
+    Error(Msg),
 }
 
 const PILL_HEIGHT: f32 = 48.0;
@@ -76,14 +78,14 @@ pub struct PillView {
     pub state: PillState,
     pub level: f32,
     pub elapsed: Duration,
-    /// The "Still working…" state, entered past `timeout::SLOW_STATE_UI`.
+    /// The tr(Msg::HudSlow) state, entered past `timeout::SLOW_STATE_UI`.
     pub slow: bool,
     bars: [f32; BAR_COUNT],
     started: Instant,
     last_frame: Option<Instant>,
     /// When the current recording began, for the hands-free timer.
     pub recording_since: Option<Instant>,
-    /// When the current transcription began, for the "Still working…" state.
+    /// When the current transcription began, for the tr(Msg::HudSlow) state.
     pub processing_since: Option<Instant>,
 }
 
@@ -149,26 +151,16 @@ impl PillView {
             DictationState::Cancelled => resting,
             DictationState::Done(outcome) => match outcome {
                 DictationOutcome::Inserted => PillState::Success { words: 0 },
-                DictationOutcome::AwaitingChip => {
-                    PillState::Notice("Copied — press Ctrl+V to paste".into())
-                }
-                DictationOutcome::CopiedToClipboard => {
-                    PillState::Notice("Copied — press Ctrl+V to paste".into())
-                }
-                DictationOutcome::HeldForSecureField => {
-                    PillState::Notice("Password field — saved to History only".into())
-                }
-                DictationOutcome::QueuedForRetry => {
-                    PillState::Notice("Offline — saved, will send when you reconnect".into())
-                }
+                DictationOutcome::AwaitingChip => PillState::Notice(Msg::HudCopied.into()),
+                DictationOutcome::CopiedToClipboard => PillState::Notice(Msg::HudCopied.into()),
+                DictationOutcome::HeldForSecureField => PillState::Notice(Msg::HudHeld.into()),
+                DictationOutcome::QueuedForRetry => PillState::Notice(Msg::HudOffline.into()),
                 DictationOutcome::Silent => match silence {
-                    SilenceReason::NoSpeech => PillState::Notice("Didn't catch that".into()),
-                    SilenceReason::TooNoisy => {
-                        PillState::Notice("Too noisy to hear you — saved to History".into())
-                    }
+                    SilenceReason::NoSpeech => PillState::Notice(Msg::HudSilent.into()),
+                    SilenceReason::TooNoisy => PillState::Notice(Msg::HudNoise.into()),
                 },
             },
-            DictationState::Failed(failure) => PillState::Error(failure_copy(failure)),
+            DictationState::Failed(failure) => PillState::Error(failure_message(failure)),
         }
     }
 
@@ -347,6 +339,13 @@ impl Render for PillView {
                     Some(width),
                     theme.surface,
                     div()
+                        .id("hud-listening")
+                        .role(gpui::Role::Status)
+                        .aria_label(tr(if locked {
+                            Msg::HudHandsFree
+                        } else {
+                            Msg::HudListening
+                        }))
                         .flex()
                         .items_center()
                         .gap(theme::spacing::S)
@@ -355,7 +354,7 @@ impl Render for PillView {
                                 div()
                                     .text_size(theme::type_scale::LABEL)
                                     .text_color(theme.on_surface_variant)
-                                    .child("Hands-free"),
+                                    .child(tr(Msg::HudHandsFree)),
                             )
                         })
                         .when(show_timer, |row| {
@@ -382,6 +381,13 @@ impl Render for PillView {
                     }),
                     theme.surface,
                     div()
+                        .id("hud-processing")
+                        .role(gpui::Role::Status)
+                        .aria_label(tr(if self.slow {
+                            Msg::HudSlow
+                        } else {
+                            Msg::HudProcessing
+                        }))
                         .flex()
                         .items_center()
                         .gap(theme::spacing::S)
@@ -391,7 +397,7 @@ impl Render for PillView {
                                 div()
                                     .text_size(theme::type_scale::LABEL)
                                     .text_color(theme.on_surface_variant)
-                                    .child("Still working…"),
+                                    .child(tr(Msg::HudSlow)),
                             )
                         }),
                 )
@@ -428,7 +434,7 @@ impl Render for PillView {
                         div()
                             .text_size(theme::type_scale::LABEL_SMALL)
                             .text_color(theme.on_surface_variant)
-                            .child(SharedString::from(format!("{words} words"))),
+                            .child(tf(Msg::HudWords, &[&words])),
                     )
                 })
                 .into_any_element(),
@@ -441,7 +447,7 @@ impl Render for PillView {
                     div()
                         .text_size(theme::type_scale::LABEL)
                         .text_color(theme.on_surface)
-                        .child(message),
+                        .child(message.render()),
                 )
                 .into_any_element(),
 
@@ -464,7 +470,7 @@ impl Render for PillView {
                             div()
                                 .text_size(theme::type_scale::LABEL)
                                 .text_color(theme.on_error_container)
-                                .child(message),
+                                .child(tr(message)),
                         ),
                 )
                 .into_any_element(),
@@ -482,26 +488,35 @@ impl Render for PillView {
     }
 }
 
+pub fn coaching_message(hint: CoachingHint) -> LocalizedText {
+    match hint {
+        CoachingHint::HoldToTalk => Msg::HudCoach.into(),
+        CoachingHint::SecureField => Msg::HudSecure.into(),
+        CoachingHint::DeviceChanged(name) => LocalizedText::with(Msg::HudMicChanged, &[&name]),
+        CoachingHint::TimeLimit => Msg::HudTimeLimit.into(),
+        CoachingHint::MicrophoneStopped => Msg::HudMicStopped.into(),
+    }
+}
+
 /// Copy for each failure, from the failure matrix. Every one of these names
 /// what happened and what the user can do, and none of them loses the words.
-pub fn failure_copy(failure: jot_core::state_machine::DictationFailure) -> SharedString {
+pub fn failure_message(failure: jot_core::state_machine::DictationFailure) -> Msg {
     use jot_core::state_machine::DictationFailure as F;
     match failure {
-        F::Audio => "Microphone didn't start — check Windows sound settings",
-        F::NoMicrophone => "No microphone found",
-        F::NoAudio => "Nothing was recorded",
-        F::Network => "Couldn't reach Gemini — saved to History, retry there",
-        F::Auth => "No usable API key — add one in Settings",
-        F::ModelAccess => "Your key can't use this model — see Settings → Advanced",
-        F::BadRequest => "Gemini refused the request — saved to History",
-        F::RateLimited => "Rate limited — saved to History, retry in a moment",
-        F::QuotaExhausted => "Daily quota reached — saved to History",
-        F::Timeout => "Timed out — saved to History, retry there",
-        F::Validation => "Couldn't make out the words — saved to History",
-        F::SafetyBlocked => "Gemini declined to transcribe this — saved to History",
-        F::Storage => "Couldn't write to disk — check free space",
+        F::Audio => Msg::HudAudio,
+        F::NoMicrophone => Msg::HudNoMic,
+        F::NoAudio => Msg::HudNoAudio,
+        F::Network => Msg::HudNetwork,
+        F::Auth => Msg::Auth,
+        F::ModelAccess => Msg::ModelAccess,
+        F::BadRequest => Msg::HudBadRequest,
+        F::RateLimited => Msg::HudRate,
+        F::QuotaExhausted => Msg::HudQuota,
+        F::Timeout => Msg::HudTimeout,
+        F::Validation => Msg::HudValidation,
+        F::SafetyBlocked => Msg::HudSafety,
+        F::Storage => Msg::HudStorage,
     }
-    .into()
 }
 
 fn with_alpha(color: Rgba, alpha: f32) -> Rgba {
@@ -576,7 +591,10 @@ mod tests {
         let PillState::Notice(message) = held else {
             panic!("expected a notice");
         };
-        assert!(!message.to_lowercase().contains("copied"), "{message}");
+        use crate::i18n::Locale;
+        let en = message.render_in(Locale::En);
+        assert!(!en.to_lowercase().contains("copied"), "{en}");
+        assert_ne!(en, message.render_in(Locale::Fr));
     }
 
     #[test]
@@ -591,7 +609,7 @@ mod tests {
             DictationFailure::Validation,
             DictationFailure::SafetyBlocked,
         ] {
-            let copy = failure_copy(failure);
+            let copy = failure_message(failure).text(crate::i18n::Locale::En);
             assert!(!copy.is_empty());
             // Anything recoverable must say so; an error with no next step is
             // just a scolding.

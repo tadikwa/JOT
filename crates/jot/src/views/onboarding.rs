@@ -19,14 +19,16 @@
 //! VPN coming up — must let the user continue, or setup strands people whose
 //! key is fine.
 
+use crate::i18n::{LocalizedText, Msg, hotkey, tf, tr};
 use crate::services::Services;
 use crate::text_field::{Submit, TextField};
 use crate::theme::{self, Theme};
 use crate::views::widgets::{self, ButtonKind, StatusTone};
-use gpui::{Context, Entity, Role, SharedString, Window, div, prelude::*, px, relative};
+use gpui::{Context, Entity, Role, Window, div, prelude::*, px};
 use jot_core::audio;
 use jot_core::credentials;
 use jot_core::gemini::KeyCheck;
+use jot_core::hotkey::DictationActivationMode;
 use jot_core::state_machine::{DictationOutcome, DictationState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,7 +56,7 @@ pub struct OnboardingView {
     services: Services,
     step: Step,
     api_key: Entity<TextField>,
-    status: Option<(SharedString, StatusTone)>,
+    status: Option<(LocalizedText, StatusTone)>,
     checking: bool,
     /// Set once a dictation actually completes while this window is open.
     tried_it: bool,
@@ -123,16 +125,13 @@ impl OnboardingView {
             .api_key
             .update(cx, |field, _| field.content().trim().to_string());
         if key.is_empty() {
-            self.status = Some(("Paste your key first".into(), StatusTone::Bad));
+            self.status = Some((Msg::PasteKeyFirst.into(), StatusTone::Bad));
             cx.notify();
             return;
         }
         if let Err(error) = credentials::set_api_key(&key) {
             tracing::error!(%error, "storing the API key failed");
-            self.status = Some((
-                "Windows Credential Manager refused the key".into(),
-                StatusTone::Bad,
-            ));
+            self.status = Some((Msg::KeyStoreFailed.into(), StatusTone::Bad));
             cx.notify();
             return;
         }
@@ -141,7 +140,7 @@ impl OnboardingView {
         });
 
         self.checking = true;
-        self.status = Some(("Checking your key…".into(), StatusTone::Neutral));
+        self.status = Some((Msg::KeyChecking.into(), StatusTone::Neutral));
         cx.notify();
 
         let client = self.services.client.clone();
@@ -152,7 +151,10 @@ impl OnboardingView {
             // that the key authenticates — so the model is checked too.
             let model = if check == KeyCheck::Valid {
                 client
-                    .resolve_available_model(std::slice::from_ref(&config.transcribe_model), &config.endpoint)
+                    .resolve_available_model(
+                        std::slice::from_ref(&config.transcribe_model),
+                        &config.endpoint,
+                    )
                     .await
             } else {
                 None
@@ -162,35 +164,26 @@ impl OnboardingView {
                 this.checking = false;
                 match check {
                     KeyCheck::Valid if model.is_some() => {
-                        this.status = Some(("Key works".into(), StatusTone::Good));
+                        this.status = Some((Msg::KeyWorks.into(), StatusTone::Good));
                         this.step = Step::Microphone;
                     }
                     KeyCheck::Valid => {
                         // The key is fine; this model is not available to it.
                         // Naming the model sends them to the right fix.
                         this.status = Some((
-                            format!(
-                                "Your key works, but it can't reach {}. Pick another in Settings → Advanced.",
-                                config.transcribe_model
-                            )
-                            .into(),
-                            StatusTone::Bad,
-                        ));
-                    }
-                    KeyCheck::Rejected(detail) => {
-                        this.status = Some((
-                            SharedString::from(
-                                detail.unwrap_or_else(|| "Google rejected this key".into()),
+                            LocalizedText::with(
+                                Msg::KeyModelUnavailable,
+                                &[&config.transcribe_model],
                             ),
                             StatusTone::Bad,
                         ));
                     }
+                    KeyCheck::Rejected(_) => {
+                        this.status = Some((Msg::KeyRejected.into(), StatusTone::Bad));
+                    }
                     KeyCheck::Unreachable => {
                         // Never strand someone behind a captive portal.
-                        this.status = Some((
-                            "Couldn't reach Google to check it. Saved anyway — carry on.".into(),
-                            StatusTone::Neutral,
-                        ));
+                        this.status = Some((Msg::KeyUnreachable.into(), StatusTone::Neutral));
                         this.step = Step::Microphone;
                     }
                 }
@@ -203,13 +196,10 @@ impl OnboardingView {
     fn check_microphone(&mut self, cx: &mut Context<Self>) {
         let devices = audio::input_device_names();
         if devices.is_empty() {
-            self.status = Some((
-                "Windows reports no microphone. Plug one in and try again.".into(),
-                StatusTone::Bad,
-            ));
+            self.status = Some((Msg::SetupNoMic.into(), StatusTone::Bad));
         } else {
             self.status = Some((
-                format!("Found {}", devices.join(", ")).into(),
+                LocalizedText::with(Msg::SetupFoundMic, &[&devices.join(", ")]),
                 StatusTone::Good,
             ));
             self.step = Step::TryIt;
@@ -237,26 +227,30 @@ impl OnboardingView {
     }
 
     fn body(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
-        let hotkey = self.services.settings.get().hotkey_key;
+        let settings = self.services.settings.get();
+        let key = hotkey(settings.hotkey_key);
+        let toggle = settings.dictation_activation_mode == DictationActivationMode::Toggle;
         match self.step {
             Step::Key => div()
                 .flex()
                 .flex_col()
                 .gap(theme::spacing::S)
-                .child(paragraph(
-                    "Jot uses your own Gemini API key. Get one from Google AI Studio, \
-                     then paste it here. It is stored in Windows Credential Manager and \
-                     only ever sent to Google.",
+                .child(paragraph(tr(Msg::SetupKeyHint), theme))
+                .child(widgets::hug(widgets::button(
+                    "open-key-page",
+                    "Google AI Studio",
+                    ButtonKind::Secondary,
+                    true,
                     theme,
-                ))
-                .child(paragraph("aistudio.google.com/apikey", theme))
+                    |_, _, cx| cx.open_url("https://aistudio.google.com/apikey"),
+                )))
                 .child(self.api_key.clone())
                 .child(widgets::hug(widgets::button(
                     "save-key",
                     if self.checking {
-                        "Checking…"
+                        tr(Msg::KeyChecking)
                     } else {
-                        "Save and check"
+                        tr(Msg::SaveAndCheck)
                     },
                     ButtonKind::Primary,
                     !self.checking,
@@ -269,14 +263,10 @@ impl OnboardingView {
                 .flex()
                 .flex_col()
                 .gap(theme::spacing::S)
-                .child(paragraph(
-                    "Jot records from your default Windows input device. \
-                     Windows will ask for microphone permission the first time you dictate.",
-                    theme,
-                ))
+                .child(paragraph(tr(Msg::SetupMicHint), theme))
                 .child(widgets::hug(widgets::button(
                     "check-mic",
-                    "Check my microphone",
+                    tr(Msg::CheckMic),
                     ButtonKind::Primary,
                     true,
                     theme,
@@ -289,21 +279,20 @@ impl OnboardingView {
                 .flex_col()
                 .gap(theme::spacing::S)
                 .child(paragraph(
-                    &format!(
-                        "Click into any text box, hold {}, and say:\n\
-                         \"let's meet at 1pm — actually, no, make it 2pm\"",
-                        hotkey.display_name()
+                    &tf(
+                        if toggle {
+                            Msg::SetupTryToggle
+                        } else {
+                            Msg::SetupTryHold
+                        },
+                        &[&key],
                     ),
                     theme,
                 ))
-                .child(paragraph(
-                    "Jot should type \"Let's meet at 2 PM.\" — it follows a change of mind. \
-                     This step finishes by itself as soon as a dictation lands.",
-                    theme,
-                ))
+                .child(paragraph(tr(Msg::SetupTryExample), theme))
                 .child(widgets::hug(widgets::button(
                     "skip-try",
-                    "Skip this",
+                    tr(Msg::Skip),
                     ButtonKind::Secondary,
                     true,
                     theme,
@@ -318,25 +307,22 @@ impl OnboardingView {
                 .flex()
                 .flex_col()
                 .gap(theme::spacing::S)
+                .child(paragraph(tr(Msg::SetupDone), theme))
                 .child(paragraph(
-                    if self.tried_it {
-                        "That's it. Hold the key anywhere you can type."
-                    } else {
-                        "That's it. Hold the key anywhere you can type — come back here from the \
-                         notification area if you want to walk through it again."
-                    },
-                    theme,
-                ))
-                .child(paragraph(
-                    &format!(
-                        "Hold {} to talk · tap Space while holding for hands-free · Esc cancels",
-                        hotkey.display_name()
+                    &tf(
+                        if toggle {
+                            Msg::SetupToggleShortcut
+                        } else {
+                            Msg::SetupHoldShortcut
+                        },
+                        &[&key],
                     ),
                     theme,
                 ))
+                .child(paragraph(tr(Msg::SetupDoneGuide), theme))
                 .child(widgets::hug(widgets::button(
                     "finish",
-                    "Done",
+                    tr(Msg::Done),
                     ButtonKind::Primary,
                     true,
                     theme,
@@ -352,7 +338,7 @@ impl OnboardingView {
 
 impl Render for OnboardingView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::current(window.appearance(), crate::window_shell::high_contrast());
+        let theme = Theme::ui(window);
         let step = self.step;
         let body = self.body(theme, cx);
 
@@ -361,32 +347,19 @@ impl Render for OnboardingView {
             theme,
             &self.scroll,
             vec![
-                div()
-                    .id("heading")
-                    .role(Role::Heading)
-                    .aria_level(1)
-                    .text_size(theme::type_scale::HEADLINE)
-                    .font_weight(theme::weight::MEDIUM)
-                    .line_height(relative(theme::line_height::TIGHT))
-                    .child("Set up Jot")
-                    .into_any_element(),
+                widgets::heading(Msg::Setup).into_any_element(),
                 progress(step, theme).into_any_element(),
                 body,
                 div()
-                    .when_some(self.status.clone(), |row, (message, tone)| {
+                    .when_some(self.status.as_ref(), |row, (message, tone)| {
                         row.child(widgets::status_line(
                             "onboarding-status",
-                            message,
-                            tone,
+                            message.render(),
+                            *tone,
                             theme,
                         ))
                     })
                     .into_any_element(),
-                // Pushes the way out to the bottom of the window. Without it
-                // the two buttons sit a gap apart in the middle of an empty
-                // pane, which reads as an unfinished layout rather than a
-                // wizard with a footer.
-                div().flex_1().into_any_element(),
                 div()
                     .flex()
                     .flex_col()
@@ -394,7 +367,7 @@ impl Render for OnboardingView {
                     .child(div().h(px(1.0)).w_full().bg(theme.outline_variant))
                     .child(widgets::hug(widgets::button(
                         "later",
-                        "I'll finish this later",
+                        tr(Msg::Later),
                         ButtonKind::Secondary,
                         true,
                         theme,
@@ -409,35 +382,53 @@ impl Render for OnboardingView {
     }
 }
 
-/// How far through setup you are, as a row of dots with the current one drawn
-/// as a pill.
-///
-/// It replaced the words "Step 2 of 4", which were accurate and completely
-/// invisible. The words survive as the accessible label, because a row of
-/// coloured rectangles says nothing to a screen reader.
 fn progress(step: Step, theme: Theme) -> impl IntoElement {
+    let label = match step {
+        Step::Key => Msg::StepKey,
+        Step::Microphone => Msg::StepMicrophone,
+        Step::TryIt => Msg::StepTry,
+        Step::Done => Msg::StepDone,
+    };
     div()
         .id("progress")
         .role(Role::Status)
-        .aria_label(format!("Step {} of {TOTAL_STEPS}", step.index()))
         .flex()
-        .items_center()
+        .flex_col()
         .gap(theme::spacing::XS)
-        .children((1..=TOTAL_STEPS).map(|index| {
+        .child(
             div()
-                .h(px(6.0))
-                .w(if index == step.index() {
-                    px(24.0)
-                } else {
-                    px(6.0)
-                })
-                .rounded_full()
-                .bg(if index <= step.index() {
-                    theme.primary
-                } else {
-                    theme.outline_variant
-                })
-        }))
+                .flex()
+                .items_center()
+                .gap(theme::spacing::XS)
+                .children((1..=TOTAL_STEPS).map(|index| {
+                    div()
+                        .h(px(6.0))
+                        .w(if index == step.index() {
+                            px(24.0)
+                        } else {
+                            px(6.0)
+                        })
+                        .rounded_full()
+                        .bg(if index <= step.index() {
+                            theme.primary
+                        } else {
+                            theme.outline_variant
+                        })
+                })),
+        )
+        .child(
+            div()
+                .flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .text_size(theme::type_scale::LABEL)
+                        .text_color(theme.on_surface_variant)
+                        .child(tf(Msg::Step, &[&step.index(), &TOTAL_STEPS])),
+                )
+                .child(div().font_weight(theme::weight::MEDIUM).child(tr(label))),
+        )
 }
 
 fn paragraph(text: &str, theme: Theme) -> impl IntoElement {

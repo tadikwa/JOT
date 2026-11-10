@@ -191,6 +191,30 @@ impl Theme {
         }
     }
 
+    pub fn ui(window: &gpui::Window) -> Self {
+        use jot_core::settings::{SettingsStore, UiTheme};
+        let mut theme = match SettingsStore::global().ui_theme() {
+            UiTheme::Automatic => Self::for_appearance(window.appearance()),
+            UiTheme::Light => Self::light(),
+            UiTheme::Dark => Self::dark(),
+        };
+        if theme.dark {
+            theme.window_background = rgb(0x141820);
+            theme.surface = rgb(0x1B212B);
+            theme.surface_container = rgb(0x222A37);
+            theme.outline_variant = rgb(0x354151);
+        } else {
+            theme.window_background = rgb(0xF5F7FA);
+            theme.surface_container = rgb(0xEAF0F7);
+            theme.outline_variant = rgb(0xD6DFEA);
+        }
+        if crate::window_shell::high_contrast() {
+            theme.with_increased_contrast()
+        } else {
+            theme
+        }
+    }
+
     /// Collapses the secondary text and outline onto the primary foreground, so
     /// nothing depends on a low-contrast tint to be readable.
     pub fn with_increased_contrast(mut self) -> Self {

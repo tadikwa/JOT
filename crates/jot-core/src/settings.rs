@@ -95,9 +95,31 @@ impl TranscriptionMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UiLanguage {
+    French,
+    English,
+    #[default]
+    #[serde(other)]
+    Automatic,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum UiTheme {
+    Light,
+    Dark,
+    #[default]
+    #[serde(other)]
+    Automatic,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
+    pub ui_language: UiLanguage,
+    pub ui_theme: UiTheme,
     /// True once the user finished onboarding — a deliberate "I'll add it later"
     /// must not re-trap them in the wizard every launch.
     pub has_completed_onboarding: bool,
@@ -141,6 +163,8 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
+            ui_language: UiLanguage::default(),
+            ui_theme: UiTheme::default(),
             has_completed_onboarding: false,
             endpoint_override: None,
             transcribe_model_override: None,
@@ -277,15 +301,19 @@ impl SettingsStore {
         self.data.read().clone()
     }
 
+    pub fn ui_theme(&self) -> UiTheme {
+        self.data.read().ui_theme
+    }
+
     /// Mutate, persist, and announce. `key` names the setting for subscribers;
     /// pass `None` for bookkeeping that no surface renders.
     pub fn update(&self, key: Option<&'static str>, mutate: impl FnOnce(&mut Settings)) {
-        let snapshot = {
+        {
+            // Keep concurrent updates from replacing a newer snapshot on disk.
             let mut data = self.data.write();
             mutate(&mut data);
-            data.clone()
-        };
-        self.persist(&snapshot);
+            self.persist(&data);
+        }
         if let Some(key) = key {
             let _ = self.changes.send(key);
         }
@@ -342,6 +370,55 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let store = SettingsStore::open(temp.path().join("settings.json"));
         (temp, store)
+    }
+
+    #[test]
+    fn legacy_settings_keep_values_when_ui_preferences_are_added() {
+        let (temp, _) = store();
+        let path = temp.path().join("settings.json");
+        std::fs::write(&path, r#"{"hotkeyKey":"capsLock","dictationActivationMode":"toggle","audioRetentionDays":30,"soundsEnabled":false}"#).unwrap();
+        let store = SettingsStore::open(path.clone());
+        let legacy = store.get();
+        assert_eq!(legacy.ui_language, UiLanguage::Automatic);
+        assert_eq!(legacy.ui_theme, UiTheme::Automatic);
+
+        for (language, theme) in [
+            (UiLanguage::English, UiTheme::Dark),
+            (UiLanguage::French, UiTheme::Light),
+            (UiLanguage::Automatic, UiTheme::Automatic),
+        ] {
+            store.update(Some("interface"), |settings| {
+                settings.ui_language = language;
+                settings.ui_theme = theme;
+            });
+            let reopened = SettingsStore::open(path.clone()).get();
+            assert_eq!(
+                reopened,
+                Settings {
+                    ui_language: language,
+                    ui_theme: theme,
+                    ..legacy.clone()
+                }
+            );
+            assert_eq!(reopened.hotkey_key, HotkeyKey::CapsLock);
+            assert_eq!(
+                reopened.dictation_activation_mode,
+                DictationActivationMode::Toggle
+            );
+            assert_eq!(reopened.audio_retention_days, 30);
+            assert!(!reopened.sounds_enabled);
+        }
+    }
+
+    #[test]
+    fn unknown_ui_preferences_do_not_discard_other_settings() {
+        let settings: Settings = serde_json::from_str(
+            r#"{"uiLanguage":"futureLanguage","uiTheme":"futureTheme","audioRetentionDays":30}"#,
+        )
+        .unwrap();
+        assert_eq!(settings.ui_language, UiLanguage::Automatic);
+        assert_eq!(settings.ui_theme, UiTheme::Automatic);
+        assert_eq!(settings.audio_retention_days, 30);
     }
 
     #[test]

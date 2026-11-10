@@ -15,23 +15,60 @@
 //! Settings: the dictation key, what the pill shows, how a transcript is
 //! formatted, how long audio is kept, and the escape hatches.
 
+use crate::i18n::{Msg, tr};
 use crate::services::Services;
 use crate::text_field::TextField;
 use crate::theme::{self, Theme};
 use crate::views::widgets::{self, ButtonKind, StatusTone};
-use gpui::{Context, Entity, Role, SharedString, Window, div, prelude::*, relative};
+use gpui::{AnyElement, Context, Entity, Role, SharedString, Window, div, prelude::*, px};
 use jot_core::audio;
 use jot_core::credentials;
 use jot_core::gemini::KeyCheck;
 use jot_core::hotkey::{DictationActivationMode, HotkeyKey};
+use jot_core::settings::{Settings, UiLanguage, UiTheme};
 
 /// Audio retention options, in the order they read as a sentence.
-const RETENTION_CHOICES: [(i64, &str); 4] = [
-    (-1, "Never keep"),
-    (7, "7 days"),
-    (30, "30 days"),
-    (0, "Forever"),
+const RETENTION_CHOICES: [(i64, Msg); 4] = [
+    (-1, Msg::NeverKeep),
+    (7, Msg::SevenDays),
+    (30, Msg::ThirtyDays),
+    (0, Msg::Forever),
 ];
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Category {
+    General,
+    Shortcuts,
+    Transcription,
+    Audio,
+    Appearance,
+    Privacy,
+    Advanced,
+}
+
+impl Category {
+    const ALL: [Self; 7] = [
+        Self::General,
+        Self::Shortcuts,
+        Self::Transcription,
+        Self::Audio,
+        Self::Appearance,
+        Self::Privacy,
+        Self::Advanced,
+    ];
+
+    fn label(self) -> Msg {
+        match self {
+            Self::General => Msg::General,
+            Self::Shortcuts => Msg::Shortcuts,
+            Self::Transcription => Msg::Transcription,
+            Self::Audio => Msg::Audio,
+            Self::Appearance => Msg::Appearance,
+            Self::Privacy => Msg::Privacy,
+            Self::Advanced => Msg::Advanced,
+        }
+    }
+}
 
 pub struct SettingsView {
     services: Services,
@@ -39,11 +76,14 @@ pub struct SettingsView {
     endpoint: Entity<TextField>,
     transcribe_model: Entity<TextField>,
     cleanup_model: Entity<TextField>,
-    key_status: Option<(SharedString, StatusTone)>,
-    advanced_status: Option<SharedString>,
+    key_status: Option<(Msg, StatusTone)>,
+    advanced_status: Option<(Msg, StatusTone)>,
     /// True once the user has asked to wipe everything and been shown what
     /// that means.
     confirming_delete_all: bool,
+    confirming_remove_key: bool,
+    autostart_error: bool,
+    category: Category,
     /// Mirrors the registry so the switch shows what the machine actually does,
     /// not what we last asked for.
     autostart_enabled: bool,
@@ -84,18 +124,25 @@ impl SettingsView {
             services,
             // The stored key is never read back into the UI: it lives in the
             // credential manager and this field only ever writes a new one.
-            api_key: cx.new(|cx| {
-                TextField::new("settings-api-key", "Paste a new Gemini API key", cx).masked()
-            }),
+            api_key: cx.new(|cx| TextField::new("settings-api-key", Msg::PasteNewKey, cx).masked()),
             endpoint,
             transcribe_model,
             cleanup_model,
             key_status: None,
             advanced_status: None,
             confirming_delete_all: false,
+            confirming_remove_key: false,
+            autostart_error: false,
+            category: Category::Shortcuts,
             autostart_enabled: crate::autostart::is_enabled(),
             scroll: widgets::PageScroll::new(),
         }
+    }
+
+    pub fn dismiss_confirmations(&mut self, cx: &mut Context<Self>) {
+        self.confirming_delete_all = false;
+        self.confirming_remove_key = false;
+        cx.notify();
     }
 
     fn delete_all(&mut self, cx: &mut Context<Self>) {
@@ -111,30 +158,25 @@ impl SettingsView {
     }
 
     fn save_api_key(&mut self, cx: &mut Context<Self>) {
+        self.confirming_remove_key = false;
         let key = self.api_key.update(cx, |field, cx| {
             cx.notify();
             field.take_content()
         });
         let key = key.trim().to_string();
         if key.is_empty() {
-            self.key_status = Some((
-                "Nothing to save — paste a key first".into(),
-                StatusTone::Bad,
-            ));
+            self.key_status = Some((Msg::PasteKeyFirst, StatusTone::Bad));
             cx.notify();
             return;
         }
         if let Err(error) = credentials::set_api_key(&key) {
             // The message never contains the key itself.
             tracing::error!(%error, "storing the API key failed");
-            self.key_status = Some((
-                "Windows Credential Manager refused the key".into(),
-                StatusTone::Bad,
-            ));
+            self.key_status = Some((Msg::KeyStoreFailed, StatusTone::Bad));
             cx.notify();
             return;
         }
-        self.key_status = Some(("Saved — checking it works…".into(), StatusTone::Neutral));
+        self.key_status = Some((Msg::KeySavedChecking, StatusTone::Neutral));
         cx.notify();
 
         let client = self.services.client.clone();
@@ -142,17 +184,11 @@ impl SettingsView {
         cx.spawn(async move |this, cx| {
             let check = client.validate_key(&endpoint).await;
             let status = match check {
-                KeyCheck::Valid => ("Key works".into(), StatusTone::Good),
+                KeyCheck::Valid => (Msg::KeyWorks, StatusTone::Good),
                 // The server answered and the answer was no.
-                KeyCheck::Rejected(detail) => (
-                    SharedString::from(detail.unwrap_or_else(|| "Google rejected this key".into())),
-                    StatusTone::Bad,
-                ),
+                KeyCheck::Rejected(_) => (Msg::KeyRejected, StatusTone::Bad),
                 // Never blame the key for a network we could not reach.
-                KeyCheck::Unreachable => (
-                    "Saved, but Google was unreachable — it will be used anyway".into(),
-                    StatusTone::Neutral,
-                ),
+                KeyCheck::Unreachable => (Msg::KeyUnreachable, StatusTone::Neutral),
             };
             let _ = this.update(cx, |this, cx| {
                 this.key_status = Some(status);
@@ -163,13 +199,12 @@ impl SettingsView {
     }
 
     fn clear_api_key(&mut self, cx: &mut Context<Self>) {
+        self.confirming_remove_key = false;
         match credentials::clear_api_key() {
-            Ok(()) => {
-                self.key_status = Some(("Key removed from this PC".into(), StatusTone::Neutral))
-            }
+            Ok(()) => self.key_status = Some((Msg::KeyRemoved, StatusTone::Neutral)),
             Err(error) => {
                 tracing::error!(%error, "clearing the API key failed");
-                self.key_status = Some(("Could not remove the key".into(), StatusTone::Bad));
+                self.key_status = Some((Msg::KeyRemoveFailed, StatusTone::Bad));
             }
         }
         cx.notify();
@@ -184,8 +219,7 @@ impl SettingsView {
         // never disagree with which endpoint is actually in play.
         let endpoint_usable = jot_core::settings::Settings::usable_endpoint(Some(&endpoint));
         if !endpoint.is_empty() && endpoint_usable.is_none() {
-            self.advanced_status =
-                Some("That endpoint is not an http(s) URL — nothing was saved".into());
+            self.advanced_status = Some((Msg::InvalidEndpoint, StatusTone::Bad));
             cx.notify();
             return;
         }
@@ -195,24 +229,60 @@ impl SettingsView {
             settings.transcribe_model_override = (!transcribe.is_empty()).then_some(transcribe);
             settings.cleanup_model_override = (!cleanup.is_empty()).then_some(cleanup);
         });
-        self.advanced_status = Some("Saved — applies to your next dictation".into());
+        self.advanced_status = Some((Msg::AdvancedSaved, StatusTone::Good));
         cx.notify();
     }
 }
 
-impl Render for SettingsView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = Theme::current(window.appearance(), crate::window_shell::high_contrast());
-        let settings = self.services.settings.get();
+impl SettingsView {
+    fn general(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        widgets::section(
+            tr(Msg::General),
+            theme,
+            vec![
+                widgets::toggle(
+                    "autostart",
+                    tr(Msg::Autostart),
+                    tr(Msg::AutostartHint),
+                    self.autostart_enabled,
+                    theme,
+                    cx.listener(|this, _, _, cx| {
+                        let wanted = !this.autostart_enabled;
+                        this.autostart_error = !crate::autostart::set_enabled(wanted);
+                        if !this.autostart_error {
+                            this.autostart_enabled = wanted;
+                        } else {
+                            // The registry refused; do not show a toggle that
+                            // claims a state the machine does not have.
+                            this.autostart_enabled = crate::autostart::is_enabled();
+                        }
+                        cx.notify();
+                    }),
+                )
+                .into_any_element(),
+                div()
+                    .when(self.autostart_error, |row| {
+                        row.child(widgets::status_line(
+                            "autostart-error",
+                            tr(Msg::AutostartError),
+                            StatusTone::Bad,
+                            theme,
+                        ))
+                    })
+                    .into_any_element(),
+            ],
+        )
+        .into_any_element()
+    }
 
-        // ----- General
+    fn shortcuts(&self, theme: Theme, settings: &Settings, cx: &mut Context<Self>) -> AnyElement {
         let mut hotkey_row = div().flex().flex_wrap().gap(theme::spacing::XS);
         for key in HotkeyKey::ALL {
             let selected = settings.hotkey_key == key;
             let store = self.services.settings.clone();
             hotkey_row = hotkey_row.child(widgets::button(
                 ("hotkey", key.vk_code()),
-                key.display_name(),
+                crate::i18n::hotkey(key),
                 if selected {
                     ButtonKind::Primary
                 } else {
@@ -220,8 +290,9 @@ impl Render for SettingsView {
                 },
                 true,
                 theme,
-                move |_, _, _| {
+                move |_, _, cx| {
                     store.update(Some("hotkeyKey"), |settings| settings.hotkey_key = key);
+                    cx.refresh_windows();
                 },
             ));
         }
@@ -229,27 +300,29 @@ impl Render for SettingsView {
         let mut mode_row = div()
             .id("dictation-activation-options")
             .role(Role::RadioGroup)
-            .aria_label("Mode d’activation de la dictée")
+            .aria_label(tr(Msg::Activation))
             .flex()
             .flex_wrap()
             .gap(theme::spacing::XS);
-        for (id, mode, label) in [
+        for (id, mode, label, description) in [
             (
                 "dictation-hold",
                 DictationActivationMode::Hold,
-                "Maintenir pour parler",
+                Msg::Hold,
+                Msg::HoldHint,
             ),
             (
                 "dictation-toggle",
                 DictationActivationMode::Toggle,
-                "Appuyer pour démarrer / arrêter",
+                Msg::Toggle,
+                Msg::ToggleHint,
             ),
         ] {
             let selected = settings.dictation_activation_mode == mode;
             mode_row = mode_row.child(
                 widgets::button(
                     id,
-                    label,
+                    tr(label),
                     if selected {
                         ButtonKind::Primary
                     } else {
@@ -267,7 +340,18 @@ impl Render for SettingsView {
                         cx.notify();
                     }),
                 )
+                .flex_1()
+                .min_w(px(190.0))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_size(theme::type_scale::LABEL)
+                        .child(tr(description)),
+                )
                 .role(Role::RadioButton)
+                .aria_label(format!("{}. {}", tr(label), tr(description)))
                 .aria_toggled(if selected {
                     gpui::Toggled::True
                 } else {
@@ -276,6 +360,90 @@ impl Render for SettingsView {
             );
         }
 
+        widgets::section(
+            tr(Msg::Shortcuts),
+            theme,
+            vec![
+                widgets::field_row(
+                    tr(Msg::Activation),
+                    tr(Msg::ActivationHint),
+                    theme,
+                    mode_row,
+                )
+                .into_any_element(),
+                div()
+                    .text_size(theme::type_scale::LABEL)
+                    .text_color(theme.on_surface_variant)
+                    .child(tr(Msg::CancelShortcut))
+                    .into_any_element(),
+                widgets::field_row(tr(Msg::Hotkey), tr(Msg::HotkeyHint), theme, hotkey_row)
+                    .into_any_element(),
+                widgets::toggle(
+                    "double-tap",
+                    tr(Msg::DoubleTap),
+                    tr(Msg::DoubleTapHint),
+                    settings.double_tap_lock,
+                    theme,
+                    {
+                        let store = self.services.settings.clone();
+                        move |_, _, cx| {
+                            let next = !store.get().double_tap_lock;
+                            store.update(Some("doubleTapLock"), |s| s.double_tap_lock = next);
+                            cx.refresh_windows();
+                        }
+                    },
+                )
+                .into_any_element(),
+            ],
+        )
+        .into_any_element()
+    }
+
+    fn transcription(&self, theme: Theme, settings: &Settings) -> AnyElement {
+        widgets::section(
+            tr(Msg::Transcription),
+            theme,
+            vec![
+                widgets::toggle(
+                    "smart-transcription",
+                    tr(Msg::Smart),
+                    tr(Msg::SmartHint),
+                    settings.smart_transcription,
+                    theme,
+                    {
+                        let store = self.services.settings.clone();
+                        move |_, _, cx| {
+                            let next = !store.get().smart_transcription;
+                            store.update(Some("smartTranscription"), |s| {
+                                s.smart_transcription = next
+                            });
+                            cx.refresh_windows();
+                        }
+                    },
+                )
+                .into_any_element(),
+                widgets::toggle(
+                    "tone-pass",
+                    tr(Msg::Tone),
+                    tr(Msg::ToneHint),
+                    settings.smart_cleanup_pass,
+                    theme,
+                    {
+                        let store = self.services.settings.clone();
+                        move |_, _, cx| {
+                            let next = !store.get().smart_cleanup_pass;
+                            store.set_smart_cleanup_pass(next);
+                            cx.refresh_windows();
+                        }
+                    },
+                )
+                .into_any_element(),
+            ],
+        )
+        .into_any_element()
+    }
+
+    fn audio(&self, theme: Theme, settings: &Settings) -> AnyElement {
         let mut microphone_row = div().flex().flex_wrap().gap(theme::spacing::XS);
         let devices = audio::input_device_names();
         let chosen = settings.preferred_input_device.clone();
@@ -287,7 +455,7 @@ impl Render for SettingsView {
             let store = self.services.settings.clone();
             let label = choice
                 .clone()
-                .unwrap_or_else(|| "System default".to_string());
+                .unwrap_or_else(|| tr(Msg::DefaultDevice).to_string());
             let value = choice.clone();
             microphone_row = microphone_row.child(widgets::button(
                 SharedString::from(format!("microphone-{index}")),
@@ -299,174 +467,74 @@ impl Render for SettingsView {
                 },
                 true,
                 theme,
-                move |_, _, _| {
+                move |_, _, cx| {
                     let value = value.clone();
                     store.update(Some("preferredInputDevice"), |settings| {
                         settings.preferred_input_device = value;
                     });
+                    cx.refresh_windows();
                 },
             ));
         }
 
-        let general = widgets::section(
-            "General",
+        widgets::section(
+            tr(Msg::Audio),
             theme,
             vec![
                 widgets::field_row(
-                    "Dictation key",
-                    "Windows has no fn key, so pick a bare key you never press alone",
-                    theme,
-                    hotkey_row,
-                )
-                .into_any_element(),
-                widgets::field_row(
-                    "Mode d’activation de la dictée",
-                    "Ce choix s’applique à la prochaine dictée.",
-                    theme,
-                    mode_row,
-                )
-                .into_any_element(),
-                widgets::field_row(
-                    "Microphone",
-                    "A device you pick is never silently swapped for another",
+                    tr(Msg::Microphone),
+                    tr(Msg::MicrophoneHint),
                     theme,
                     microphone_row,
                 )
                 .into_any_element(),
                 widgets::toggle(
-                    "idle-indicator",
-                    "Show the resting indicator",
-                    "A thin bar at the bottom of the screen when Jot is idle",
-                    settings.show_idle_indicator,
-                    theme,
-                    {
-                        let store = self.services.settings.clone();
-                        move |_, _, _| {
-                            let next = !store.get().show_idle_indicator;
-                            store.update(Some("showIdleIndicator"), |s| {
-                                s.show_idle_indicator = next
-                            });
-                        }
-                    },
-                )
-                .into_any_element(),
-                widgets::toggle(
-                    "autostart",
-                    "Start with Windows",
-                    "A dictation key you have to launch first gets used once",
-                    self.autostart_enabled,
-                    theme,
-                    cx.listener(|this, _, _, cx| {
-                        let wanted = !this.autostart_enabled;
-                        if crate::autostart::set_enabled(wanted) {
-                            this.autostart_enabled = wanted;
-                        } else {
-                            // The registry refused; do not show a toggle that
-                            // claims a state the machine does not have.
-                            this.autostart_enabled = crate::autostart::is_enabled();
-                        }
-                        cx.notify();
-                    }),
-                )
-                .into_any_element(),
-                widgets::toggle(
                     "sounds",
-                    "Sounds",
-                    "Short earcons when a dictation starts, lands, or fails",
+                    tr(Msg::Sounds),
+                    tr(Msg::SoundsHint),
                     settings.sounds_enabled,
                     theme,
                     {
                         let store = self.services.settings.clone();
-                        move |_, _, _| {
+                        move |_, _, cx| {
                             let next = !store.get().sounds_enabled;
                             store.update(Some("soundsEnabled"), |s| s.sounds_enabled = next);
-                        }
-                    },
-                )
-                .into_any_element(),
-                widgets::toggle(
-                    "double-tap",
-                    "Double-tap to lock hands-free",
-                    "Hold mode only. You can also hold the key and tap Space to lock",
-                    settings.double_tap_lock,
-                    theme,
-                    {
-                        let store = self.services.settings.clone();
-                        move |_, _, _| {
-                            let next = !store.get().double_tap_lock;
-                            store.update(Some("doubleTapLock"), |s| s.double_tap_lock = next);
-                        }
-                    },
-                )
-                .into_any_element(),
-            ],
-        );
-
-        // ----- Dictation
-        let dictation = widgets::section(
-            "Dictation",
-            theme,
-            vec![
-                widgets::toggle(
-                    "smart-transcription",
-                    "Smart transcription",
-                    "The model removes fillers and follows a change of mind. Off gives you exactly what you said",
-                    settings.smart_transcription,
-                    theme,
-                    {
-                        let store = self.services.settings.clone();
-                        move |_, _, _| {
-                            let next = !store.get().smart_transcription;
-                            store.update(Some("smartTranscription"), |s| {
-                                s.smart_transcription = next
-                            });
-                        }
-                    },
-                )
-                .into_any_element(),
-                widgets::toggle(
-                    "tone-pass",
-                    "Match the tone of the app you're in",
-                    "A second, optional model pass. Costs a round trip and sends the transcript text again",
-                    settings.smart_cleanup_pass,
-                    theme,
-                    {
-                        let store = self.services.settings.clone();
-                        move |_, _, _| {
-                            let next = !store.get().smart_cleanup_pass;
-                            store.set_smart_cleanup_pass(next);
+                            cx.refresh_windows();
                         }
                     },
                 )
                 .into_any_element(),
                 widgets::toggle(
                     "noise-handling",
-                    "Judge speech against the room (experimental)",
-                    "Helps in a loud room. Jot measures the room either way; this decides whether it acts on it",
+                    tr(Msg::Noise),
+                    tr(Msg::NoiseHint),
                     settings.experimental_noise_handling,
                     theme,
                     {
                         let store = self.services.settings.clone();
-                        move |_, _, _| {
+                        move |_, _, cx| {
                             let next = !store.get().experimental_noise_handling;
                             store.update(Some("experimentalNoiseHandling"), |s| {
                                 s.experimental_noise_handling = next
                             });
+                            cx.refresh_windows();
                         }
                     },
                 )
                 .into_any_element(),
             ],
-        );
+        )
+        .into_any_element()
+    }
 
-        // ----- Privacy
+    fn privacy(&self, theme: Theme, settings: &Settings, cx: &mut Context<Self>) -> AnyElement {
         let mut retention_row = div().flex().flex_wrap().gap(theme::spacing::XS);
         for (days, label) in RETENTION_CHOICES {
             let selected = settings.audio_retention_days == days;
             let store = self.services.settings.clone();
             retention_row = retention_row.child(widgets::button(
                 ("retention", days as u64),
-                label,
+                tr(label),
                 if selected {
                     ButtonKind::Primary
                 } else {
@@ -474,36 +542,34 @@ impl Render for SettingsView {
                 },
                 true,
                 theme,
-                move |_, _, _| {
+                move |_, _, cx| {
                     store.update(Some("audioRetentionDays"), |settings| {
                         settings.audio_retention_days = days
                     });
+                    cx.refresh_windows();
                 },
             ));
         }
 
-        let privacy = widgets::section(
-            "Privacy",
+        widgets::section(
+            tr(Msg::Privacy),
             theme,
             vec![
                 div()
                     .text_size(theme::type_scale::BODY)
                     .text_color(theme.on_surface_variant)
-                    .child(
-                        "Your voice goes from this PC straight to the Gemini API with your key. \
-                         No middleman server, no account, no analytics.",
-                    )
+                    .child(tr(Msg::VoicePrivacy))
                     .into_any_element(),
                 widgets::field_row(
-                    "Keep recordings for",
-                    "Transcripts are kept until you delete them",
+                    tr(Msg::Retention),
+                    tr(Msg::RetentionHint),
                     theme,
                     retention_row,
                 )
                 .into_any_element(),
                 widgets::field_row(
-                    "Gemini API key",
-                    "Stored in Windows Credential Manager, never in a settings file",
+                    tr(Msg::ApiKey),
+                    tr(Msg::ApiKeyHint),
                     theme,
                     div()
                         .flex()
@@ -516,7 +582,7 @@ impl Render for SettingsView {
                                 .gap(theme::spacing::XS)
                                 .child(widgets::button(
                                     "save-key",
-                                    "Save key",
+                                    tr(Msg::SaveKey),
                                     ButtonKind::Primary,
                                     true,
                                     theme,
@@ -524,25 +590,60 @@ impl Render for SettingsView {
                                 ))
                                 .child(widgets::button(
                                     "clear-key",
-                                    "Remove key",
+                                    tr(Msg::RemoveKey),
                                     ButtonKind::Destructive,
                                     true,
                                     theme,
-                                    cx.listener(|this, _, _, cx| this.clear_api_key(cx)),
+                                    cx.listener(|this, _, _, cx| {
+                                        this.confirming_remove_key = true;
+                                        cx.notify();
+                                    }),
                                 )),
                         )
-                        .when_some(self.key_status.clone(), |column, (message, tone)| {
+                        .when(self.confirming_remove_key, |column| {
+                            column
+                                .child(widgets::status_line(
+                                    "remove-key-warning",
+                                    tr(Msg::RemoveKeyConfirm),
+                                    StatusTone::Bad,
+                                    theme,
+                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        .child(widgets::button(
+                                            "remove-key-confirm",
+                                            tr(Msg::RemoveKey),
+                                            ButtonKind::Destructive,
+                                            true,
+                                            theme,
+                                            cx.listener(|this, _, _, cx| this.clear_api_key(cx)),
+                                        ))
+                                        .child(widgets::button(
+                                            "remove-key-cancel",
+                                            tr(Msg::Cancel),
+                                            ButtonKind::Secondary,
+                                            true,
+                                            theme,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.confirming_remove_key = false;
+                                                cx.notify();
+                                            }),
+                                        )),
+                                )
+                        })
+                        .when_some(self.key_status, |column, (message, tone)| {
                             column.child(widgets::status_line(
                                 "settings-key-status",
-                                message,
+                                tr(message),
                                 tone,
                                 theme,
                             ))
                         }),
                 )
                 .into_any_element(),
-                // Two steps, because this is the one control in the app that
-                // destroys data with no way back.
                 if self.confirming_delete_all {
                     div()
                         .flex()
@@ -550,10 +651,7 @@ impl Render for SettingsView {
                         .gap(theme::spacing::XS)
                         .child(widgets::status_line(
                             "delete-all-warning",
-                            format!(
-                                "Delete {} saved dictations and every recording? This cannot be undone.",
-                                self.services.history.stats().total_dictations
-                            ),
+                            tr(Msg::DeleteAllWarning),
                             StatusTone::Bad,
                             theme,
                         ))
@@ -563,7 +661,7 @@ impl Render for SettingsView {
                                 .gap(theme::spacing::XS)
                                 .child(widgets::button(
                                     "delete-all-confirm",
-                                    "Yes, delete everything",
+                                    tr(Msg::DeleteAllConfirm),
                                     ButtonKind::Destructive,
                                     true,
                                     theme,
@@ -571,7 +669,7 @@ impl Render for SettingsView {
                                 ))
                                 .child(widgets::button(
                                     "delete-all-cancel",
-                                    "Cancel",
+                                    tr(Msg::Cancel),
                                     ButtonKind::Secondary,
                                     true,
                                     theme,
@@ -585,7 +683,7 @@ impl Render for SettingsView {
                 } else {
                     widgets::hug(widgets::button(
                         "delete-all",
-                        "Delete all history and recordings",
+                        tr(Msg::DeleteAll),
                         ButtonKind::Destructive,
                         true,
                         theme,
@@ -597,36 +695,45 @@ impl Render for SettingsView {
                     .into_any_element()
                 },
             ],
-        );
+        )
+        .into_any_element()
+    }
 
-        // ----- Advanced
-        let advanced = widgets::section(
-            "Advanced",
+    fn advanced(&self, theme: Theme, settings: &Settings, cx: &mut Context<Self>) -> AnyElement {
+        widgets::section(
+            tr(Msg::Advanced),
             theme,
             vec![
                 div()
                     .text_size(theme::type_scale::LABEL)
                     .text_color(theme.on_surface_variant)
-                    .child("Leave these empty unless a model was renamed or you are pointing Jot at a proxy.")
+                    .child(tr(Msg::AdvancedHint))
                     .into_any_element(),
-                widgets::field_row("API endpoint", "", theme, self.endpoint.clone()).into_any_element(),
-                widgets::field_row("Transcription model", "", theme, self.transcribe_model.clone())
+                widgets::field_row(tr(Msg::Endpoint), "", theme, self.endpoint.clone())
                     .into_any_element(),
-                widgets::field_row("Tone-pass model", "", theme, self.cleanup_model.clone())
+                widgets::field_row(
+                    tr(Msg::TranscribeModel),
+                    "",
+                    theme,
+                    self.transcribe_model.clone(),
+                )
+                .into_any_element(),
+                widgets::field_row(tr(Msg::CleanupModel), "", theme, self.cleanup_model.clone())
                     .into_any_element(),
                 widgets::toggle(
                     "legacy-endpoint",
-                    "Use the legacy transcription endpoint",
-                    "An escape hatch if smart transcription regresses. Smart formatting is unavailable there",
+                    tr(Msg::Legacy),
+                    tr(Msg::LegacyHint),
                     settings.legacy_transcribe_endpoint,
                     theme,
                     {
                         let store = self.services.settings.clone();
-                        move |_, _, _| {
+                        move |_, _, cx| {
                             let next = !store.get().legacy_transcribe_endpoint;
                             store.update(Some("legacyTranscribeEndpoint"), |s| {
                                 s.legacy_transcribe_endpoint = next
                             });
+                            cx.refresh_windows();
                         }
                     },
                 )
@@ -636,7 +743,7 @@ impl Render for SettingsView {
                     .gap(theme::spacing::XS)
                     .child(widgets::button(
                         "save-advanced",
-                        "Save",
+                        tr(Msg::Save),
                         ButtonKind::Primary,
                         true,
                         theme,
@@ -644,31 +751,186 @@ impl Render for SettingsView {
                     ))
                     .into_any_element(),
                 div()
-                    .when_some(self.advanced_status.clone(), |row, message| {
-                        row.child(widgets::status_line("settings-advanced-status", message, StatusTone::Neutral, theme))
+                    .when_some(self.advanced_status, |row, (message, tone)| {
+                        row.child(widgets::status_line(
+                            "settings-advanced-status",
+                            tr(message),
+                            tone,
+                            theme,
+                        ))
                     })
                     .into_any_element(),
             ],
+        )
+        .into_any_element()
+    }
+
+    fn appearance(&self, theme: Theme, settings: &Settings) -> AnyElement {
+        let language = choices(
+            "ui-language",
+            Msg::Language,
+            [
+                (UiLanguage::Automatic, Msg::Automatic),
+                (UiLanguage::French, Msg::French),
+                (UiLanguage::English, Msg::English),
+            ],
+            settings.ui_language,
+            theme,
+            {
+                let store = self.services.settings.clone();
+                move |language, cx| {
+                    store.update(Some("uiLanguage"), |settings| {
+                        settings.ui_language = language
+                    });
+                    crate::i18n::select(language);
+                    crate::tray::refresh_tooltip();
+                    super::refresh_language(cx);
+                }
+            },
         );
+        let palette = choices(
+            "ui-theme",
+            Msg::Theme,
+            [
+                (UiTheme::Automatic, Msg::Automatic),
+                (UiTheme::Light, Msg::ThemeLight),
+                (UiTheme::Dark, Msg::ThemeDark),
+            ],
+            settings.ui_theme,
+            theme,
+            {
+                let store = self.services.settings.clone();
+                move |theme, cx| {
+                    store.update(Some("uiTheme"), |settings| settings.ui_theme = theme);
+                    cx.refresh_windows();
+                }
+            },
+        );
+        widgets::section(
+            tr(Msg::Appearance),
+            theme,
+            vec![
+                widgets::field_row(tr(Msg::Language), tr(Msg::LanguageHint), theme, language)
+                    .into_any_element(),
+                widgets::field_row(tr(Msg::Theme), "", theme, palette).into_any_element(),
+                widgets::toggle(
+                    "idle-indicator",
+                    tr(Msg::IdleIndicator),
+                    tr(Msg::IdleIndicatorHint),
+                    settings.show_idle_indicator,
+                    theme,
+                    {
+                        let store = self.services.settings.clone();
+                        move |_, _, cx| {
+                            let next = !store.get().show_idle_indicator;
+                            store.update(Some("showIdleIndicator"), |s| {
+                                s.show_idle_indicator = next
+                            });
+                            cx.refresh_windows();
+                        }
+                    },
+                )
+                .into_any_element(),
+            ],
+        )
+        .into_any_element()
+    }
+}
+
+fn choices<T: Copy + PartialEq + 'static, const N: usize>(
+    id: &'static str,
+    group_label: Msg,
+    choices: [(T, Msg); N],
+    current: T,
+    theme: Theme,
+    select: impl Fn(T, &mut gpui::App) + Clone + 'static,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .role(Role::RadioGroup)
+        .aria_label(tr(group_label))
+        .flex()
+        .flex_wrap()
+        .gap_2()
+        .children(
+            choices
+                .into_iter()
+                .enumerate()
+                .map(|(index, (value, label))| {
+                    let selected = value == current;
+                    let select = select.clone();
+                    widgets::button(
+                        (id, index),
+                        tr(label),
+                        if selected {
+                            ButtonKind::Selected
+                        } else {
+                            ButtonKind::Secondary
+                        },
+                        true,
+                        theme,
+                        move |_, _, cx| select(value, cx),
+                    )
+                    .role(Role::RadioButton)
+                    .aria_toggled(if selected {
+                        gpui::Toggled::True
+                    } else {
+                        gpui::Toggled::False
+                    })
+                }),
+        )
+}
+
+impl Render for SettingsView {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = Theme::ui(window);
+        let settings = self.services.settings.get();
+        let menu = div()
+            .id("settings-navigation")
+            .role(Role::TabList)
+            .aria_label(tr(Msg::SettingsNavigation))
+            .flex()
+            .flex_wrap()
+            .gap_2()
+            .children(
+                Category::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, category)| {
+                        let selected = self.category == category;
+                        widgets::navigation_button(
+                            ("settings-category", index),
+                            tr(category.label()),
+                            selected,
+                            theme,
+                            cx.listener(move |this, _, _, cx| {
+                                this.category = category;
+                                this.confirming_delete_all = false;
+                                this.confirming_remove_key = false;
+                                this.scroll.reset();
+                                cx.notify();
+                            }),
+                        )
+                    }),
+            );
+        let section = match self.category {
+            Category::General => self.general(theme, cx),
+            Category::Shortcuts => self.shortcuts(theme, &settings, cx),
+            Category::Transcription => self.transcription(theme, &settings),
+            Category::Audio => self.audio(theme, &settings),
+            Category::Appearance => self.appearance(theme, &settings),
+            Category::Privacy => self.privacy(theme, &settings, cx),
+            Category::Advanced => self.advanced(theme, &settings, cx),
+        };
 
         widgets::page(
             "settings",
             theme,
             &self.scroll,
             vec![
-                div()
-                    .id("heading")
-                    .role(Role::Heading)
-                    .aria_level(1)
-                    .text_size(theme::type_scale::HEADLINE)
-                    .font_weight(theme::weight::MEDIUM)
-                    .line_height(relative(theme::line_height::TIGHT))
-                    .child("Settings")
-                    .into_any_element(),
-                general.into_any_element(),
-                dictation.into_any_element(),
-                privacy.into_any_element(),
-                advanced.into_any_element(),
+                widgets::heading(Msg::Settings).into_any_element(),
+                menu.into_any_element(),
+                section,
             ],
         )
     }
