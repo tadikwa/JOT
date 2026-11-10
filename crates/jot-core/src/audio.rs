@@ -266,6 +266,7 @@ impl AudioCapturing for WasapiCapture {
         let writer = open_writer(path)?;
 
         let (chunk_tx, chunk_rx) = sync_channel::<Chunk>(CHUNK_QUEUE_DEPTH);
+        let (ready_tx, ready_rx) = sync_channel(1);
         let callbacks = self.callbacks.clone();
         let stop_flag = self.stop_flag.clone();
         stop_flag.store(false, Ordering::SeqCst);
@@ -275,20 +276,33 @@ impl AudioCapturing for WasapiCapture {
         let engine = std::thread::Builder::new()
             .name("jot-audio".into())
             .spawn(move || {
-                run_engine(EngineArgs {
-                    device,
-                    config,
-                    writer,
-                    path,
-                    chunk_tx,
-                    chunk_rx,
-                    callbacks,
-                    stop_flag,
-                    preferred,
-                })
+                run_engine(
+                    EngineArgs {
+                        device,
+                        config,
+                        writer,
+                        path,
+                        chunk_tx,
+                        chunk_rx,
+                        callbacks,
+                        stop_flag,
+                        preferred,
+                    },
+                    ready_tx,
+                )
             })
             .map_err(|error| CaptureError::Io(error.to_string()))?;
 
+        // Opening the device is not enough: stream creation and play can fail
+        // on the audio thread before the coordinator starts showing Recording.
+        if let Err(error) = ready_rx.recv().unwrap_or_else(|error| {
+            Err(CaptureError::Config(format!(
+                "audio thread stopped: {error}"
+            )))
+        }) {
+            let _ = engine.join();
+            return Err(error);
+        }
         self.engine = Some(engine);
         Ok(())
     }
@@ -340,7 +354,7 @@ struct EngineArgs {
     preferred: Option<String>,
 }
 
-fn run_engine(args: EngineArgs) -> Tally {
+fn run_engine(args: EngineArgs, ready: SyncSender<Result<(), CaptureError>>) -> Tally {
     let EngineArgs {
         device,
         config,
@@ -363,10 +377,11 @@ fn run_engine(args: EngineArgs) -> Tally {
     let mut stream = match build_stream(&device, &config, chunk_tx.clone(), overflowed.clone()) {
         Ok(stream) => Some(stream),
         Err(error) => {
-            notify_engine_died(&callbacks, &format!("Microphone stopped ({error})"));
-            None
+            let _ = ready.send(Err(error));
+            return tally;
         }
     };
+    let _ = ready.send(Ok(()));
 
     let mut last_housekeeping = Instant::now();
     let mut write_failures = 0_u32;

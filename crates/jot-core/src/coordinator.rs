@@ -303,7 +303,10 @@ impl DictationCoordinator {
     fn begin_session(self: &Arc<Self>) -> bool {
         {
             let inner = self.inner.lock();
-            if !(inner.state == DictationState::Idle || inner.state.is_terminal()) {
+            // Cancelled is visible before capture teardown and retention finish.
+            if inner.session.is_some()
+                || !(inner.state == DictationState::Idle || inner.state.is_terminal())
+            {
                 tracing::info!(state = ?inner.state, "begin ignored: session already active");
                 return false;
             }
@@ -429,7 +432,9 @@ impl DictationCoordinator {
             Ok(()) => {
                 let mut inner = self.inner.lock();
                 // Re-check: the session can end while the device was opening.
-                if inner.session.as_ref().is_none_or(|s| s.id != session_id) {
+                if inner.state != DictationState::Warming
+                    || inner.session.as_ref().is_none_or(|s| s.id != session_id)
+                {
                     drop(inner);
                     let _ = capture.stop();
                     return;
@@ -440,8 +445,7 @@ impl DictationCoordinator {
                     inner.pending_lock_in = false;
                     self.apply(&mut inner, DictationEvent::LockIn);
                 }
-                drop(inner);
-                self.start_cap_timers();
+                self.start_cap_timers(&mut inner);
             }
             Err(error) => {
                 tracing::error!(%error, "audio engine failed to start");
@@ -455,15 +459,19 @@ impl DictationCoordinator {
                     DictationFailure::Audio
                 };
                 let mut inner = self.inner.lock();
-                self.apply(&mut inner, DictationEvent::EngineFailed(failure));
-                self.discard_session_artifacts(&mut inner);
+                if inner.state == DictationState::Warming
+                    && inner.session.as_ref().is_some_and(|s| s.id == session_id)
+                {
+                    self.apply(&mut inner, DictationEvent::EngineFailed(failure));
+                    self.discard_session_artifacts(&mut inner);
+                }
             }
         }
     }
 
     // ----- Recording cap and disk failure
 
-    fn start_cap_timers(self: &Arc<Self>) {
+    fn start_cap_timers(self: &Arc<Self>, inner: &mut Inner) {
         let warn = {
             let coordinator = self.clone();
             crate::runtime::spawn(async move {
@@ -485,7 +493,7 @@ impl DictationCoordinator {
             })
             .abort_handle()
         };
-        self.inner.lock().cap_tasks = vec![warn, stop];
+        inner.cap_tasks = vec![warn, stop];
     }
 
     fn handle_write_failure(self: &Arc<Self>) {
@@ -613,6 +621,9 @@ impl DictationCoordinator {
         while start.elapsed() < TRAILING_CAPTURE_CAP {
             tokio::time::sleep(TRAILING_POLL).await;
             let inner = self.inner.lock();
+            if inner.state != DictationState::Finalizing {
+                break;
+            }
             let quiet = inner.latest_level < Self::trailing_threshold(&inner);
             drop(inner);
             if quiet {
@@ -636,6 +647,12 @@ impl DictationCoordinator {
             let Some(session) = inner.session.as_ref() else {
                 return;
             };
+            // If Esc arrived while the WAV was flushing, the finalizer still
+            // owns the capture and has the actual duration for retention.
+            if inner.state == DictationState::Cancelled {
+                self.complete_cancel(&mut inner, Some(result));
+                return;
+            }
             let held_for = ((self.deps.now)() - session.started_at)
                 .try_into()
                 .unwrap_or(Duration::ZERO);
@@ -717,6 +734,12 @@ impl DictationCoordinator {
 
         let coordinator = self.clone();
         let started = Instant::now();
+        let mut inner = self.inner.lock();
+        if inner.state != DictationState::Transcribing
+            || inner.session.as_ref().is_none_or(|s| s.id != session_id)
+        {
+            return;
+        }
         let handle = crate::runtime::spawn(async move {
             let audio = file_layout::audio_wav(&folder);
             match coordinator
@@ -733,7 +756,7 @@ impl DictationCoordinator {
                 Err(error) => coordinator.fail_transcription(session_id, error),
             }
         });
-        self.inner.lock().in_flight = Some(handle.abort_handle());
+        inner.in_flight = Some(handle.abort_handle());
     }
 
     async fn complete_transcription(
@@ -744,8 +767,10 @@ impl DictationCoordinator {
     ) {
         let context = {
             let mut inner = self.inner.lock();
-            // Stale completion.
-            if inner.session.as_ref().is_none_or(|s| s.id != session_id) {
+            // Abort does not interrupt a result already waiting on this lock.
+            if inner.state != DictationState::Transcribing
+                || inner.session.as_ref().is_none_or(|s| s.id != session_id)
+            {
                 return;
             }
             if let Some(session) = inner.session.as_mut() {
@@ -809,7 +834,9 @@ impl DictationCoordinator {
 
     fn fail_transcription(self: &Arc<Self>, session_id: Uuid, error: TranscriptionError) {
         let mut inner = self.inner.lock();
-        if inner.session.as_ref().is_none_or(|s| s.id != session_id) {
+        if inner.state != DictationState::Transcribing
+            || inner.session.as_ref().is_none_or(|s| s.id != session_id)
+        {
             return;
         }
 
@@ -891,8 +918,9 @@ impl DictationCoordinator {
     }
 
     fn cancel_session(self: &Arc<Self>, hint: Option<String>) {
-        let engine = {
+        let (engine, was_finalizing) = {
             let mut inner = self.inner.lock();
+            let was_finalizing = inner.state == DictationState::Finalizing;
             // The machine decides first; side effects only on an ACCEPTED
             // cancel — a rejected cancel must not corrupt meta or the session.
             if !self.apply(&mut inner, DictationEvent::Cancel) {
@@ -906,10 +934,13 @@ impl DictationCoordinator {
             inner.mic_level = 0.0;
             let _ = self.updates.send(CoordinatorUpdate::MicLevel(0.0));
             self.stop_cap_timers(&mut inner);
-            inner.capture.take()
+            (inner.capture.take(), was_finalizing)
         };
         // Feedback is immediate; the bookkeeping can wait.
         self.emit_hint(hint);
+        if was_finalizing {
+            return;
+        }
 
         // Teardown drains the tail, so the keep-or-discard decision — which
         // needs the real recorded duration — completes after it. The pill is
@@ -922,12 +953,11 @@ impl DictationCoordinator {
                     .ok(),
                 None => None,
             };
-            coordinator.complete_cancel(result);
+            coordinator.complete_cancel(&mut coordinator.inner.lock(), result);
         });
     }
 
-    fn complete_cancel(self: &Arc<Self>, result: Option<AudioCaptureResult>) {
-        let mut inner = self.inner.lock();
+    fn complete_cancel(&self, inner: &mut Inner, result: Option<AudioCaptureResult>) {
         // Post-finalize cancels have no live capture — fall back to the duration
         // finalize already persisted. Reading 0 here would destroy a recording
         // of ANY length when Esc lands during transcription.
@@ -947,7 +977,7 @@ impl DictationCoordinator {
 
         if has_transcript || duration >= CANCEL_KEEP_THRESHOLD {
             // Long cancels stay recoverable — History shows them with Retry.
-            self.mutate_meta(&mut inner, |meta| {
+            self.mutate_meta(inner, |meta| {
                 meta.status = SessionStatus::Cancelled;
                 if meta.audio_duration_seconds.is_none() {
                     meta.audio_duration_seconds = Some(duration);
@@ -958,7 +988,7 @@ impl DictationCoordinator {
             // Blips and short deliberate cancels leave no trace: the pill
             // already gave feedback in the moment; hidden audio is pure
             // liability.
-            self.discard_session_artifacts(&mut inner);
+            self.discard_session_artifacts(inner);
         }
     }
 
@@ -1502,6 +1532,87 @@ mod tests {
 
         assert_eq!(harness.coordinator.state(), DictationState::Cancelled);
         assert_eq!(harness.discarded.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn transcription_completions_cannot_modify_a_cancelled_session() {
+        for succeeds in [true, false] {
+            let harness = harness(
+                FakeCapture::default(),
+                None,
+                InsertionOutcome::Inserted,
+                false,
+            );
+            let coordinator = &harness.coordinator;
+            assert!(coordinator.handle(HotkeyIntent::Begin));
+            settle().await;
+            let id = {
+                // Freeze the interleaving: the network result has arrived, but
+                // has not yet acquired the lock to finish the transcription.
+                let mut inner = coordinator.inner.lock();
+                assert!(coordinator.apply(&mut inner, DictationEvent::Finalize));
+                assert!(coordinator.apply(&mut inner, DictationEvent::AudioFinalized));
+                inner.session.as_ref().unwrap().id
+            };
+            let folder = coordinator.active_session_folder().unwrap();
+            assert!(!coordinator.handle(HotkeyIntent::Begin));
+            assert!(coordinator.handle(HotkeyIntent::Cancel));
+            if succeeds {
+                coordinator
+                    .complete_transcription(
+                        id,
+                        TranscriptionResult {
+                            raw_transcript: "must not land".into(),
+                            cleaned_transcript: "Must not land.".into(),
+                            model_id: "test".into(),
+                        },
+                        Instant::now(),
+                    )
+                    .await;
+            } else {
+                coordinator.fail_transcription(id, TranscriptionError::Auth);
+            }
+            assert_eq!(coordinator.state(), DictationState::Cancelled);
+            assert!(coordinator.last_result().is_none());
+            assert_eq!(coordinator.active_session_folder(), Some(folder));
+            settle().await;
+            assert_eq!(harness.discarded.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn escape_during_finalizing_keeps_long_audio_without_transcribing() {
+        let harness = harness(
+            FakeCapture {
+                result: AudioCaptureResult {
+                    frames_written: 16_000 * 45,
+                    duration_seconds: 45.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            None,
+            InsertionOutcome::Inserted,
+            false,
+        );
+        let coordinator = &harness.coordinator;
+        assert!(coordinator.handle(HotkeyIntent::Begin));
+        settle().await;
+        let folder = coordinator.active_session_folder().unwrap();
+        coordinator.handle(HotkeyIntent::Finalize);
+        assert_eq!(coordinator.state(), DictationState::Finalizing);
+        coordinator.handle(HotkeyIntent::Cancel);
+        assert_eq!(coordinator.state(), DictationState::Cancelled);
+        assert!(!coordinator.handle(HotkeyIntent::Begin));
+        settle().await;
+        assert_eq!(harness.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            SessionMeta::read(&folder).unwrap().status,
+            SessionStatus::Cancelled
+        );
+        assert!(coordinator.handle(HotkeyIntent::Begin));
+        settle().await;
+        assert!(coordinator.state().is_recording());
     }
 
     #[tokio::test]

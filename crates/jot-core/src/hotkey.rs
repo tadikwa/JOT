@@ -89,6 +89,15 @@ impl HotkeyKey {
     }
 }
 
+/// How the configured key starts and stops a dictation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DictationActivationMode {
+    #[default]
+    Hold,
+    Toggle,
+}
+
 /// What the hotkey layer asks the session coordinator to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HotkeyIntent {
@@ -149,7 +158,7 @@ enum Phase {
     /// Key physically down, classification pending (hold vs tap).
     Pressed {
         down_at: Duration,
-        session_start_at: Duration,
+        mode: DictationActivationMode,
     },
     /// First short tap released; waiting for a possible second tap. Still recording.
     PendingSecondTap { session_start_at: Duration },
@@ -157,7 +166,9 @@ enum Phase {
     Locked,
 }
 
-/// The pure hotkey grammar:
+/// The pure hotkey grammar. In Toggle, the first press starts recording, its
+/// release locks it hands-free, and the next distinct press finalizes.
+/// The legacy Hold gestures are:
 ///
 /// ```text
 ///   hold >= 0.3s           -> push-to-talk: key-up finalizes
@@ -176,9 +187,9 @@ enum Phase {
 #[derive(Debug, Default)]
 pub struct HotkeyProcessor {
     phase: Phase,
-    /// When set, the next key-up of the hotkey belongs to an already-classified
-    /// press (lock stop, cancel, abort) and must be swallowed without effects.
-    swallow_next_up: bool,
+    /// Keep tracking the physical press even if the gesture ends before key-up.
+    key_down: bool,
+    pub activation_mode: DictationActivationMode,
     /// When off, a short tap hints immediately and never arms the double-tap
     /// window. Default OFF: firm taps routinely exceed the hold threshold,
     /// misreading tap-tap as hold→finalize. Space-while-holding replaced it.
@@ -190,17 +201,25 @@ impl HotkeyProcessor {
         Self::default()
     }
 
-    /// Snap back to idle after the coordinator REFUSES a begin (password field,
-    /// busy) — otherwise a Space-lock on the phantom session strands the grammar
-    /// in `Locked` and silently eats the next dictation attempt.
+    /// Forget the gesture when the coordinator refuses or ends a recording.
+    /// A physical key-up is still required before accepting a fresh press.
     pub fn reset(&mut self) {
         self.phase = Phase::Idle;
-        self.swallow_next_up = false;
     }
 
-    /// True while the hotkey is physically down (the Space-lock gesture window).
-    pub fn is_key_held(&self) -> bool {
-        matches!(self.phase, Phase::Pressed { .. })
+    pub fn is_key_down(&self) -> bool {
+        self.key_down
+    }
+
+    /// Whether Space currently means the hands-free gesture.
+    pub fn can_space_lock(&self) -> bool {
+        matches!(
+            self.phase,
+            Phase::Pressed {
+                mode: DictationActivationMode::Hold,
+                ..
+            }
+        )
     }
 
     /// True whenever a dictation session is in flight from the hotkey's
@@ -212,36 +231,44 @@ impl HotkeyProcessor {
     pub fn handle(&mut self, event: HotkeyEvent, now: Duration) -> Effects {
         use HotkeyEvent as E;
         let mut fx = Effects::default();
+        match event {
+            E::HotkeyDown if self.key_down => return fx,
+            E::HotkeyDown => self.key_down = true,
+            E::HotkeyUp if !self.key_down => return fx,
+            E::HotkeyUp => self.key_down = false,
+            _ => {}
+        }
 
         match (self.phase, event) {
             // ----- idle
             (Phase::Idle, E::HotkeyDown) => {
                 self.phase = Phase::Pressed {
                     down_at: now,
-                    session_start_at: now,
+                    mode: self.activation_mode,
                 };
-                self.swallow_next_up = false;
                 fx.intents.push(HotkeyIntent::Begin);
             }
-            // Residual up from a press we already classified (lock stop, cancel…).
-            (Phase::Idle, E::HotkeyUp) => self.swallow_next_up = false,
             (Phase::Idle, _) => {}
 
             // ----- pressed (key down, disambiguating)
             (
                 Phase::Pressed {
-                    down_at,
-                    session_start_at,
+                    mode: DictationActivationMode::Toggle,
+                    ..
                 },
                 E::HotkeyUp,
             ) => {
-                if self.swallow_next_up {
-                    self.swallow_next_up = false;
-                } else if now.saturating_sub(down_at) >= tuning::HOLD_THRESHOLD {
+                self.phase = Phase::Locked;
+                fx.intents.push(HotkeyIntent::LockIn);
+            }
+            (Phase::Pressed { down_at, .. }, E::HotkeyUp) => {
+                if now.saturating_sub(down_at) >= tuning::HOLD_THRESHOLD {
                     self.phase = Phase::Idle;
                     fx.intents.push(HotkeyIntent::Finalize);
                 } else if self.double_tap_lock_enabled {
-                    self.phase = Phase::PendingSecondTap { session_start_at };
+                    self.phase = Phase::PendingSecondTap {
+                        session_start_at: down_at,
+                    };
                     fx.arm_timer = Some(tuning::DOUBLE_TAP_WINDOW);
                 } else {
                     self.phase = Phase::Idle;
@@ -250,18 +277,11 @@ impl HotkeyProcessor {
             }
             (Phase::Pressed { .. }, E::EscDown) => {
                 self.phase = Phase::Idle;
-                self.swallow_next_up = true;
                 fx.intents.push(HotkeyIntent::Cancel);
             }
-            (
-                Phase::Pressed {
-                    session_start_at, ..
-                },
-                E::OtherKeyDown,
-            ) => {
-                if now.saturating_sub(session_start_at) < tuning::INTERRUPTION_WINDOW {
+            (Phase::Pressed { down_at, .. }, E::OtherKeyDown) => {
+                if now.saturating_sub(down_at) < tuning::INTERRUPTION_WINDOW {
                     self.phase = Phase::Idle;
-                    self.swallow_next_up = true;
                     fx.intents.push(HotkeyIntent::AbortAccidental);
                 }
                 // After the window: the user is deliberately chording/typing
@@ -269,17 +289,21 @@ impl HotkeyProcessor {
             }
             // Hold + tap Space = hands-free, no timing window. The hotkey release
             // that follows belongs to this gesture and must not finalize.
-            (Phase::Pressed { .. }, E::SpaceLock) => {
+            (
+                Phase::Pressed {
+                    mode: DictationActivationMode::Hold,
+                    ..
+                },
+                E::SpaceLock,
+            ) => {
                 self.phase = Phase::Locked;
-                self.swallow_next_up = true;
                 fx.intents.push(HotkeyIntent::LockIn);
             }
-            (Phase::Pressed { .. }, E::HotkeyDown | E::DoubleTapTimeout) => {}
+            (Phase::Pressed { .. }, E::HotkeyDown | E::DoubleTapTimeout | E::SpaceLock) => {}
 
             // ----- pendingSecondTap (short tap released, window open, still recording)
             (Phase::PendingSecondTap { .. }, E::HotkeyDown) => {
                 self.phase = Phase::Locked;
-                self.swallow_next_up = true;
                 fx.intents.push(HotkeyIntent::LockIn);
                 fx.disarm_timer = true;
             }
@@ -303,22 +327,19 @@ impl HotkeyProcessor {
                     },
                 );
             }
-            (Phase::PendingSecondTap { .. }, E::HotkeyUp) => self.swallow_next_up = false,
-            // Key not held — Space types normally.
-            (Phase::PendingSecondTap { .. }, E::SpaceLock) => {}
+            (Phase::PendingSecondTap { .. }, E::HotkeyUp | E::SpaceLock) => {}
 
             // ----- locked (hands-free)
             (Phase::Locked, E::HotkeyDown) => {
                 self.phase = Phase::Idle;
-                self.swallow_next_up = true;
                 fx.intents.push(HotkeyIntent::Finalize);
             }
             (Phase::Locked, E::EscDown) => {
                 self.phase = Phase::Idle;
                 fx.intents.push(HotkeyIntent::Cancel);
             }
-            (Phase::Locked, E::HotkeyUp) => self.swallow_next_up = false,
-            (Phase::Locked, E::OtherKeyDown | E::DoubleTapTimeout | E::SpaceLock) => {}
+            (Phase::Locked, E::HotkeyUp | E::OtherKeyDown | E::DoubleTapTimeout | E::SpaceLock) => {
+            }
         }
 
         fx
@@ -341,6 +362,82 @@ mod tests {
         assert_eq!(p.handle(E::HotkeyDown, ms(0)).intents, vec![I::Begin]);
         assert_eq!(p.handle(E::HotkeyUp, ms(900)).intents, vec![I::Finalize]);
         assert!(!p.is_session_active());
+    }
+
+    #[test]
+    fn cancelling_a_hold_ignores_repeats_until_release() {
+        let mut p = HotkeyProcessor::new();
+        assert_eq!(p.handle(E::HotkeyDown, ms(0)).intents, vec![I::Begin]);
+        assert!(p.handle(E::HotkeyDown, ms(500)).intents.is_empty());
+        assert_eq!(p.handle(E::EscDown, ms(600)).intents, vec![I::Cancel]);
+        assert!(p.handle(E::HotkeyDown, ms(650)).intents.is_empty());
+        assert!(p.handle(E::HotkeyUp, ms(700)).intents.is_empty());
+        assert_eq!(p.handle(E::HotkeyDown, ms(800)).intents, vec![I::Begin]);
+        assert_eq!(p.handle(E::HotkeyUp, ms(1200)).intents, vec![I::Finalize]);
+    }
+
+    #[test]
+    fn toggle_starts_and_stops_once_per_press_without_a_time_window() {
+        let mut p = HotkeyProcessor::new();
+        p.activation_mode = DictationActivationMode::Toggle;
+        p.double_tap_lock_enabled = true;
+        assert_eq!(p.handle(E::HotkeyDown, ms(0)).intents, vec![I::Begin]);
+        assert!(!p.can_space_lock());
+        assert_eq!(p.handle(E::HotkeyDown, ms(50)), Effects::default());
+        assert_eq!(
+            p.handle(E::HotkeyUp, ms(100)),
+            Effects {
+                intents: vec![I::LockIn],
+                ..Effects::default()
+            }
+        );
+        assert_eq!(p.handle(E::OtherKeyDown, ms(150)), Effects::default());
+        assert_eq!(p.handle(E::DoubleTapTimeout, ms(700)), Effects::default());
+        assert!(p.is_session_active());
+        assert_eq!(
+            p.handle(E::HotkeyDown, ms(60_000)).intents,
+            vec![I::Finalize]
+        );
+        assert_eq!(p.handle(E::HotkeyDown, ms(60_100)), Effects::default());
+        assert_eq!(p.handle(E::HotkeyUp, ms(60_200)), Effects::default());
+        assert!(!p.is_session_active());
+        assert_eq!(p.handle(E::HotkeyDown, ms(61_000)).intents, vec![I::Begin]);
+    }
+
+    #[test]
+    fn toggle_can_be_cancelled_before_or_after_release() {
+        for released in [false, true] {
+            let mut p = HotkeyProcessor::new();
+            p.activation_mode = DictationActivationMode::Toggle;
+            p.handle(E::HotkeyDown, ms(0));
+            if released {
+                p.handle(E::HotkeyUp, ms(100));
+            }
+            assert_eq!(p.handle(E::EscDown, ms(200)).intents, vec![I::Cancel]);
+            assert_eq!(p.handle(E::EscDown, ms(250)), Effects::default());
+            if !released {
+                assert_eq!(p.handle(E::HotkeyDown, ms(300)), Effects::default());
+            }
+            assert_eq!(p.handle(E::HotkeyUp, ms(350)), Effects::default());
+            assert_eq!(p.handle(E::HotkeyDown, ms(500)).intents, vec![I::Begin]);
+        }
+    }
+
+    #[test]
+    fn a_mode_change_applies_to_the_next_dictation() {
+        let mut p = HotkeyProcessor::new();
+        p.handle(E::HotkeyDown, ms(0));
+        p.activation_mode = DictationActivationMode::Toggle;
+        assert!(p.can_space_lock());
+        assert_eq!(p.handle(E::HotkeyUp, ms(400)).intents, vec![I::Finalize]);
+        assert_eq!(p.handle(E::HotkeyDown, ms(500)).intents, vec![I::Begin]);
+        p.activation_mode = DictationActivationMode::Hold;
+        assert!(!p.can_space_lock());
+        assert_eq!(p.handle(E::HotkeyUp, ms(900)).intents, vec![I::LockIn]);
+        assert_eq!(p.handle(E::HotkeyDown, ms(1500)).intents, vec![I::Finalize]);
+        p.handle(E::HotkeyUp, ms(1600));
+        assert_eq!(p.handle(E::HotkeyDown, ms(1700)).intents, vec![I::Begin]);
+        assert_eq!(p.handle(E::HotkeyUp, ms(2100)).intents, vec![I::Finalize]);
     }
 
     #[test]
@@ -421,6 +518,8 @@ mod tests {
         p.handle(E::SpaceLock, ms(50));
         p.reset();
         assert!(!p.is_session_active());
+        assert!(p.handle(E::HotkeyDown, ms(75)).intents.is_empty());
+        assert!(p.handle(E::HotkeyUp, ms(90)).intents.is_empty());
         assert_eq!(p.handle(E::HotkeyDown, ms(100)).intents, vec![I::Begin]);
     }
 

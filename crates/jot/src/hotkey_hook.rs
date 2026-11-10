@@ -39,26 +39,24 @@ static EVENTS: OnceLock<UnboundedSender<TimedEvent>> = OnceLock::new();
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 /// The virtual-key code currently bound to dictation.
 static HOTKEY_VK: AtomicU32 = AtomicU32::new(0);
-/// Whether that key must be swallowed rather than passed on.
-static SUPPRESS_HOTKEY: AtomicBool = AtomicBool::new(false);
-/// Mirrors the grammar: true while a dictation is in flight, so Esc is
-/// intercepted only when it means "cancel" rather than "close this dialog".
-static SESSION_ACTIVE: AtomicBool = AtomicBool::new(false);
-/// Mirrors the grammar: true while the hotkey is physically held, so Space is
-/// swallowed only when it is the hands-free gesture rather than a space.
-static KEY_HELD: AtomicBool = AtomicBool::new(false);
+/// Escape is intercepted only while the coordinator can cancel.
+static CANCEL_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Space is intercepted only for the legacy hold-to-lock gesture.
+static SPACE_LOCK_ENABLED: AtomicBool = AtomicBool::new(false);
 
 pub fn set_hotkey(key: HotkeyKey) {
-    HOTKEY_VK.store(key.vk_code(), Ordering::SeqCst);
-    SUPPRESS_HOTKEY.store(key.must_suppress(), Ordering::SeqCst);
+    let previous = HOTKEY_VK.swap(key.vk_code(), Ordering::SeqCst);
+    if previous != key.vk_code() {
+        tracing::info!(key = key.display_name(), "dictation key bound");
+    }
 }
 
-pub fn set_session_active(active: bool) {
-    SESSION_ACTIVE.store(active, Ordering::SeqCst);
+pub fn set_cancel_enabled(enabled: bool) {
+    CANCEL_ENABLED.store(enabled, Ordering::SeqCst);
 }
 
-pub fn set_key_held(held: bool) {
-    KEY_HELD.store(held, Ordering::SeqCst);
+pub fn set_space_lock_enabled(enabled: bool) {
+    SPACE_LOCK_ENABLED.store(enabled, Ordering::SeqCst);
 }
 
 pub fn now() -> Duration {
@@ -132,16 +130,26 @@ fn is_modifier(vk: u32) -> bool {
     )
 }
 
-/// The whole hook policy, as a pure function so it can be tested without a
-/// message loop.
-fn classify(vk: u32, is_down: bool, hotkey_vk: u32, suppress_hotkey: bool) -> Decision {
-    if vk == hotkey_vk {
+/// The hook policy, testable without a message loop.
+fn classify(
+    vk: u32,
+    is_down: bool,
+    hotkey: HotkeyKey,
+    pressed_key: &mut Option<HotkeyKey>,
+    cancel_enabled: bool,
+    space_lock_enabled: bool,
+) -> Decision {
+    // A rebind can race with a queued key-down. Keep both halves of the
+    // physical press on the same binding, including its suppression policy.
+    let key = pressed_key.unwrap_or(hotkey);
+    if vk == key.vk_code() {
+        *pressed_key = is_down.then_some(key);
         let event = if is_down {
             HotkeyEvent::HotkeyDown
         } else {
             HotkeyEvent::HotkeyUp
         };
-        return if suppress_hotkey {
+        return if key.must_suppress() {
             // Caps Lock toggles a global state and the Windows key opens the
             // Start menu on release. Either would fire on every dictation.
             Decision::eat(event)
@@ -153,14 +161,15 @@ fn classify(vk: u32, is_down: bool, hotkey_vk: u32, suppress_hotkey: bool) -> De
         return Decision::IGNORE;
     }
     if vk == VK_ESCAPE {
-        return if SESSION_ACTIVE.load(Ordering::SeqCst) {
-            // Only while dictating: otherwise Esc must still close dialogs.
+        return if cancel_enabled {
             Decision::eat(HotkeyEvent::EscDown)
         } else {
-            Decision::IGNORE
+            // Report even before the consumer has handled a queued Begin, but
+            // let Windows see Esc whenever Jot isn't known to be cancellable.
+            Decision::pass(HotkeyEvent::EscDown)
         };
     }
-    if vk == VK_SPACE && KEY_HELD.load(Ordering::SeqCst) {
+    if vk == VK_SPACE && space_lock_enabled && pressed_key.is_some() {
         // The hands-free gesture. Swallowed so it does not also type a space
         // into whatever the user is dictating into.
         return Decision::eat(HotkeyEvent::SpaceLock);
@@ -180,6 +189,12 @@ mod platform {
         SetWindowsHookExW, TranslateMessage, WH_KEYBOARD_LL, WM_KEYDOWN, WM_KEYUP, WM_SYSKEYDOWN,
         WM_SYSKEYUP,
     };
+
+    thread_local! {
+        static PRESSED_KEY: std::cell::RefCell<Option<HotkeyKey>> = const {
+            std::cell::RefCell::new(None)
+        };
+    }
 
     pub fn run_hook_thread() {
         let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), None, 0) };
@@ -221,12 +236,16 @@ mod platform {
             return unsafe { CallNextHookEx(None, code, wparam, lparam) };
         }
 
-        let decision = classify(
-            info.vkCode,
-            is_down,
-            HOTKEY_VK.load(Ordering::SeqCst),
-            SUPPRESS_HOTKEY.load(Ordering::SeqCst),
-        );
+        let decision = PRESSED_KEY.with(|pressed_key| {
+            classify(
+                info.vkCode,
+                is_down,
+                HotkeyKey::from_vk(HOTKEY_VK.load(Ordering::SeqCst)).unwrap_or_default(),
+                &mut pressed_key.borrow_mut(),
+                CANCEL_ENABLED.load(Ordering::SeqCst),
+                SPACE_LOCK_ENABLED.load(Ordering::SeqCst),
+            )
+        });
         if let Some(event) = decision.event {
             emit(event);
         }
@@ -246,98 +265,124 @@ mod platform {
 mod tests {
     use super::*;
 
+    use HotkeyKey::{CapsLock, RightControl};
+
     const RIGHT_CTRL: u32 = 0xA3;
     const CAPS_LOCK: u32 = 0x14;
     const KEY_A: u32 = 0x41;
 
-    fn reset() {
-        SESSION_ACTIVE.store(false, Ordering::SeqCst);
-        KEY_HELD.store(false, Ordering::SeqCst);
-    }
-
     #[test]
     fn the_hotkey_is_reported_and_passed_through_when_it_carries_no_state() {
-        reset();
+        let mut held = None;
         assert_eq!(
-            classify(RIGHT_CTRL, true, RIGHT_CTRL, false),
+            classify(RIGHT_CTRL, true, RightControl, &mut held, false, false),
             Decision::pass(HotkeyEvent::HotkeyDown)
         );
         assert_eq!(
-            classify(RIGHT_CTRL, false, RIGHT_CTRL, false),
+            classify(RIGHT_CTRL, false, RightControl, &mut held, false, false),
             Decision::pass(HotkeyEvent::HotkeyUp)
         );
     }
 
     #[test]
     fn caps_lock_is_swallowed_so_it_never_toggles_while_dictating() {
-        reset();
         assert_eq!(
-            classify(CAPS_LOCK, true, CAPS_LOCK, true),
+            classify(CAPS_LOCK, true, CapsLock, &mut None, false, false),
             Decision::eat(HotkeyEvent::HotkeyDown)
         );
     }
 
     #[test]
-    fn escape_is_only_intercepted_while_a_session_is_live() {
-        reset();
+    fn changing_the_binding_still_reports_the_old_release() {
+        let mut held = None;
         assert_eq!(
-            classify(VK_ESCAPE, true, RIGHT_CTRL, false),
-            Decision::IGNORE
+            classify(CAPS_LOCK, true, CapsLock, &mut held, false, false),
+            Decision::eat(HotkeyEvent::HotkeyDown)
         );
-
-        SESSION_ACTIVE.store(true, Ordering::SeqCst);
         assert_eq!(
-            classify(VK_ESCAPE, true, RIGHT_CTRL, false),
-            Decision::eat(HotkeyEvent::EscDown)
+            classify(CAPS_LOCK, false, RightControl, &mut held, false, false),
+            Decision::eat(HotkeyEvent::HotkeyUp)
         );
-        reset();
+        assert_eq!(
+            classify(RIGHT_CTRL, true, RightControl, &mut held, false, false),
+            Decision::pass(HotkeyEvent::HotkeyDown)
+        );
     }
 
     #[test]
-    fn space_is_the_lock_gesture_only_while_the_hotkey_is_held() {
-        reset();
+    fn escape_is_only_intercepted_while_a_session_is_live() {
         assert_eq!(
-            classify(VK_SPACE, true, RIGHT_CTRL, false),
+            classify(VK_ESCAPE, true, RightControl, &mut None, false, false),
+            Decision::pass(HotkeyEvent::EscDown)
+        );
+        assert_eq!(
+            classify(VK_ESCAPE, true, RightControl, &mut None, true, false),
+            Decision::eat(HotkeyEvent::EscDown)
+        );
+    }
+
+    #[test]
+    fn space_is_only_intercepted_for_the_hold_mode_gesture() {
+        assert_eq!(
+            classify(VK_SPACE, true, RightControl, &mut None, true, true),
             Decision::pass(HotkeyEvent::OtherKeyDown)
         );
-
-        KEY_HELD.store(true, Ordering::SeqCst);
         assert_eq!(
-            classify(VK_SPACE, true, RIGHT_CTRL, false),
+            classify(
+                VK_SPACE,
+                true,
+                RightControl,
+                &mut Some(RightControl),
+                true,
+                false
+            ),
+            Decision::pass(HotkeyEvent::OtherKeyDown)
+        );
+        assert_eq!(
+            classify(
+                VK_SPACE,
+                true,
+                RightControl,
+                &mut Some(RightControl),
+                true,
+                true
+            ),
             Decision::eat(HotkeyEvent::SpaceLock)
         );
-        reset();
     }
 
     #[test]
     fn a_bare_modifier_is_not_an_accidental_chord() {
-        reset();
-        // Holding Shift to capitalise mid-dictation must not cancel it.
-        assert_eq!(classify(0x10, true, RIGHT_CTRL, false), Decision::IGNORE);
-        assert_eq!(classify(0xA0, true, RIGHT_CTRL, false), Decision::IGNORE);
         assert_eq!(
-            classify(KEY_A, true, RIGHT_CTRL, false),
+            classify(0x10, true, RightControl, &mut None, false, false),
+            Decision::IGNORE
+        );
+        assert_eq!(
+            classify(0xA0, true, RightControl, &mut None, false, false),
+            Decision::IGNORE
+        );
+        assert_eq!(
+            classify(KEY_A, true, RightControl, &mut None, false, false),
             Decision::pass(HotkeyEvent::OtherKeyDown)
         );
     }
 
     #[test]
     fn key_releases_other_than_the_hotkey_are_not_events() {
-        reset();
-        assert_eq!(classify(KEY_A, false, RIGHT_CTRL, false), Decision::IGNORE);
         assert_eq!(
-            classify(VK_SPACE, false, RIGHT_CTRL, false),
+            classify(KEY_A, false, RightControl, &mut None, false, false),
+            Decision::IGNORE
+        );
+        assert_eq!(
+            classify(VK_SPACE, false, RightControl, &mut None, false, false),
             Decision::IGNORE
         );
     }
 
     #[test]
     fn nothing_the_hook_swallows_is_ever_left_unreported() {
-        reset();
-        SESSION_ACTIVE.store(true, Ordering::SeqCst);
-        KEY_HELD.store(true, Ordering::SeqCst);
         for vk in [CAPS_LOCK, VK_ESCAPE, VK_SPACE] {
-            let decision = classify(vk, true, CAPS_LOCK, true);
+            let decision = classify(vk, true, CapsLock, &mut Some(CapsLock), true, true);
             if decision.swallow {
                 assert!(
                     decision.event.is_some(),
@@ -345,6 +390,5 @@ mod tests {
                 );
             }
         }
-        reset();
     }
 }

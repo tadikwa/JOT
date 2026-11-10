@@ -45,9 +45,11 @@ use gpui::{
 };
 use gpui_platform::application;
 use jot_core::coordinator::{CoordinatorUpdate, DictationCoordinator};
-use jot_core::hotkey::{HotkeyIntent, HotkeyProcessor};
+use jot_core::hotkey::{HotkeyEvent, HotkeyIntent, HotkeyProcessor};
 use jot_core::settings::SettingsStore;
-use jot_core::state_machine::{DictationOutcome, DictationState, SilenceReason};
+use jot_core::state_machine::{
+    DictationEvent, DictationOutcome, DictationState, SilenceReason, transition,
+};
 use pill::{PillState, PillView};
 use services::Services;
 use sound::Earcon;
@@ -133,7 +135,6 @@ fn main() -> Result<()> {
         services.coordinator.clone(),
         services.settings.clone(),
     ));
-    runtime.spawn(follow_hotkey_setting(services.settings.clone()));
     services.start_background_work();
 
     let app_services = services.clone();
@@ -325,9 +326,6 @@ fn drive_pill(hud: WindowHandle<PillView>, services: Services, cx: &mut App) {
                 }
                 CoordinatorUpdate::State(state) => {
                     play_transition(state, sounds);
-                    hotkey_hook::set_session_active(
-                        !state.is_terminal() && state != DictationState::Idle,
-                    );
                     tray::set_dictating(state.is_recording());
 
                     let show_idle = services.settings.get().show_idle_indicator;
@@ -465,64 +463,91 @@ async fn run_hotkey_grammar(
     coordinator: Arc<DictationCoordinator>,
     settings: Arc<SettingsStore>,
 ) {
+    use HotkeyEvent as E;
+    use tokio::sync::broadcast::error::RecvError;
+
     let mut processor = HotkeyProcessor::new();
+    let mut updates = coordinator.subscribe();
+    let mut changes = settings.subscribe();
     let mut deadline: Option<Duration> = None;
 
     loop {
-        let (event, at) = match deadline {
-            Some(deadline_at) => {
-                let wait = deadline_at.saturating_sub(hotkey_hook::now());
-                match tokio::time::timeout(wait, events.recv()).await {
-                    Ok(Some(event)) => event,
-                    Ok(None) => break,
-                    Err(_) => {
+        let input = tokio::select! {
+            // Match the old timeout: a key already queued beats the timer.
+            biased;
+            event = events.recv() => match event {
+                Some(event) => Some(event),
+                None => break,
+            },
+            update = updates.recv() => match update {
+                Ok(CoordinatorUpdate::State(_)) | Err(RecvError::Lagged(_)) => None,
+                Ok(_) => continue,
+                Err(RecvError::Closed) => break,
+            },
+            change = changes.recv() => match change {
+                Ok("hotkeyKey") | Err(RecvError::Lagged(_)) => None,
+                Ok(_) => continue,
+                Err(RecvError::Closed) => break,
+            },
+            _ = async {
+                if let Some(at) = deadline {
+                    tokio::time::sleep(at.saturating_sub(hotkey_hook::now())).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                deadline = None;
+                Some((E::DoubleTapTimeout, hotkey_hook::now()))
+            }
+        };
+
+        // The coordinator can end a recording without a keyboard event (audio
+        // error, time cap, tray). Keep the physical key edge, forget the gesture.
+        let state = coordinator.state();
+        if !state.is_recording() && state != DictationState::Warming {
+            processor.reset();
+            deadline = None;
+        }
+
+        let preferences = settings.get();
+        if let Some((event, at)) = input {
+            if event == E::EscDown && !processor.is_session_active() {
+                // The keyboard gesture already ended on stop, but Esc can
+                // still cancel the coordinator during processing.
+                if can_cancel(state) {
+                    coordinator.handle(HotkeyIntent::Cancel);
+                }
+            } else {
+                processor.activation_mode = preferences.dictation_activation_mode;
+                processor.double_tap_lock_enabled = preferences.double_tap_lock;
+                let effects = processor.handle(event, at);
+                if let Some(window) = effects.arm_timer {
+                    deadline = Some(at + window);
+                }
+                if effects.disarm_timer {
+                    deadline = None;
+                }
+                for intent in effects.intents {
+                    if !coordinator.handle(intent) {
+                        processor.reset();
                         deadline = None;
-                        (
-                            jot_core::hotkey::HotkeyEvent::DoubleTapTimeout,
-                            hotkey_hook::now(),
-                        )
+                        break;
                     }
                 }
             }
-            None => match events.recv().await {
-                Some(event) => event,
-                None => break,
-            },
-        };
+        }
 
-        // Read per-event: a toggle flipped in Settings applies to the next
-        // gesture, never mid-gesture.
-        processor.double_tap_lock_enabled = settings.get().double_tap_lock;
-        let effects = processor.handle(event, at);
-
-        if let Some(window) = effects.arm_timer {
-            deadline = Some(at + window);
+        hotkey_hook::set_cancel_enabled(can_cancel(coordinator.state()));
+        hotkey_hook::set_space_lock_enabled(processor.can_space_lock());
+        // A shortcut changed mid-gesture must not steal its release or stop.
+        if !processor.is_key_down() && !processor.is_session_active() {
+            hotkey_hook::set_hotkey(preferences.hotkey_key);
         }
-        if effects.disarm_timer {
-            deadline = None;
-        }
-        for intent in effects.intents {
-            // A refused begin must reach the grammar, or a Space-lock on the
-            // phantom session strands it and eats the next dictation.
-            if !coordinator.handle(intent) {
-                processor.reset();
-            }
-        }
-        hotkey_hook::set_session_active(processor.is_session_active());
-        hotkey_hook::set_key_held(processor.is_key_held());
     }
 }
 
-/// Rebinds the hook when the dictation key changes in Settings.
-async fn follow_hotkey_setting(settings: Arc<SettingsStore>) {
-    let mut changes = settings.subscribe();
-    while let Ok(key) = changes.recv().await {
-        if key == "hotkeyKey" {
-            let hotkey = settings.get().hotkey_key;
-            tracing::info!(key = hotkey.display_name(), "dictation key rebound");
-            hotkey_hook::set_hotkey(hotkey);
-        }
-    }
+fn can_cancel(state: DictationState) -> bool {
+    transition(state, DictationEvent::Cancel).is_some()
 }
 
 #[cfg(test)]

@@ -15,7 +15,6 @@
 //! Settings: the dictation key, what the pill shows, how a transcript is
 //! formatted, how long audio is kept, and the escape hatches.
 
-use crate::hotkey_hook;
 use crate::services::Services;
 use crate::text_field::TextField;
 use crate::theme::{self, Theme};
@@ -24,7 +23,7 @@ use gpui::{Context, Entity, Role, SharedString, Window, div, prelude::*, relativ
 use jot_core::audio;
 use jot_core::credentials;
 use jot_core::gemini::KeyCheck;
-use jot_core::hotkey::HotkeyKey;
+use jot_core::hotkey::{DictationActivationMode, HotkeyKey};
 
 /// Audio retention options, in the order they read as a sentence.
 const RETENTION_CHOICES: [(i64, &str); 4] = [
@@ -223,12 +222,58 @@ impl Render for SettingsView {
                 theme,
                 move |_, _, _| {
                     store.update(Some("hotkeyKey"), |settings| settings.hotkey_key = key);
-                    // The hook rebinds from the settings subscription too; doing
-                    // it here as well makes the click feel immediate even if the
-                    // subscriber is busy.
-                    hotkey_hook::set_hotkey(key);
                 },
             ));
+        }
+
+        let mut mode_row = div()
+            .id("dictation-activation-options")
+            .role(Role::RadioGroup)
+            .aria_label("Mode d’activation de la dictée")
+            .flex()
+            .flex_wrap()
+            .gap(theme::spacing::XS);
+        for (id, mode, label) in [
+            (
+                "dictation-hold",
+                DictationActivationMode::Hold,
+                "Maintenir pour parler",
+            ),
+            (
+                "dictation-toggle",
+                DictationActivationMode::Toggle,
+                "Appuyer pour démarrer / arrêter",
+            ),
+        ] {
+            let selected = settings.dictation_activation_mode == mode;
+            mode_row = mode_row.child(
+                widgets::button(
+                    id,
+                    label,
+                    if selected {
+                        ButtonKind::Primary
+                    } else {
+                        ButtonKind::Secondary
+                    },
+                    true,
+                    theme,
+                    cx.listener(move |this, _, _, cx| {
+                        this.services.settings.update(
+                            Some("dictationActivationMode"),
+                            |settings| {
+                                settings.dictation_activation_mode = mode;
+                            },
+                        );
+                        cx.notify();
+                    }),
+                )
+                .role(Role::RadioButton)
+                .aria_toggled(if selected {
+                    gpui::Toggled::True
+                } else {
+                    gpui::Toggled::False
+                }),
+            );
         }
 
         let mut microphone_row = div().flex().flex_wrap().gap(theme::spacing::XS);
@@ -272,6 +317,13 @@ impl Render for SettingsView {
                     "Windows has no fn key, so pick a bare key you never press alone",
                     theme,
                     hotkey_row,
+                )
+                .into_any_element(),
+                widgets::field_row(
+                    "Mode d’activation de la dictée",
+                    "Ce choix s’applique à la prochaine dictée.",
+                    theme,
+                    mode_row,
                 )
                 .into_any_element(),
                 widgets::field_row(
@@ -335,7 +387,7 @@ impl Render for SettingsView {
                 widgets::toggle(
                     "double-tap",
                     "Double-tap to lock hands-free",
-                    "Off by default: firm taps often read as a hold. Holding and tapping Space always works",
+                    "Hold mode only. You can also hold the key and tap Space to lock",
                     settings.double_tap_lock,
                     theme,
                     {

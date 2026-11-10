@@ -16,7 +16,7 @@
 //! preview models get renamed.
 
 use crate::file_layout;
-use crate::hotkey::HotkeyKey;
+use crate::hotkey::{DictationActivationMode, HotkeyKey};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -113,6 +113,7 @@ pub struct Settings {
     pub show_idle_indicator: bool,
     pub sounds_enabled: bool,
     pub hotkey_key: HotkeyKey,
+    pub dictation_activation_mode: DictationActivationMode,
     /// The microphone to record from, by name. `None` follows the Windows
     /// default, including when the user changes it mid-recording.
     pub preferred_input_device: Option<String>,
@@ -148,6 +149,7 @@ impl Default for Settings {
             show_idle_indicator: true,
             sounds_enabled: true,
             hotkey_key: HotkeyKey::default(),
+            dictation_activation_mode: DictationActivationMode::default(),
             preferred_input_device: None,
             smart_transcription: true,
             smart_cleanup_pass: false,
@@ -364,6 +366,31 @@ mod tests {
         store.update(Some("soundsEnabled"), |s| s.sounds_enabled = false);
         let reopened = SettingsStore::open(temp.path().join("settings.json"));
         assert!(!reopened.get().sounds_enabled);
+    }
+
+    #[test]
+    fn activation_mode_survives_reopen_without_overwriting_the_hotkey() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(&path, r#"{"hotkeyKey":"capsLock","doubleTapLock":true}"#).unwrap();
+        let legacy = SettingsStore::open(path.clone());
+        assert_eq!(
+            legacy.get().dictation_activation_mode,
+            DictationActivationMode::Hold
+        );
+        assert_eq!(legacy.get().hotkey_key, HotkeyKey::CapsLock);
+        assert!(legacy.get().double_tap_lock);
+
+        legacy.update(Some("dictationActivationMode"), |settings| {
+            settings.dictation_activation_mode = DictationActivationMode::Toggle;
+        });
+        let reopened = SettingsStore::open(path);
+        assert_eq!(
+            reopened.get().dictation_activation_mode,
+            DictationActivationMode::Toggle
+        );
+        assert_eq!(reopened.get().hotkey_key, HotkeyKey::CapsLock);
+        assert!(reopened.get().double_tap_lock);
     }
 
     #[test]
