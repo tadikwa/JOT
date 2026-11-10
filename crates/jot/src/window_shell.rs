@@ -74,25 +74,28 @@ pub fn hwnd_of(window: &Window) -> Option<isize> {
 /// Placement is part of this rather than a later step because the taskbar is
 /// topmost as well: a pill positioned against the screen edge is simply drawn
 /// behind it, which looks exactly like a pill that never appeared.
-pub fn make_overlay(window: &Window, bottom_margin: f32) {
-    if let Some(hwnd) = hwnd_of(window) {
-        platform::make_overlay(hwnd);
-        platform::place_on_active_display(hwnd, bottom_margin);
-    }
+pub fn make_overlay(window: &Window, bottom_margin: f32) -> anyhow::Result<()> {
+    let hwnd = hwnd_of(window).ok_or_else(|| anyhow::anyhow!("HUD has no Win32 handle"))?;
+    platform::make_overlay(hwnd)?;
+    platform::place_on_active_display(hwnd, bottom_margin)
 }
 
 /// Moves the HUD to the bottom centre of the display holding the foreground
 /// window — where the text is about to land.
 pub fn place_on_active_display(window: &Window, bottom_margin: f32) {
     if let Some(hwnd) = hwnd_of(window) {
-        platform::place_on_active_display(hwnd, bottom_margin);
+        if let Err(error) = platform::place_on_active_display(hwnd, bottom_margin) {
+            tracing::error!(%error, "could not position the HUD");
+        }
     }
 }
 
 #[cfg(target_os = "windows")]
 mod platform {
     use super::bottom_center;
-    use windows::Win32::Foundation::{HWND, RECT};
+    use windows::Win32::Foundation::{
+        COLORREF, ERROR_SUCCESS, GetLastError, HWND, RECT, SetLastError,
+    };
     use windows::Win32::Graphics::Dwm::{
         DWMNCRP_DISABLED, DWMWA_BORDER_COLOR, DWMWA_NCRENDERING_POLICY,
         DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_DONOTROUND, DwmSetWindowAttribute,
@@ -103,8 +106,9 @@ mod platform {
     use windows::Win32::UI::HiDpi::GetDpiForWindow;
     use windows::Win32::UI::WindowsAndMessaging::{
         GWL_EXSTYLE, GetForegroundWindow, GetWindowLongPtrW, GetWindowRect, HWND_TOPMOST,
-        SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_EX_WINDOWEDGE,
+        IsWindowVisible, LWA_ALPHA, SW_SHOWNOACTIVATE, SWP_NOACTIVATE, SWP_NOSIZE,
+        SetLayeredWindowAttributes, SetWindowLongPtrW, SetWindowPos, ShowWindow, WS_EX_LAYERED,
+        WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_EX_WINDOWEDGE,
     };
 
     /// `DWMWA_COLOR_NONE` — documented, but not exported by the `windows` crate.
@@ -131,26 +135,32 @@ mod platform {
         queried.is_ok() && info.dwFlags.0 & 0x0000_0001 != 0
     }
 
-    pub fn make_overlay(hwnd: isize) {
+    pub fn make_overlay(hwnd: isize) -> anyhow::Result<()> {
         let hwnd = HWND(hwnd as *mut _);
         unsafe {
+            SetLastError(ERROR_SUCCESS);
             let current = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
-            let wanted = (current
-                // A raised window edge on a transparent overlay is a grey
-                // rectangle floating over the desktop.
-                & !WS_EX_WINDOWEDGE.0)
-                // Never becomes the active window: the app the text is going
-                // into must keep focus through the whole dictation.
-                | WS_EX_NOACTIVATE.0
-                // Clicks pass straight through. The pill is informational on
-                // Windows precisely because the alternative is a 600-pixel dead
-                // strip across the bottom of every screen.
+            anyhow::ensure!(
+                current != 0 || GetLastError() == ERROR_SUCCESS,
+                "GetWindowLongPtrW: {}",
+                windows::core::Error::from_win32()
+            );
+            // WS_EX_TRANSPARENT alone only orders painting. Layered + transparent
+            // provides cross-process input transparency; initialize or it stays invisible.
+            // GPUI uses DirectComposition, never UpdateLayeredWindow (which SLA disables).
+            let wanted = (current & !WS_EX_WINDOWEDGE.0)
+                | WS_EX_LAYERED.0
                 | WS_EX_TRANSPARENT.0
-                // Keeps it out of Alt+Tab and the taskbar.
+                | WS_EX_NOACTIVATE.0
                 | WS_EX_TOOLWINDOW.0;
-            if wanted != current {
-                SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wanted as isize);
-            }
+            SetLastError(ERROR_SUCCESS);
+            let previous = SetWindowLongPtrW(hwnd, GWL_EXSTYLE, wanted as isize);
+            anyhow::ensure!(
+                previous != 0 || GetLastError() == ERROR_SUCCESS,
+                "SetWindowLongPtrW: {}",
+                windows::core::Error::from_win32()
+            );
+            SetLayeredWindowAttributes(hwnd, COLORREF(0), 255, LWA_ALPHA)?;
 
             // Windows 11 draws a rounded 1px border around EVERY top-level
             // window, including a borderless transparent one. On the HUD that
@@ -162,32 +172,51 @@ mod platform {
             // one — DWM draws that edge as caption chrome, which the border
             // colour does not cover.
             let policy = DWMNCRP_DISABLED;
-            let _ = DwmSetWindowAttribute(
+            if let Err(error) = DwmSetWindowAttribute(
                 hwnd,
                 DWMWA_NCRENDERING_POLICY,
                 &policy as *const _ as *const _,
                 std::mem::size_of_val(&policy) as u32,
-            );
+            ) {
+                tracing::debug!(%error, "HUD non-client rendering attribute unavailable");
+            }
             let corner = DWMWCP_DONOTROUND;
-            let _ = DwmSetWindowAttribute(
+            if let Err(error) = DwmSetWindowAttribute(
                 hwnd,
                 DWMWA_WINDOW_CORNER_PREFERENCE,
                 &corner as *const _ as *const _,
                 std::mem::size_of_val(&corner) as u32,
-            );
+            ) {
+                tracing::debug!(%error, "HUD corner attribute unavailable");
+            }
             let none = DWMWA_COLOR_NONE;
-            let _ = DwmSetWindowAttribute(
+            if let Err(error) = DwmSetWindowAttribute(
                 hwnd,
                 DWMWA_BORDER_COLOR,
                 &none as *const _ as *const _,
                 std::mem::size_of_val(&none) as u32,
-            );
-            let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE_NOSIZE_NOACTIVATE);
+            ) {
+                tracing::debug!(%error, "HUD border attribute unavailable");
+            }
+            SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE_NOSIZE_NOACTIVATE)?;
             // Explicitly, and without activating. A `WS_EX_NOACTIVATE` popup is
             // left hidden by the normal show path, which makes the pill exist
             // and never appear — the worst possible failure for a HUD.
+            // ShowWindow returns the *previous* visibility, not success/failure.
             let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            anyhow::ensure!(IsWindowVisible(hwnd).as_bool(), "HUD remained hidden");
+            let applied = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+            anyhow::ensure!(
+                applied & wanted == wanted && applied & WS_EX_TOPMOST.0 != 0,
+                "HUD styles not applied: {applied:#010x}"
+            );
+            tracing::info!(
+                hwnd = hwnd.0 as usize,
+                ex_style = applied,
+                "passive layered HUD initialized"
+            );
         }
+        Ok(())
     }
 
     const SWP_NOMOVE_NOSIZE_NOACTIVATE:
@@ -196,26 +225,9 @@ mod platform {
             0x0002 /* SWP_NOMOVE */ | SWP_NOSIZE.0 | SWP_NOACTIVATE.0,
         );
 
-    pub fn place_on_active_display(hwnd: isize, bottom_margin: f32) {
+    pub fn place_on_active_display(hwnd: isize, bottom_margin: f32) -> anyhow::Result<()> {
         let hwnd = HWND(hwnd as *mut _);
         unsafe {
-            // The window's OWN rect, in physical pixels. Centring from the
-            // logical size instead is wrong by the scale factor: on a 150%
-            // display a 600pt pill is 900px wide and lands 150px off centre.
-            let mut rect = RECT::default();
-            if GetWindowRect(hwnd, &mut rect).is_err() {
-                return;
-            }
-            let width = rect.right - rect.left;
-            let height = rect.bottom - rect.top;
-            // The margin is a design value in points, so it scales too.
-            let scale = GetDpiForWindow(hwnd).max(96) as f32 / 96.0;
-            let margin = (bottom_margin * scale) as i32;
-
-            // The display hosting the app being dictated into, not the one Jot
-            // happened to launch on and not wherever the pointer is parked:
-            // keyboard-first users routinely dictate on one screen with the
-            // mouse on another.
             let target = GetForegroundWindow();
             let monitor = MonitorFromWindow(
                 if target.0.is_null() { hwnd } else { target },
@@ -225,26 +237,40 @@ mod platform {
                 cbSize: std::mem::size_of::<MONITORINFO>() as u32,
                 ..Default::default()
             };
-            if !GetMonitorInfoW(monitor, &mut info).as_bool() {
-                return;
-            }
-            let RECT {
-                left,
-                top,
-                right,
-                bottom,
-            } = info.rcWork;
-            let placement = bottom_center(left, top, right, bottom, width, height, margin);
-            let _ = SetWindowPos(
-                hwnd,
-                HWND_TOPMOST,
-                placement.x,
-                placement.y,
-                0,
-                0,
-                SWP_NOSIZE | SWP_NOACTIVATE,
+            anyhow::ensure!(
+                GetMonitorInfoW(monitor, &mut info).as_bool(),
+                "GetMonitorInfoW: {}",
+                windows::core::Error::from_win32()
             );
+            // Moving between DPI domains synchronously invokes GPUI's WM_DPICHANGED.
+            // Re-read its resulting physical size and DPI before the final centring.
+            for _ in 0..2 {
+                let mut rect = RECT::default();
+                GetWindowRect(hwnd, &mut rect)?;
+                let dpi = GetDpiForWindow(hwnd);
+                anyhow::ensure!(dpi != 0, "GetDpiForWindow failed");
+                let work = info.rcWork;
+                let placement = bottom_center(
+                    work.left,
+                    work.top,
+                    work.right,
+                    work.bottom,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    (bottom_margin * dpi as f32 / 96.0).round() as i32,
+                );
+                SetWindowPos(
+                    hwnd,
+                    HWND_TOPMOST,
+                    placement.x,
+                    placement.y,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE,
+                )?;
+            }
         }
+        Ok(())
     }
 }
 
@@ -253,8 +279,12 @@ mod platform {
     pub fn high_contrast() -> bool {
         false
     }
-    pub fn make_overlay(_hwnd: isize) {}
-    pub fn place_on_active_display(_hwnd: isize, _margin: f32) {}
+    pub fn make_overlay(_hwnd: isize) -> anyhow::Result<()> {
+        Ok(())
+    }
+    pub fn place_on_active_display(_hwnd: isize, _margin: f32) -> anyhow::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]

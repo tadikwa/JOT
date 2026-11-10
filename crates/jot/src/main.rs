@@ -25,8 +25,12 @@
 mod autostart;
 mod file_dialog;
 mod hotkey_hook;
+#[cfg(target_os = "windows")]
+mod hud_validation;
 mod pill;
 mod services;
+#[cfg(target_os = "windows")]
+mod single_instance;
 mod sound;
 mod text_field;
 mod theme;
@@ -56,6 +60,47 @@ use tray::TrayCommand;
 const CLOCK_TICK: Duration = Duration::from_millis(200);
 
 fn main() -> Result<()> {
+    #[cfg(target_os = "windows")]
+    match std::env::args().nth(1).as_deref() {
+        Some("--profile-check") => {
+            return hud_validation::profile_check(
+                std::env::args_os()
+                    .nth(2)
+                    .expect("report file required")
+                    .into(),
+            );
+        }
+        Some("--hud-click-target") => {
+            return hud_validation::target(
+                std::env::args()
+                    .nth(2)
+                    .ok_or_else(|| anyhow::anyhow!("parent PID required"))?
+                    .parse()?,
+            );
+        }
+        Some("--hud-validate") => {
+            return hud_validation::run(
+                std::env::args_os()
+                    .nth(2)
+                    .expect("report directory required")
+                    .into(),
+            );
+        }
+        _ => {}
+    }
+    let test_settings = std::env::args().any(|a| a == "--test-settings");
+    anyhow::ensure!(
+        !test_settings || jot_core::test_profile::root().is_some(),
+        "--test-settings requires an isolated profile"
+    );
+    #[cfg(target_os = "windows")]
+    let _instance = match single_instance::acquire() {
+        Ok(instance) => instance,
+        Err(error) => {
+            single_instance::notify(&error);
+            return Err(error);
+        }
+    };
     // Held for the process lifetime: dropping it stops the log file flushing.
     let _log_guard = init_tracing();
 
@@ -111,7 +156,16 @@ fn main() -> Result<()> {
         run_clock(hud, cx);
         handle_tray(tray_commands, hud, app_services.clone(), cx);
 
-        if !app_services.settings.get().has_completed_onboarding {
+        if test_settings {
+            views::open_settings(&app_services, cx);
+            cx.spawn(async move |cx| {
+                cx.background_executor()
+                    .timer(Duration::from_secs(60))
+                    .await;
+                let _ = cx.update(|cx| cx.quit());
+            })
+            .detach();
+        } else if !app_services.settings.get().has_completed_onboarding {
             views::open_onboarding(&app_services, cx);
         }
     });
@@ -176,6 +230,7 @@ fn open_hud(cx: &mut App, show_idle_indicator: bool) -> Result<WindowHandle<Pill
         .map(|display| display.bounds().origin)
         .unwrap_or_default();
 
+    let mut overlay_result = Ok(());
     let handle = cx.open_window(
         WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds {
@@ -196,7 +251,7 @@ fn open_hud(cx: &mut App, show_idle_indicator: bool) -> Result<WindowHandle<Pill
         |window, cx| {
             // Refuses focus, passes clicks through, and sits in the work area
             // rather than under the taskbar — see `window_shell`.
-            window_shell::make_overlay(window, pill::HUD_BOTTOM_MARGIN);
+            overlay_result = window_shell::make_overlay(window, pill::HUD_BOTTOM_MARGIN);
             cx.new(|_| {
                 let mut pill = PillView::new();
                 // Start at rest, not blank: the resting indicator is the only
@@ -210,6 +265,10 @@ fn open_hud(cx: &mut App, show_idle_indicator: bool) -> Result<WindowHandle<Pill
             })
         },
     )?;
+    if let Err(error) = overlay_result {
+        let _ = handle.update(cx, |_, window, _| window.remove_window());
+        return Err(error);
+    }
     Ok(handle)
 }
 

@@ -29,12 +29,18 @@ pub fn launch_command() -> Option<String> {
 }
 
 pub fn is_enabled() -> bool {
+    if jot_core::test_profile::root().is_some() {
+        return false;
+    }
     platform::read().is_some()
 }
 
 /// True when the stored command points at a different build than the one
 /// running — a leftover from a previous install location.
 pub fn is_stale() -> bool {
+    if jot_core::test_profile::root().is_some() {
+        return false;
+    }
     match (platform::read(), launch_command()) {
         (Some(stored), Some(current)) => !stored.eq_ignore_ascii_case(&current),
         _ => false,
@@ -42,6 +48,9 @@ pub fn is_stale() -> bool {
 }
 
 pub fn set_enabled(enabled: bool) -> bool {
+    if jot_core::test_profile::root().is_some() {
+        return false;
+    }
     match (enabled, launch_command()) {
         (true, Some(command)) => platform::write(&command),
         (true, None) => false,

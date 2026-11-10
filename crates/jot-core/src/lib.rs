@@ -33,6 +33,7 @@ pub mod replacement;
 pub mod runtime;
 pub mod settings;
 pub mod state_machine;
+pub mod test_profile;
 pub mod timeout;
 pub mod transcription;
 pub mod update;

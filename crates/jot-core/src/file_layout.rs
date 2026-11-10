@@ -42,6 +42,9 @@ pub fn app_support_root() -> PathBuf {
     if let Some(root) = OVERRIDE_ROOT.read().clone() {
         return root;
     }
+    if let Some(root) = crate::test_profile::root() {
+        return root.to_path_buf();
+    }
     dirs::data_local_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Jot")
@@ -121,6 +124,18 @@ mod tests {
         );
         assert_eq!(folder.parent().unwrap(), recordings_root());
 
+        set_override_root(None);
+    }
+
+    #[test]
+    fn all_persistent_paths_follow_the_same_root() {
+        let _guard = TEST_ROOT_LOCK.lock();
+        let temp = tempfile::tempdir().unwrap();
+        set_override_root(Some(temp.path().to_path_buf()));
+        assert_eq!(settings_json(), temp.path().join("settings.json"));
+        assert_eq!(dictionary_json(), temp.path().join("dictionary.json"));
+        assert_eq!(history_sqlite(), temp.path().join("history.sqlite"));
+        assert_eq!(recordings_root(), temp.path().join("recordings"));
         set_override_root(None);
     }
 
