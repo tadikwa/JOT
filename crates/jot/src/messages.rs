@@ -73,6 +73,7 @@ messages! {
     Autostart => "Start with Windows", "Lancer au démarrage de Windows";
     AutostartHint => "Keep dictation available as soon as you sign in.", "Rend la dictée disponible dès l’ouverture de votre session.";
     AutostartError => "Windows could not change the startup setting.", "Impossible de modifier le démarrage automatique dans Windows.";
+    AutostartTestProfile => "Start with Windows is disabled in the test profile: a test build never launches at sign-in.", "Le démarrage automatique est désactivé dans le profil de test : une version de test ne se lance jamais à l’ouverture de session.";
     Sounds => "Dictation sounds", "Sons de dictée";
     SoundsHint => "Play a sound when dictation starts, succeeds or fails.", "Joue un son au début de la dictée, à la réussite ou en cas d’échec.";
     DoubleTap => "Double-press to go hands-free", "Deux appuis pour passer en mains libres";

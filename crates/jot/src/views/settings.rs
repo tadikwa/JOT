@@ -374,6 +374,9 @@ impl SettingsView {
                     self.autostart_enabled,
                     theme,
                     cx.listener(|this, _, _, cx| {
+                        if crate::autostart::is_locked() {
+                            return;
+                        }
                         let wanted = !this.autostart_enabled;
                         this.autostart_error = !crate::autostart::set_enabled(wanted);
                         if !this.autostart_error {
@@ -386,8 +389,19 @@ impl SettingsView {
                         cx.notify();
                     }),
                 )
+                .when(crate::autostart::is_locked(), |row| {
+                    row.opacity(0.5).cursor_default()
+                })
                 .into_any_element(),
                 div()
+                    .when(crate::autostart::is_locked(), |row| {
+                        row.child(widgets::status_line(
+                            "autostart-test-profile",
+                            tr(Msg::AutostartTestProfile),
+                            StatusTone::Neutral,
+                            theme,
+                        ))
+                    })
                     .when(self.autostart_error, |row| {
                         row.child(widgets::status_line(
                             "autostart-error",

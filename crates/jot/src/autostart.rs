@@ -28,27 +28,40 @@ pub fn launch_command() -> Option<String> {
     Some(format!("\"{}\" --background", exe.display()))
 }
 
+/// A portable test profile never touches the real Windows startup entry.
+pub fn is_locked() -> bool {
+    jot_core::test_profile::root().is_some()
+}
+
 pub fn is_enabled() -> bool {
-    if jot_core::test_profile::root().is_some() {
+    if is_locked() {
         return false;
     }
     platform::read().is_some()
 }
 
-/// True when the stored command points at a different build than the one
+/// True when the stored command points at a different Jot build than the one
 /// running — a leftover from a previous install location.
 pub fn is_stale() -> bool {
-    if jot_core::test_profile::root().is_some() {
+    if is_locked() {
         return false;
     }
     match (platform::read(), launch_command()) {
-        (Some(stored), Some(current)) => !stored.eq_ignore_ascii_case(&current),
+        (Some(stored), Some(current)) => stale(&stored, &current),
         _ => false,
     }
 }
 
+/// Only a `Run\Jot` value that launches some `jot.exe` is ours to rewrite; a
+/// value another program stored under the same name is left alone.
+fn stale(stored: &str, current: &str) -> bool {
+    let lower = stored.to_ascii_lowercase();
+    !stored.eq_ignore_ascii_case(current)
+        && (lower.contains("\\jot.exe\"") || lower.ends_with("\\jot.exe"))
+}
+
 pub fn set_enabled(enabled: bool) -> bool {
-    if jot_core::test_profile::root().is_some() {
+    if is_locked() {
         return false;
     }
     match (enabled, launch_command()) {
@@ -171,6 +184,17 @@ mod tests {
             "{command}"
         );
         assert!(command.to_lowercase().contains("jot"), "{command}");
+    }
+
+    #[test]
+    fn only_another_jot_build_counts_as_stale() {
+        let current = r#""C:\Users\a\AppData\Local\Programs\Jot\jot.exe" --background"#;
+        assert!(!stale(current, current));
+        assert!(!stale(&current.to_uppercase(), current));
+        assert!(stale(r#""E:\Old Jot\jot.exe" --background"#, current));
+        assert!(stale(r"E:\Old\jot.exe", current));
+        assert!(!stale(r#""C:\Tools\other.exe" /jot"#, current));
+        assert!(!stale(r#""C:\Tools\notjot.exe""#, current));
     }
 
     #[test]
