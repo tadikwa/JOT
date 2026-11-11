@@ -1672,6 +1672,13 @@ fn engine_label(model_id: &str) -> String {
                 "refusé par le contrôle : transcription brute conservée"
             )
         ),
+        "missing" => format!(
+            "{head} · {model} {}",
+            ui(
+                "not installed — raw transcript kept",
+                "non installé : transcription brute conservée"
+            )
+        ),
         _ => format!(
             "{head} · {model} {}",
             ui(
@@ -1801,6 +1808,12 @@ mod tests {
             rejected.contains("Qwen3.5 9B") && !rejected.contains("→"),
             "{rejected}"
         );
+        let missing = engine_label("local/qwen3-asr-1.7b+qwen3.5-4b:missing");
+        assert_ne!(
+            missing,
+            engine_label("local/qwen3-asr-1.7b+qwen3.5-4b:error")
+        );
+        assert!(!missing.contains("→"), "{missing}");
     }
 
     #[test]

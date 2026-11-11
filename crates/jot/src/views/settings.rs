@@ -64,6 +64,70 @@ fn pack_source(pack: Pack) -> &'static str {
     }
 }
 
+/// What the next local dictation will really get, one line per stage: an
+/// installed transcription pack must never read as "reformulation ready".
+fn local_state(
+    mode: LocalReformulation,
+    transcription: bool,
+    reformulation: bool,
+) -> [(String, StatusTone); 2] {
+    let transcription = if transcription {
+        (
+            ui(
+                "Local transcription: installed",
+                "Transcription locale : installée",
+            ),
+            StatusTone::Good,
+        )
+    } else {
+        (
+            ui(
+                "Local transcription: not installed — local dictation is unavailable until it is downloaded",
+                "Transcription locale : non installée — la dictée locale est indisponible tant qu’elle n’est pas téléchargée",
+            ),
+            StatusTone::Bad,
+        )
+    };
+    let name = match mode {
+        LocalReformulation::Quality => ui("Quality editing", "Reformulation qualité"),
+        _ => ui("Fast editing", "Reformulation rapide"),
+    };
+    let reformulation = match (mode, reformulation) {
+        (LocalReformulation::Off, _) => (
+            ui(
+                "Local editing: off — the raw transcript is inserted",
+                "Reformulation locale : désactivée — la transcription brute est insérée",
+            )
+            .to_string(),
+            StatusTone::Neutral,
+        ),
+        (_, true) => (
+            format!(
+                "{name}{}",
+                ui(
+                    ": installed — available and active",
+                    " : installée — disponible et active"
+                )
+            ),
+            StatusTone::Good,
+        ),
+        (_, false) => (
+            format!(
+                "{name}{}",
+                ui(
+                    ": editing model not installed — download it below. Until then, the raw transcript is inserted.",
+                    " : modèle de reformulation non installé — téléchargez-le ci-dessous. En attendant, la transcription brute est insérée.",
+                )
+            ),
+            StatusTone::Bad,
+        ),
+    };
+    [
+        (transcription.0.to_string(), transcription.1),
+        reformulation,
+    ]
+}
+
 /// Audio retention options, in the order they read as a sentence.
 const RETENTION_CHOICES: [(i64, Msg); 4] = [
     (-1, Msg::NeverKeep),
@@ -749,17 +813,29 @@ impl SettingsView {
     }
 
     fn finish_download(&mut self) {
-        let Some((_, progress)) = self.download.take() else {
+        let Some((pack, progress)) = self.download.take() else {
             return;
         };
         let error = progress.error.lock().clone();
+        let active =
+            Pack::for_reformulation(self.services.settings.get().local_reformulation) == Some(pack);
         self.download_status = Some(match error {
             None => (
-                ui(
-                    "Installed and verified (SHA-256).",
-                    "Installé et vérifié (SHA-256).",
-                )
-                .into(),
+                format!(
+                    "{}{}",
+                    ui(
+                        "Installed and verified (SHA-256).",
+                        "Installé et vérifié (SHA-256).",
+                    ),
+                    if active {
+                        ui(
+                            " Local editing is now available and active.",
+                            " La reformulation locale est maintenant disponible et active.",
+                        )
+                    } else {
+                        ""
+                    }
+                ),
                 StatusTone::Good,
             ),
             Some(error) if error == local::CANCELLED => (
@@ -892,12 +968,23 @@ impl SettingsView {
         settings: &Settings,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let mut rows = vec![self.pack_row(
+        let mut rows: Vec<AnyElement> = local_state(
+            settings.local_reformulation,
+            Pack::Transcription.installed(),
+            Pack::for_reformulation(settings.local_reformulation).is_some_and(Pack::installed),
+        )
+        .into_iter()
+        .zip(["local-state-transcription", "local-state-reformulation"])
+        .map(|((message, tone), id)| {
+            widgets::status_line(id, message, tone, theme).into_any_element()
+        })
+        .collect();
+        rows.push(self.pack_row(
             Pack::Transcription,
             ui("Local transcription", "Transcription locale"),
             theme,
             cx,
-        )];
+        ));
         rows.push(
             widgets::field_row(
                 tr(Msg::Reformulation),
@@ -1641,5 +1728,30 @@ impl Drop for SettingsView {
         if self.capturing_hotkey {
             crate::hotkey_hook::stop_capture();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_state_never_reports_a_missing_editing_model_as_ready() {
+        let tones = |mode, asr, llm| local_state(mode, asr, llm).map(|(_, tone)| tone);
+        assert_eq!(
+            tones(LocalReformulation::Fast, true, false),
+            [StatusTone::Good, StatusTone::Bad]
+        );
+        assert_eq!(
+            tones(LocalReformulation::Quality, true, true),
+            [StatusTone::Good, StatusTone::Good]
+        );
+        assert_eq!(
+            tones(LocalReformulation::Off, false, false),
+            [StatusTone::Bad, StatusTone::Neutral]
+        );
+        let [_, (missing, _)] = local_state(LocalReformulation::Fast, true, false);
+        let [_, (ready, _)] = local_state(LocalReformulation::Fast, true, true);
+        assert_ne!(missing, ready);
     }
 }
