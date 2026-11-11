@@ -142,6 +142,9 @@ fn main() -> Result<()> {
         services.settings.clone(),
     ));
     services.start_background_work();
+    if settings.check_updates {
+        runtime.spawn(announce_update(settings.include_prereleases));
+    }
 
     let app_services = services.clone();
     application().run(move |cx: &mut App| {
@@ -180,6 +183,29 @@ fn main() -> Result<()> {
     });
 
     Ok(())
+}
+
+/// The once-a-day startup check: one balloon per new version, silence otherwise.
+async fn announce_update(include_prereleases: bool) {
+    use i18n::{Msg, tf, tr};
+    use jot_core::update::{self, Outcome};
+    match update::check(
+        env!("CARGO_PKG_VERSION"),
+        include_prereleases,
+        update::DAILY,
+    )
+    .await
+    {
+        Ok(Outcome::Available(found)) if update::first_notice(&found.version) => {
+            tracing::info!(version = %found.version, "announcing an update");
+            tray::notify(
+                tr(Msg::UpdateNoticeTitle).to_string(),
+                tf(Msg::UpdateNoticeBody, &[&found.version]),
+            );
+        }
+        Ok(outcome) => tracing::info!(?outcome, "update check"),
+        Err(error) => tracing::info!(%error, "update check failed"),
+    }
 }
 
 /// Starts logging. The returned guard flushes the file writer and must live for

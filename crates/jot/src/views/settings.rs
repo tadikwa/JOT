@@ -1202,6 +1202,40 @@ impl SettingsView {
                     retention_row,
                 )
                 .into_any_element(),
+                widgets::toggle(
+                    "check-updates",
+                    tr(Msg::CheckUpdates),
+                    tr(Msg::CheckUpdatesHint),
+                    settings.check_updates,
+                    theme,
+                    {
+                        let store = self.services.settings.clone();
+                        move |_, _, cx| {
+                            let next = !store.get().check_updates;
+                            store.update(Some("checkUpdates"), |s| s.check_updates = next);
+                            cx.refresh_windows();
+                        }
+                    },
+                )
+                .into_any_element(),
+                widgets::toggle(
+                    "include-prereleases",
+                    tr(Msg::Prereleases),
+                    tr(Msg::PrereleasesHint),
+                    settings.include_prereleases,
+                    theme,
+                    {
+                        let store = self.services.settings.clone();
+                        move |_, _, cx| {
+                            let next = !store.get().include_prereleases;
+                            store.update(Some("includePrereleases"), |s| {
+                                s.include_prereleases = next
+                            });
+                            cx.refresh_windows();
+                        }
+                    },
+                )
+                .into_any_element(),
                 widgets::field_row(
                     tr(Msg::ApiKey),
                     tr(Msg::ApiKeyHint),

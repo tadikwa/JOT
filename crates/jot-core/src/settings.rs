@@ -183,6 +183,11 @@ pub struct Settings {
     pub audio_retention_days: i64,
     pub transcription_engine: TranscriptionEngine,
     pub local_reformulation: LocalReformulation,
+    /// Ask GitHub Releases at most once a day at startup whether a newer Jot
+    /// exists. Only the app version leaves the PC; nothing is downloaded.
+    pub check_updates: bool,
+    /// Also announce prereleases (test builds) of the fork.
+    pub include_prereleases: bool,
     /// Auto-degrade bookkeeping: three gate trips in 24h ⇒ tone pass off.
     #[serde(with = "gate_trip_stamps")]
     pub gate_trips: Vec<OffsetDateTime>,
@@ -212,6 +217,8 @@ impl Default for Settings {
             audio_retention_days: 7,
             transcription_engine: TranscriptionEngine::Gemini,
             local_reformulation: LocalReformulation::Fast,
+            check_updates: true,
+            include_prereleases: false,
             gate_trips: Vec::new(),
         }
     }

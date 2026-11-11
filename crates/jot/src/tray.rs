@@ -123,6 +123,14 @@ pub fn refresh_tooltip() {
     platform::refresh_tooltip();
 }
 
+/// Shows a notification-area balloon; clicking it opens About.
+pub fn notify(title: String, body: String) {
+    #[cfg(windows)]
+    platform::notify(title, body);
+    #[cfg(not(windows))]
+    let _ = (title, body);
+}
+
 pub fn install() -> UnboundedReceiver<TrayCommand> {
     let (tx, rx) = unbounded_channel();
     let _ = COMMANDS.set(tx);
@@ -179,8 +187,8 @@ mod platform {
     use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, TRUE, WPARAM};
     use windows::Win32::System::LibraryLoader::GetModuleHandleW;
     use windows::Win32::UI::Shell::{
-        NIF_ICON, NIF_MESSAGE, NIF_TIP, NIM_ADD, NIM_DELETE, NIM_MODIFY, NOTIFYICONDATAW,
-        Shell_NotifyIconW,
+        NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
+        NIN_BALLOONUSERCLICK, NOTIFYICONDATAW, Shell_NotifyIconW,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
@@ -195,7 +203,28 @@ mod platform {
     /// Our private message id for the notification-area callback.
     const WM_TRAY: u32 = WM_APP + 1;
     const WM_REFRESH_TOOLTIP: u32 = WM_APP + 2;
+    const WM_NOTIFY_BALLOON: u32 = WM_APP + 3;
     const ICON_ID: u32 = 1;
+
+    /// The balloon waiting for the tray thread to show it.
+    static BALLOON: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+    pub fn notify(title: String, body: String) {
+        *BALLOON.lock().unwrap_or_else(|e| e.into_inner()) = Some((title, body));
+        unsafe {
+            if let Ok(hwnd) = FindWindowW(w!("JotTrayHost"), None) {
+                let _ = PostMessageW(hwnd, WM_NOTIFY_BALLOON, WPARAM(0), LPARAM(0));
+            }
+        }
+    }
+
+    fn copy_into(slot: &mut [u16], text: &str) {
+        let last = slot.len() - 1;
+        for (cell, unit) in slot[..last].iter_mut().zip(text.encode_utf16()) {
+            *cell = unit;
+        }
+        slot[last.min(text.encode_utf16().count())] = 0;
+    }
 
     pub fn refresh_tooltip() {
         unsafe {
@@ -265,6 +294,10 @@ mod platform {
         if !unsafe { Shell_NotifyIconW(NIM_ADD, &data) }.as_bool() {
             tracing::error!("the notification area rejected the icon");
         }
+        // A notice that arrived before this window existed.
+        if BALLOON.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+            let _ = unsafe { PostMessageW(hwnd, WM_NOTIFY_BALLOON, WPARAM(0), LPARAM(0)) };
+        }
 
         let mut message = MSG::default();
         unsafe {
@@ -316,6 +349,7 @@ mod platform {
                     // most; the full menu is on the right button.
                     WM_LBUTTONUP => emit(TrayCommand::OpenDashboard),
                     WM_RBUTTONUP => unsafe { show_menu(hwnd) },
+                    NIN_BALLOONUSERCLICK => emit(TrayCommand::About),
                     _ => {}
                 }
                 LRESULT(0)
@@ -330,6 +364,23 @@ mod platform {
                 };
                 set_tooltip(&mut data);
                 let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+                LRESULT(0)
+            }
+            WM_NOTIFY_BALLOON => {
+                let pending = BALLOON.lock().unwrap_or_else(|e| e.into_inner()).take();
+                if let Some((title, body)) = pending {
+                    let mut data = NOTIFYICONDATAW {
+                        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                        hWnd: hwnd,
+                        uID: ICON_ID,
+                        uFlags: NIF_INFO,
+                        dwInfoFlags: NIIF_INFO,
+                        ..Default::default()
+                    };
+                    copy_into(&mut data.szInfoTitle, &title);
+                    copy_into(&mut data.szInfo, &body);
+                    let _ = unsafe { Shell_NotifyIconW(NIM_MODIFY, &data) };
+                }
                 LRESULT(0)
             }
             WM_COMMAND => {

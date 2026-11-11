@@ -29,9 +29,11 @@ use gpui::{
     AnyWindowHandle, App, Bounds, Context, Entity, Render, Role, TitlebarOptions, Window,
     WindowBounds, WindowOptions, div, prelude::*, px, relative, size,
 };
+use jot_core::update::{CheckError, Outcome};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
+use std::time::Duration;
 
 /// Open tool windows, so a second request focuses the existing one instead of
 /// stacking duplicates on top of each other.
@@ -367,30 +369,24 @@ pub struct AboutView {
 
 enum UpdateState {
     Checking,
-    UpToDate,
-    Available(jot_core::update::Update),
-    /// GitHub was unreachable or unhappy. Worth saying, not worth retrying:
-    /// this window is not the reason anyone opened Jot.
-    Unknown,
+    Done(Result<jot_core::update::Outcome, jot_core::update::CheckError>),
 }
 
 impl AboutView {
     fn new(cx: &mut gpui::Context<Self>) -> Self {
         cx.spawn(async move |this, cx| {
-            let outcome =
-                jot_core::runtime::spawn(jot_core::update::check(env!("CARGO_PKG_VERSION"))).await;
-            let state = match outcome {
-                Ok(Ok(Some(update))) => UpdateState::Available(update),
-                Ok(Ok(None)) => UpdateState::UpToDate,
-                Ok(Err(error)) => {
-                    tracing::debug!(?error, "update check failed");
-                    UpdateState::Unknown
-                }
-                Err(error) => {
-                    tracing::debug!(?error, "update check did not run");
-                    UpdateState::Unknown
-                }
-            };
+            let prereleases = jot_core::settings::SettingsStore::global()
+                .get()
+                .include_prereleases;
+            // Opening About is a request to look, but not ten times a minute.
+            let outcome = jot_core::runtime::spawn(jot_core::update::check(
+                env!("CARGO_PKG_VERSION"),
+                prereleases,
+                Duration::from_secs(600),
+            ))
+            .await;
+            let state =
+                UpdateState::Done(outcome.unwrap_or(Err(jot_core::update::CheckError::BadReply)));
             this.update(cx, |this, cx| {
                 this.update = state;
                 cx.notify();
@@ -414,15 +410,27 @@ impl AboutView {
                 theme,
             )
             .into_any_element(),
-            UpdateState::UpToDate => {
+            UpdateState::Done(Ok(Outcome::UpToDate)) => {
                 widgets::status_line("update", tr(Msg::UpdateCurrent), StatusTone::Good, theme)
                     .into_any_element()
             }
-            UpdateState::Unknown => {
-                widgets::status_line("update", tr(Msg::UpdateUnknown), StatusTone::Neutral, theme)
+            UpdateState::Done(Ok(Outcome::NoRelease)) => widgets::status_line(
+                "update",
+                tr(Msg::UpdateNoRelease),
+                StatusTone::Neutral,
+                theme,
+            )
+            .into_any_element(),
+            UpdateState::Done(Err(error)) => {
+                let message = match error {
+                    CheckError::Offline => tr(Msg::UpdateUnknown).to_string(),
+                    CheckError::RateLimited { .. } => tr(Msg::UpdateRateLimited).to_string(),
+                    other => tf(Msg::UpdateFailed, &[&other.to_string()]),
+                };
+                widgets::status_line("update", message, StatusTone::Neutral, theme)
                     .into_any_element()
             }
-            UpdateState::Available(update) => {
+            UpdateState::Done(Ok(Outcome::Available(update))) => {
                 let page = update.page.clone();
                 div()
                     .flex()
@@ -430,7 +438,14 @@ impl AboutView {
                     .gap_2()
                     .child(widgets::status_line(
                         "update",
-                        tf(Msg::UpdateAvailable, &[&update.version]),
+                        tf(
+                            if update.prerelease {
+                                Msg::UpdatePrerelease
+                            } else {
+                                Msg::UpdateAvailable
+                            },
+                            &[&update.version],
+                        ),
                         StatusTone::Good,
                         theme,
                     ))

@@ -16,6 +16,16 @@ messages! {
     UpdateCurrent => "You are on the latest version.", "Jot est à jour.";
     UpdateUnknown => "Could not reach GitHub to check for updates.", "Impossible de joindre GitHub pour vérifier les mises à jour.";
     UpdateAvailable => "Jot {0} is available.", "Jot {0} est disponible.";
+    UpdatePrerelease => "Test version {0} is available (prerelease).", "La préversion {0} est disponible (version de test).";
+    UpdateNoRelease => "No version of Jot has been published on GitHub yet.", "Aucune version de Jot n’a encore été publiée sur GitHub.";
+    UpdateRateLimited => "GitHub is limiting checks for now. Try again later.", "GitHub limite temporairement les vérifications. Réessayez plus tard.";
+    UpdateFailed => "GitHub gave an unexpected answer ({0}).", "GitHub a donné une réponse inattendue ({0}).";
+    UpdateNoticeTitle => "Jot update", "Mise à jour de Jot";
+    UpdateNoticeBody => "Jot {0} is available. Click to see what to do.", "Jot {0} est disponible. Cliquez pour savoir comment l’installer.";
+    CheckUpdates => "Check for updates", "Rechercher les mises à jour";
+    CheckUpdatesHint => "At most once a day, at startup, Jot asks GitHub for the list of published versions. Only the app version is sent; nothing is downloaded or installed for you.", "Une fois par jour au plus, au démarrage, Jot demande à GitHub la liste des versions publiées. Seule la version de l’application est transmise ; rien n’est téléchargé ni installé à votre place.";
+    Prereleases => "Include prereleases", "Inclure les préversions";
+    PrereleasesHint => "Also announce test versions, which are less proven.", "Annonce aussi les versions de test, moins éprouvées.";
     UpdateDownload => "Open the download page", "Ouvrir la page de téléchargement";
     Version => "Version {0}", "Version {0}";
     AboutDescription => "Use your shortcut to dictate in any app. Jot sends the recording directly to the Gemini API with your key.", "Utilisez votre raccourci pour dicter dans n’importe quelle application. Jot envoie l’enregistrement directement à l’API Gemini avec votre clé.";
