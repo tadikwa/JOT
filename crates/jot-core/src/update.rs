@@ -30,7 +30,7 @@ use anyhow::{Context as _, Result, anyhow};
 /// anything. This URL answers 302 to the newest tag with no such limit, and
 /// the tag is the only fact needed.
 const LATEST_RELEASE: &str =
-    "https://github.com/ubranch/jot-gemini-transcribe-Windows/releases/latest";
+    "https://github.com/tadikwa/jot-gemini-transcribe-Windows/releases/latest";
 
 /// GitHub answers slowly or not at all more often than it answers wrongly, and
 /// a stalled About window is worse than an unanswered question.

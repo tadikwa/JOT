@@ -3,12 +3,12 @@
 Candidat de test **non publié** : aucun push, PR, tag, release ni remplacement de l’installation principale. À valider par l’utilisateur.
 
 ## État Git
-- Worktree : `C:\Users\Utilisateur\.codex\worktrees\jot-dictionary-v14\JOT`, branche locale `codex/dictionary-v14`, base `e6e502d` (Jot 1.3).
+- Worktree : `<worktrees>/jot-dictionary-v14\JOT`, branche locale `codex/dictionary-v14`, base `e6e502d` (Jot 1.3).
 - `a9141b1` — travail Codex V1.4 (lots A–D), commité tel quel après relecture du diff et recherche de secrets.
 - `3dceb76` — corrections de cette reprise (ci-dessous). **Le binaire livré est compilé depuis cet arbre.**
 - Commit suivant : ce rapport (documentation seule).
 - Non commité volontairement : `docs/v14/test-integration.log` (ancien journal Codex, version 1.3.0, chemins locaux).
-- Le checkout principal `E:\05 - IA\01 - GITHUB\JOT` (branche `dev`, modifications non commitées) n’a pas été touché, sauf ajouts dans `test-build\` et le dossier `target` partagé.
+- Le checkout principal `<checkout>` (branche `dev`, modifications non commitées) n’a pas été touché, sauf ajouts dans `test-build\` et le dossier `target` partagé.
 
 ## Corrections apportées
 | Défaut | Cause | Correction | Preuve |
@@ -18,7 +18,7 @@ Candidat de test **non publié** : aucun push, PR, tag, release ni remplacement 
 | Purge des suggestions orphelines non couverte par le chemin Historique | — | test `deleting_a_dictation_purges_its_pending_suggestion_but_keeps_accepted_rules` (`tests/history_library.rs`) | `cargo test` |
 
 ## Commandes et résultats (relancés sur l’arbre final)
-`CARGO_TARGET_DIR=E:/05 - IA/01 - GITHUB/JOT/target`, journaux dans `test-build\claude-v14-evidence\*-final.log`.
+`CARGO_TARGET_DIR=<checkout>/target`, journaux dans `test-build\claude-v14-evidence\*-final.log`.
 
 | Commande | Résultat |
 |---|---|
@@ -39,8 +39,8 @@ Candidat de test **non publié** : aucun push, PR, tag, release ni remplacement 
 - ZIP extrait et lancé : l’historique se reconstruit depuis `meta.json` (3 dictées fictives).
 
 ## Livrables
-- Dossier portable : `E:\05 - IA\01 - GITHUB\JOT\test-build\codex-dictionary-v14\` (`jot.exe` final, `jot-test-profile`, profil fictif Codex, `LIRE-MOI.md` mis à jour, `VALIDATION.md`). L’ancien binaire Codex est conservé : `codex-dictionary-v14-evidence\jot-codex-60EDF637.exe`.
-- ZIP : `E:\05 - IA\01 - GITHUB\JOT\test-build\Jot-1.4.0-test-portable.zip` (SHA-256 `AD0BB330D4CF02786EF8C24C11BFBFD5DA2EEE75E126275538E16D03EAEC0BD6`). Contient binaire, marqueur, licences, notes, et le profil fictif sans SQLite, journaux, audio ni clé.
+- Dossier portable : `<checkout>\test-build\codex-dictionary-v14\` (`jot.exe` final, `jot-test-profile`, profil fictif Codex, `LIRE-MOI.md` mis à jour, `VALIDATION.md`). L’ancien binaire Codex est conservé : `codex-dictionary-v14-evidence\jot-codex-60EDF637.exe`.
+- ZIP : `<checkout>\test-build\Jot-1.4.0-test-portable.zip` (SHA-256 `AD0BB330D4CF02786EF8C24C11BFBFD5DA2EEE75E126275538E16D03EAEC0BD6`). Contient binaire, marqueur, licences, notes, et le profil fictif sans SQLite, journaux, audio ni clé.
 - Preuves : `test-build\claude-v14-evidence\`. Parcours GUI : `test-build\claude-v14-walkthrough\`. Ce dossier contient de **courts enregistrements audio réels de la pièce** captés pendant les tests de raccourcis. Ne pas le partager ; il est exclu du ZIP.
 
 ## Limites

@@ -24,7 +24,7 @@ Le CSV conserve `term,misspelling` et ajoute une troisième colonne facultative 
 
 ## Tests réellement exécutés sur données fictives
 
-Depuis le worktree dédié, avec `CARGO_TARGET_DIR=E:/05 - IA/01 - GITHUB/JOT/target` :
+Depuis le worktree dédié, avec `CARGO_TARGET_DIR=<checkout>/target` :
 
 - `cargo test -p jot-core --lib --locked dictionary -- --nocapture` : **28 tests sélectionnés réussis**, aucun échec (inclut les tests d’extraction et un test de prompt existant).
 - `cargo test -p jot-core --lib --locked replacement -- --nocapture` : **13 tests sélectionnés réussis**, aucun échec (un test est commun avec le filtre dictionary).

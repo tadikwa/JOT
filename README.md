@@ -1,200 +1,147 @@
-<p align="center">
-  <img src="./assets/readme/hero.svg" width="100%"
-       alt="Jot for Windows — hold a key, speak, and the text lands at your cursor. Saying &quot;let's meet at 1pm — actually, no, make it 2pm&quot; types &quot;Let's meet at 2 PM.&quot;">
-</p>
+# Jot pour Windows
+
+**Dictée vocale pour Windows : appuyez sur une touche, parlez, et le texte arrive là où se trouve votre curseur.**
+Gratuit, open source (Apache 2.0), écrit en Rust avec [GPUI](https://www.gpui.rs).
+
+> **Code source disponible — première version stable non encore publiée.**
+> Ce dépôt (fork de [ubranch/jot-gemini-transcribe-Windows](https://github.com/ubranch/jot-gemini-transcribe-Windows))
+> ne propose pas encore de version téléchargeable ni d’installeur. Pour l’essayer aujourd’hui, il faut
+> [le compiler depuis les sources](#installation-depuis-les-sources). Les versions publiées par d’autres
+> dépôts ne correspondent pas à ce code.
 
 <p align="center">
-  <a href="https://github.com/ubranch/jot-gemini-transcribe-Windows/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/ubranch/jot-gemini-transcribe-Windows?style=flat-square&label=release&color=4285F4&labelColor=1E1F20"></a>
-  <a href="https://github.com/ubranch/jot-gemini-transcribe-Windows/releases"><img alt="Downloads" src="https://img.shields.io/github/downloads/ubranch/jot-gemini-transcribe-Windows/total?style=flat-square&label=downloads&color=34A853&labelColor=1E1F20"></a>
-  <img alt="Windows 10 and 11" src="https://img.shields.io/badge/Windows-10%20%7C%2011-0078D4?style=flat-square&labelColor=1E1F20">
-  <img alt="Rust 1.97 with GPUI" src="https://img.shields.io/badge/Rust%20%2B%20GPUI-1.97-CE422B?style=flat-square&labelColor=1E1F20">
-  <img alt="Apache 2.0" src="https://img.shields.io/badge/license-Apache--2.0-9AA0A6?style=flat-square&labelColor=1E1F20">
+  <img src="./assets/readme/accueil.png" width="900"
+       alt="Tableau de bord de Jot en français, thème sombre : mots dictés, temps économisé estimé, vitesse moyenne, dictées réussies, graphique d’utilisation sur 30 jours et calendrier d’activité. Données fictives.">
 </p>
 
-<p align="center">
-  <a href="https://github.com/ubranch/jot-gemini-transcribe-Windows/releases/latest">
-    <img src="./assets/readme/download.svg" width="272" alt="Download for Windows">
-  </a>
-</p>
+## Ce que fait Jot
 
-<p align="center">
-  <sub>
-    Portable · no installer · 10&nbsp;MB ·
-    <a href="https://github.com/ubranch/jot-gemini-transcribe-Windows/releases/latest">all downloads</a> ·
-    <a href="#build-it-yourself">or build from source</a>
-  </sub>
-</p>
+1. Vous appuyez sur la **touche de dictée** (Ctrl droit par défaut) dans n’importe quelle application.
+2. Vous parlez. Une petite pastille en bas de l’écran indique que Jot écoute ; elle ne capte jamais vos clics.
+3. Vous appuyez de nouveau (mode *Toggle*) ou relâchez la touche (mode *Maintenir*).
+4. Jot transcrit, nettoie le texte (hésitations, autocorrections orales, ponctuation) et l’insère dans
+   l’application où vous étiez. **Échap** annule une dictée en cours.
 
-<p align="center">
-  <a href="#get-it-running"><b>Get it running</b></a> ·
-  <a href="#the-three-gestures">Gestures</a> ·
-  <a href="#why-it-is-different">Why it is different</a> ·
-  <a href="#one-dictation-end-to-end">How it works</a> ·
-  <a href="#settings">Settings</a> ·
-  <a href="#build-it-yourself">Build</a>
-</p>
+Chaque dictée est conservée dans l’historique, avec sa transcription brute et vos éventuelles corrections.
 
-Hold the dictation key, say the thing, let go. A moment later your words are in the app you were
-already using — punctuated, filler words removed, cleaned up. No window to switch to, no transcript
-to copy, no account to make.
+## Fonctions de la version 1.4
 
-## Get it running
+| Fonction | Détail |
+| --- | --- |
+| Deux modes de dictée | **Appuyer pour démarrer / arrêter** (Toggle) ou **Maintenir pour parler**. Échap annule. |
+| Raccourci personnalisable | Ctrl droit, Alt droit, Maj droite, Windows droite, Verr. maj., ou une combinaison Ctrl/Alt/Maj + lettre, chiffre, Espace ou F1–F24 (hors F12). Un conflit signalé par Windows est refusé et l’ancien raccourci est conservé. |
+| Pastille (HUD) | Visible pendant la dictée, traversante pour la souris, ne vole jamais le focus. |
+| Insertion | Saisie dans le champ actif, puis collage protégé, puis presse-papiers en dernier recours. Jamais dans un champ mot de passe. |
+| Historique | Recherche plein texte (SQLite FTS5), filtres par date, application et statut, correction d’une dictée avec conservation des versions. |
+| Dictionnaire intelligent | Suggestions calculées **localement** à partir de vos corrections ; aucune règle n’est activée sans votre validation. Les refus sont mémorisés. Import/export CSV. |
+| Tableau de bord | Mots dictés, vitesse, séries d’activité et **temps économisé estimé** (comparé à une vitesse de frappe de référence réglable). |
+| Interface | Français ou anglais, thème clair ou sombre. |
+| Clé API | Stockée dans le **Gestionnaire d’identification Windows**, jamais dans un fichier de réglages. |
 
-1. **Download and unzip.** Grab [the latest release](https://github.com/ubranch/jot-gemini-transcribe-Windows/releases/latest)
-   and run `jot.exe` from the folder. SmartScreen warns because the binary is unsigned — choose
-   **More info → Run anyway**. Nothing is installed; deleting the folder uninstalls it.
-2. **Paste a [Gemini API key](https://aistudio.google.com/apikey).** It goes into Windows Credential
-   Manager, never into a settings file.
-3. **Hold `Right Ctrl` and talk** — anywhere you can type. Windows asks for microphone permission the
-   first time.
+<table>
+  <tr>
+    <td><img src="./assets/readme/historique.png" alt="Page Historique : barre de recherche, filtres, liste de dictées fictives avec statut Inséré, mention Modifiée, heure, application, nombre de mots et durée."></td>
+    <td><img src="./assets/readme/dictionnaire.png" alt="Page Dictionnaire : suggestion Klod Code vers Claude Code à valider avec boutons Accepter et Refuser, et règle validée Proxmocks vers Proxmox. Données fictives."></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Historique (données fictives)</sub></td>
+    <td align="center"><sub>Dictionnaire intelligent (données fictives)</sub></td>
+  </tr>
+</table>
 
-That is the whole setup, and it takes about two minutes. Prefer to compile it yourself? See
-[Build it yourself](#build-it-yourself).
+## Prérequis
 
-You pay Google for what you dictate at [Gemini API pricing](https://ai.google.dev/pricing); a free
-tier exists and a typical dictation is a few seconds of audio. Jot itself is free and has no account.
+- Windows 10 ou 11, 64 bits, avec un microphone.
+- Pour la dictée actuelle : une **clé API Gemini** ([Google AI Studio](https://aistudio.google.com/apikey)).
+  Un compte Google est nécessaire et les conditions et tarifs de Google s’appliquent ; un niveau gratuit existe.
+- Pour compiler : la chaîne Rust indiquée dans `rust-toolchain.toml` (actuellement 1.97) et les outils
+  de compilation MSVC (Visual Studio Build Tools, charge de travail « Développement Desktop en C++ »).
 
-## The three gestures
+## Gemini (en ligne) et mode local
 
-<p align="center">
-  <img src="./assets/readme/gestures.svg" width="100%"
-       alt="Hold Right Ctrl to talk and release to place the text at your cursor. Hold it and tap Space for hands-free, then press the key again to finish. Esc cancels, and anything over ten seconds is still kept in History.">
-</p>
+**Aujourd’hui (1.4), la transcription passe par l’API Gemini de Google.** Un mode **100 % local**
+(transcription et reformulation exécutées sur votre PC, sans clé ni connexion) est en cours de
+développement pour une version 1.5. Il n’est **pas encore publié** ; cette section sera mise à jour
+quand il le sera.
 
-Windows has no `fn` key — it is handled in keyboard firmware and never reaches a low-level hook — so
-the default is **Right Ctrl**. Right Alt, Right Shift, Right Win and Caps Lock are also available.
-Caps Lock and Right Win are swallowed while bound, so neither toggles shift-lock nor opens the Start
-menu mid-dictation.
-
-## Why it is different
-
-- **It follows a change of mind.** Say *"let's meet at 1pm — actually, no, make it 2pm"* and you get
-  **"Let's meet at 2 PM."** That is the whole pitch, and setup makes you do it once so you believe it.
-- **It never loses your words.** Audio hits the disk from the first millisecond and the WAV header is
-  rewritten every second, so a crash, a `taskkill` or a flat battery costs you nothing. Offline,
-  dictations queue and land when you reconnect. Release the key mid-word and it keeps listening until
-  you actually stop.
-- **It is private by architecture.** Your voice goes from your PC straight to the Gemini API with
-  *your* key. No middleman server, no account, no analytics, no keystroke logging. Nothing else
-  leaves the machine unattended: the only other host Jot ever contacts is `github.com`, and only at
-  the moment you open About to ask whether there is a newer version.
-- **Your jargon, spelled right.** Names and product terms go in the Dictionary and ride along with
-  the audio, so the model hears "Kubernetes" instead of guessing "cooper netties" — corrected at the
-  source, not patched afterwards.
-
-## One dictation, end to end
-
-<p align="center">
-  <img src="./assets/readme/pipeline.svg" width="100%"
-       alt="Key down writes audio.wav to disk immediately; key up sends it to gemini-3.5-transcribe; a validation gate catches a model that answered instead of transcribing; insertion tries typing into a confirmed text field, then a guarded paste, then leaves it on the clipboard. Every outcome lands in History.">
-</p>
-
-The gate exists because a cleanup model sometimes *answers* your dictation instead of transcribing
-it. When that happens Jot inserts the raw transcript rather than the model's opinion.
-
-## Settings
-
-<p align="center">
-  <img src="./assets/readme/settings.png" width="560"
-       alt="The Settings window: the dictation key picker, the microphone picker, and switches for the resting indicator, start with Windows, sounds and double-tap lock, above the formatting options.">
-</p>
-
-Pick the key, pick the microphone — a device you choose is never silently swapped for another — and
-decide whether Jot starts with Windows. Recordings are kept for 7 days by default, or never, or
-forever; transcripts stay until you delete them.
-
-<details>
-<summary><b>Ported, not translated</b> — the seven places Windows forced a different answer</summary>
-
-<br>
-
-| macOS | Windows | Why |
-| --- | --- | --- |
-| `fn` key | Right Ctrl | `fn` never reaches a Windows keyboard hook. |
-| Hover-to-dictate dot, in-pill Stop | Informational pill; stop from the key or the tray | The pill is click-through and never activates. The alternative eats clicks across the bottom of every screen, or steals focus from the app the text is about to land in. |
-| Liquid Glass pill | Solid elevated surface | Mica is an app-window material; it would tint the whole transparent rect. Nothing here pretends to be glass. |
-| Accessibility API insertion | Typing into a UIA-confirmed control | Windows has no non-destructive insert-at-selection call — `SetValue` replaces a control's entire contents. |
-| CAF + FLAC upload | WAV upload | One fewer encode on the latency path. |
-| Keychain | Credential Manager | Same role, same guarantee. |
-| Secure Input | UIA `IsPassword` + the secure desktop | Same rule: never record over, never paste into, a password field. |
-
-</details>
-
-<details>
-<summary><b>What it cannot do yet</b> — stated rather than hidden</summary>
-
-<br>
-
-- The text fields support IME composition, so Chinese, Japanese, Korean and Vietnamese input compose
-  and commit correctly, and they undo, redo and take a caret from a click — but they are not a full
-  editor. No word-wise motion, no double-click to select a word, and the IME candidate window sits
-  against the field rather than the caret.
-- Clipboard text, HTML, RTF, file drops and images all survive a paste. GDI metafiles and palettes do
-  not; they are handle-backed and cannot be copied byte-for-byte.
-- There is no self-updater. About checks GitHub for a newer release when you open it and offers the
-  download page; unzipping over the old folder is still your job.
-
-</details>
-
-<details>
-<summary><b>Inside the code</b> — what lives where</summary>
-
-<br>
-
-```text
-crates/jot-core/    the engine, headless and testable
-  hotkey.rs           the low-level-hook key set and the pure hold/lock/cancel grammar
-  audio.rs            crash-safe WASAPI capture, device changes, resampling
-  gemini.rs           the API client: auth, deadlines, status mapping
-  transcription.rs    the pipeline, retries, the vocabulary fail-open
-  validation.rs       the "never insert garbage" gate
-  insertion.rs        the type → paste → clipboard ladder
-  history.rs          the SQLite index and retention
-  recovery.rs         the offline queue and launch-time crash recovery
-  coordinator.rs      the brain
-  win32.rs            foreground app, focus kind, clipboard, synthetic input
-crates/jot/         the GPUI app
-  pill.rs             the HUD and its waveform
-  text_field.rs       the single-line field, including IME composition
-  window_shell.rs     overlay flags, DPI-correct placement, Windows 11 chrome
-  autostart.rs        the per-user Run key
-```
-
-`jot-core` has no UI dependency, which is why the paths that can lose your words — the state machine,
-the hotkey grammar, silence classification, the retry queue, crash recovery — are all exercised
-without launching the app.
-
-</details>
-
-## Build it yourself
-
-Requires Windows 10 or 11 and the toolchain pinned in `rust-toolchain.toml`.
+## Installation depuis les sources
 
 ```powershell
-git clone https://github.com/ubranch/jot-gemini-transcribe-Windows
+git clone https://github.com/tadikwa/jot-gemini-transcribe-Windows
 cd jot-gemini-transcribe-Windows
-cargo run -p jot            # run it straight from source
-
-cargo test                  # 204 tests, headless
-cargo clippy --all-targets  # clean
-./scripts/package.ps1       # release build, staged folder and zip
+cargo build --release -p jot --locked
+.\target\release\jot.exe
 ```
 
-`package.ps1` runs the format, lint and test gates before it builds, and warns loudly when it
-produces an unsigned binary — pass `-CertificateThumbprint` to sign. Jot is portable: no installer,
-data in `%LOCALAPPDATA%\Jot`, and it adds itself to startup only when you turn that on.
+Jot fonctionne alors en mode portable : pas d’installeur, données dans `%LOCALAPPDATA%\Jot`.
+Le binaire n’est pas signé : Windows SmartScreen peut afficher un avertissement.
 
-Logging is lifecycle only — transcript text never appears in it — and rolls daily into
-`%LOCALAPPDATA%\Jot\logs`:
+Au premier lancement, un assistant vous guide jusqu’à la saisie de votre clé Gemini. Le bouton
+**Obtenir une clé API Gemini** (dans l’assistant et dans *Paramètres → Confidentialité et
+conservation*) ouvre la page de Google AI Studio.
+
+<p align="center">
+  <img src="./assets/readme/parametres.png" width="760"
+       alt="Paramètres, onglet Dictée et raccourcis : choix entre Maintenir pour parler et Appuyer pour démarrer / arrêter, choix de la touche de dictée (Ctrl droit sélectionné), enregistrement d’un raccourci personnalisé.">
+</p>
+
+## Confidentialité
+
+Ce qui suit décrit le comportement du code de ce dépôt ; vérifiez-le si c’est important pour vous.
+
+- **Pendant une dictée Gemini**, Jot envoie à l’API Gemini de Google, avec **votre** clé :
+  l’enregistrement audio (WAV) et les termes de votre dictionnaire (2 Ko au plus) pour améliorer leur
+  reconnaissance. Si vous activez la passe de reformulation optionnelle, le texte transcrit est aussi
+  envoyé. Le traitement de ces données relève des conditions de Google.
+- **Aucun serveur intermédiaire**, aucun compte Jot, aucune télémétrie, aucun enregistrement des
+  frappes clavier.
+- **La seule autre connexion** est la vérification de version, faite uniquement quand vous ouvrez la
+  fenêtre *À propos* : elle demande à GitHub la dernière version publiée de ce dépôt.
+- Sur votre PC : l’audio est conservé 7 jours par défaut (durée réglable), les transcriptions jusqu’à
+  ce que vous les supprimiez, le tout dans `%LOCALAPPDATA%\Jot`. Les journaux ne contiennent jamais
+  le texte dicté.
+- Le dictionnaire intelligent analyse vos corrections **localement**, sans appel réseau.
+
+## Démarrage automatique
+
+*Paramètres → Général → Lancer au démarrage de Windows* ajoute une entrée pour votre seul compte
+utilisateur (clé `Run` de `HKEY_CURRENT_USER`, sans droits administrateur), visible et désactivable
+dans le Gestionnaire des tâches → Démarrage. Une copie de test portable (fichier `jot-test-profile`
+à côté de `jot.exe`) ne modifie jamais ce réglage.
+
+## Limites connues
+
+- Pas encore de version publiée ni d’installeur ; binaire non signé.
+- La qualité de transcription dépend du modèle Gemini et de votre micro ; relisez avant d’envoyer.
+- Le temps économisé est une **estimation** fondée sur une vitesse de frappe de référence.
+- Les raccourcis internes aux autres applications ne sont pas tous détectables ; choisissez une
+  combinaison peu utilisée.
+- Windows n’a pas de touche `fn` accessible aux applications : la touche par défaut est Ctrl droit.
+
+## Développement
 
 ```powershell
+cargo fmt --all --check
+cargo clippy --workspace --all-targets --locked -- -D warnings
+cargo test --workspace --locked
 $env:JOT_LOG = "jot=debug,jot_core=debug"; cargo run -p jot
 ```
 
-## License
+- `crates/jot-core/` : moteur sans interface (raccourcis, capture audio, client Gemini, validation,
+  insertion, historique, dictionnaire, statistiques), testable sans lancer l’application.
+- `crates/jot/` : application GPUI (pastille, fenêtres, paramètres, icône de notification).
+- `docs/` : notes de conception et rapports de validation des versions successives.
 
-Apache 2.0 — see [LICENSE](LICENSE). A Windows port of
-[Jot](https://github.com/google-gemini/jot-gemini-transcribe-macOS) by Ammaar Reshi, rewritten in
-Rust on [GPUI](https://www.gpui.rs). Not an officially supported Google product. Bundled fonts
-(Google Sans Flex, Google Sans Code) are SIL OFL 1.1 and the earcons are original works under the
-same Apache 2.0 licence — details in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+## Licence et crédits
+
+Apache 2.0 — voir [LICENSE](LICENSE) et [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)
+(polices Google Sans Flex et Google Sans Code sous SIL OFL 1.1).
+
+- Application d’origine : [Jot pour macOS](https://github.com/google-gemini/jot-gemini-transcribe-macOS),
+  par Ammaar Reshi.
+- Portage Windows en Rust/GPUI : [ubranch/jot-gemini-transcribe-Windows](https://github.com/ubranch/jot-gemini-transcribe-Windows).
+- Ce fork ajoute notamment l’interface française, le mode Toggle, l’historique avancé, le tableau de
+  bord, le dictionnaire intelligent et les raccourcis personnalisables.
+
+Jot n’est pas un produit officiellement pris en charge par Google. « Google » et « Gemini » sont des
+marques de Google LLC.

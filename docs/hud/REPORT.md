@@ -57,7 +57,7 @@ Le dernier exécutable portable validé a pour SHA-256 :
 
 Preuves locales (hors Git et hors portable, sans capture du bureau personnel) :
 
-`E:\05 - IA\01 - GITHUB\JOT\test-build\codex-hud-evidence`
+`<checkout>\test-build\codex-hud-evidence`
 
 - `baseline/result.json` : reproduction sur la base originale.
 - `packaged-runner/` et `packaged-hidden-runner/` : contrôleurs, empreinte exacte du livrable, résultats, captures et confirmation d’arrêt.
