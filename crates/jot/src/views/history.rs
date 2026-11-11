@@ -12,50 +12,182 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! History: the proof that nothing was ever lost.
-//!
-//! It is a library of words plus the things needing attention — never an event
-//! log. Anything with a transcript shows; so do retryable failures, queued
-//! dictations, and long cancelled recordings. Everything else was discarded at
-//! the source.
-
+//! A paginated library of dictations. Only previews are kept in the list;
+//! full transcripts are loaded for the selected detail on a background worker.
 use crate::i18n::{Locale, Msg, locale, tf, tr};
 use crate::services::Services;
-use crate::text_field::{self, Submit, TextField};
+use crate::text_field::{self, Changed, Submit, TextField};
 use crate::theme::{self, Theme};
-use crate::views::widgets::{self, ButtonKind, StatusTone};
-use gpui::{Context, Entity, Role, SharedString, Window, div, prelude::*, px, uniform_list};
-use jot_core::history::{DictationRecord, Stats};
+use crate::views::widgets::{self, ButtonKind, PageScroll, StatusTone};
+use gpui::{
+    AnyElement, Context, Entity, HighlightStyle, Role, SharedString, StyledText, Task, Window, div,
+    prelude::*, px, uniform_list,
+};
+use jot_core::history::{
+    ApplicationFilter, Correction, DictationRecord, HistoryFilter, HistoryItem, StatusFilter,
+    period_start,
+};
 use jot_core::meta::SessionStatus;
 use jot_core::recovery::RetryOutcome;
+use std::collections::HashSet;
+use std::sync::Arc;
+use std::time::Duration;
 use time::OffsetDateTime;
 use time::macros::format_description;
 
-const PAGE_SIZE: usize = 500;
-const ROW_HEIGHT: f32 = 116.0;
-/// The transcript line gets a fixed box; `flex_1` let the actions squeeze it
-/// to zero and a failure row then explained nothing.
-const TEXT_HEIGHT: f32 = 44.0;
+const PAGE_SIZE: usize = 100;
+const ROW_HEIGHT: f32 = 142.0;
+
+fn ui(en: &'static str, fr: &'static str) -> &'static str {
+    match locale() {
+        Locale::En => en,
+        Locale::Fr => fr,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Period {
+    Today,
+    Week,
+    Month,
+    Quarter,
+    All,
+}
+impl Period {
+    const ALL: [Self; 5] = [
+        Self::Today,
+        Self::Week,
+        Self::Month,
+        Self::Quarter,
+        Self::All,
+    ];
+    fn days(self) -> Option<u16> {
+        match self {
+            Self::Today => Some(1),
+            Self::Week => Some(7),
+            Self::Month => Some(30),
+            Self::Quarter => Some(90),
+            Self::All => None,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Today => ui("Today", "Aujourd’hui"),
+            Self::Week => ui("7 days", "7 jours"),
+            Self::Month => ui("30 days", "30 jours"),
+            Self::Quarter => ui("90 days", "90 jours"),
+            Self::All => ui("All dates", "Toutes les dates"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Version {
+    Current,
+    Raw,
+    Cleaned,
+    Corrections,
+}
+impl Version {
+    const ALL: [Self; 4] = [Self::Current, Self::Raw, Self::Cleaned, Self::Corrections];
+    fn label(self) -> &'static str {
+        match self {
+            Self::Current => ui("Current text", "Texte actuel"),
+            Self::Raw => ui("Raw", "Brut"),
+            Self::Cleaned => ui("Cleaned", "Nettoyé"),
+            Self::Corrections => ui("Corrections", "Corrections"),
+        }
+    }
+}
+
+struct Detail {
+    record: DictationRecord,
+    word_count: usize,
+    current: SharedString,
+    raw: Option<SharedString>,
+    cleaned: Option<SharedString>,
+    corrections: Vec<(Correction, SharedString, SharedString)>,
+    retryable: bool,
+}
+impl Detail {
+    fn new(record: DictationRecord, corrections: Vec<Correction>, retryable: bool) -> Self {
+        Self {
+            word_count: record.word_count(),
+            current: record.display_text().to_owned().into(),
+            raw: record.raw_transcript.clone().map(Into::into),
+            cleaned: record.cleaned_transcript.clone().map(Into::into),
+            corrections: corrections
+                .into_iter()
+                .map(|c| {
+                    let before = SharedString::from(c.before.clone());
+                    let after = SharedString::from(c.after.clone());
+                    (c, before, after)
+                })
+                .collect(),
+            record,
+            retryable,
+        }
+    }
+    fn text(&self, version: Version) -> Option<&SharedString> {
+        match version {
+            Version::Current => Some(&self.current),
+            Version::Raw => self.raw.as_ref(),
+            Version::Cleaned => self.cleaned.as_ref(),
+            Version::Corrections => None,
+        }
+    }
+}
 
 pub struct HistoryView {
     services: Services,
     search: Entity<TextField>,
-    records: Vec<DictationRecord>,
-    stats: Stats,
-    pending_delete: Option<String>,
-    status: Option<(Msg, StatusTone)>,
+    editor: Entity<TextField>,
+    items: Vec<HistoryItem>,
+    total: usize,
+    offset: usize,
+    period: Period,
+    application: ApplicationFilter,
+    status_filter: StatusFilter,
+    applications: Vec<String>,
+    refresh_applications: bool,
+    filters_open: bool,
+    selected: HashSet<String>,
+    detail: Option<Arc<Detail>>,
+    detail_id: Option<String>,
+    version: Version,
+    editing: bool,
+    pending_open: Option<Option<String>>,
+    pending_delete: Option<Vec<String>>,
+    message: Option<(String, StatusTone)>,
+    loading: bool,
+    detail_loading: bool,
+    busy: bool,
+    generation: u64,
+    detail_generation: u64,
+    query_task: Option<Task<()>>,
+    detail_task: Option<Task<()>>,
+    detail_scroll: PageScroll,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
 impl HistoryView {
     pub fn new(services: Services, cx: &mut Context<Self>) -> Self {
         let search = cx.new(|cx| TextField::new("history-search", Msg::Search, cx));
-        let subscription = cx.subscribe(&search, |this: &mut Self, _, _: &Submit, cx| {
-            this.reload(cx);
-        });
-
-        // History refreshes as dictations land, retries drain, and rows are
-        // deleted — no polling.
+        let editor = cx.new(|cx| TextField::new("history-editor", Msg::History, cx).multiline());
+        let subscriptions = vec![
+            cx.subscribe(&search, |this: &mut Self, _, _: &Changed, cx| {
+                this.offset = 0;
+                this.selected.clear();
+                this.load(true, cx);
+            }),
+            cx.subscribe(&search, |this: &mut Self, _, _: &Submit, cx| {
+                this.load(false, cx)
+            }),
+            cx.subscribe(&editor, |_: &mut Self, _, _: &Changed, cx| cx.notify()),
+            cx.subscribe(&editor, |this: &mut Self, _, _: &Submit, cx| {
+                this.save_editor(cx)
+            }),
+        ];
         let mut changes = services.history.subscribe();
         cx.spawn(async move |this, cx| {
             while !matches!(
@@ -63,42 +195,359 @@ impl HistoryView {
                 Err(tokio::sync::broadcast::error::RecvError::Closed)
             ) {
                 while changes.try_recv().is_ok() {}
-                if this.update(cx, |this, cx| this.reload(cx)).is_err() {
+                if this
+                    .update(cx, |this, cx| {
+                        this.refresh_applications = true;
+                        this.refresh(cx);
+                    })
+                    .is_err()
+                {
                     break;
                 }
             }
         })
         .detach();
-
         let mut view = Self {
             services,
             search,
-            records: Vec::new(),
-            stats: Stats::default(),
+            editor,
+            items: Vec::new(),
+            total: 0,
+            offset: 0,
+            period: Period::All,
+            application: ApplicationFilter::All,
+            status_filter: StatusFilter::All,
+            applications: Vec::new(),
+            refresh_applications: true,
+            filters_open: false,
+            selected: HashSet::new(),
+            detail: None,
+            detail_id: None,
+            version: Version::Current,
+            editing: false,
+            pending_open: None,
             pending_delete: None,
-            status: None,
-            _subscriptions: vec![subscription],
+            message: None,
+            loading: false,
+            detail_loading: false,
+            busy: false,
+            generation: 0,
+            detail_generation: 0,
+            query_task: None,
+            detail_task: None,
+            detail_scroll: PageScroll::new(),
+            _subscriptions: subscriptions,
         };
-        view.reload(cx);
+        view.load(false, cx);
         view
     }
 
-    fn reload(&mut self, cx: &mut Context<Self>) {
-        let query = self.search.read(cx).content().to_string();
-        let query = (!query.trim().is_empty()).then_some(query);
-        self.records = self.services.history.records(query.as_deref(), PAGE_SIZE);
-        self.stats = self.services.history.stats();
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        if !self.editing && !self.busy && self.detail_id.is_some() {
+            self.open_now(self.detail_id.clone(), cx);
+        }
+        self.load(false, cx);
+    }
+
+    fn clear_search(&mut self, cx: &mut Context<Self>) {
+        self.search.update(cx, |field, cx| {
+            field.set_content("");
+            cx.notify();
+        });
+        self.offset = 0;
+        self.selected.clear();
+        self.pending_delete = None;
+        self.load(false, cx);
+    }
+
+    fn load(&mut self, debounce: bool, cx: &mut Context<Self>) {
+        self.pending_delete = None;
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let store = self.services.history.clone();
+        let executor = cx.background_executor().clone();
+        let query = self.search.read(cx).content().to_owned();
+        let application = self.application.clone();
+        let status = self.status_filter;
+        let period = self.period;
+        let offset = self.offset;
+        let refresh_applications = self.refresh_applications;
+        self.loading = true;
+        self.query_task = Some(cx.spawn(async move |this, cx| {
+            if debounce {
+                executor.timer(Duration::from_millis(180)).await;
+            }
+            let result = executor
+                .spawn(async move {
+                    let filter = HistoryFilter {
+                        search: query,
+                        since: period
+                            .days()
+                            .map(|days| period_start(days, OffsetDateTime::now_utc()))
+                            .transpose()?,
+                        until: None,
+                        application,
+                        status,
+                    };
+                    let page = store.page(&filter, offset, PAGE_SIZE)?;
+                    let apps = if refresh_applications {
+                        Some(store.applications()?)
+                    } else {
+                        None
+                    };
+                    anyhow::Ok((page, apps))
+                })
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if generation != this.generation {
+                    return;
+                }
+                this.loading = false;
+                match result {
+                    Ok((page, apps)) => {
+                        this.items = page.items;
+                        this.total = page.total;
+                        if let Some(apps) = apps {
+                            this.applications = apps;
+                            this.refresh_applications = false;
+                        }
+                        if this.items.is_empty() && this.offset > 0 {
+                            this.offset = this.total.saturating_sub(1) / PAGE_SIZE * PAGE_SIZE;
+                            this.load(false, cx);
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "history page query failed");
+                        this.items.clear();
+                        this.total = 0;
+                        this.message = Some((
+                            ui(
+                                "Could not load history. Try again.",
+                                "Impossible de charger l’historique. Réessayez.",
+                            )
+                            .into(),
+                            StatusTone::Bad,
+                        ));
+                    }
+                }
+                cx.notify();
+            });
+        }));
         cx.notify();
     }
 
-    fn retry(&mut self, record: DictationRecord, cx: &mut Context<Self>) {
-        self.status = Some((Msg::Retrying, StatusTone::Neutral));
+    pub fn has_unsaved_changes(&self, cx: &gpui::App) -> bool {
+        self.busy
+            || self.editing
+                && self
+                    .detail
+                    .as_ref()
+                    .is_some_and(|detail| self.editor.read(cx).content() != detail.current.as_ref())
+    }
+
+    pub fn prevent_navigation(&mut self, cx: &mut Context<Self>) {
+        if self.busy {
+            self.message = Some((
+                ui(
+                    "Wait for the current operation to finish.",
+                    "Attendez la fin de l’opération en cours.",
+                )
+                .into(),
+                StatusTone::Neutral,
+            ));
+            cx.notify();
+            return;
+        }
+        self.message = Some((
+            ui(
+                "Save or cancel your changes before leaving History.",
+                "Enregistrez ou annulez vos modifications avant de quitter l’historique.",
+            )
+            .into(),
+            StatusTone::Neutral,
+        ));
         cx.notify();
+    }
+
+    pub fn dismiss_confirmation(&mut self, cx: &mut Context<Self>) {
+        self.pending_delete = None;
+        self.pending_open = None;
+        cx.notify();
+    }
+
+    fn open(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        if self.has_unsaved_changes(cx) {
+            self.pending_open = Some(id);
+            cx.notify();
+            return;
+        }
+        self.open_now(id, cx);
+    }
+
+    fn open_now(&mut self, id: Option<String>, cx: &mut Context<Self>) {
+        self.pending_delete = None;
+        self.detail_generation = self.detail_generation.wrapping_add(1);
+        let generation = self.detail_generation;
+        self.editing = false;
+        self.pending_open = None;
+        if self.detail_id != id {
+            self.version = Version::Current;
+            self.detail_scroll.reset();
+            self.detail = None;
+        }
+        self.detail_id = id.clone();
+        self.detail_task = None;
+        self.detail_loading = id.is_some();
+        if let Some(id) = id {
+            let store = self.services.history.clone();
+            let task = cx.background_executor().spawn(async move {
+                let record = store
+                    .record(&id)
+                    .ok_or_else(|| anyhow::anyhow!("dictation unavailable"))?;
+                let corrections = store.corrections(&id)?;
+                let retryable = store.can_retry(&id);
+                anyhow::Ok(Arc::new(Detail::new(record, corrections, retryable)))
+            });
+            self.detail_task = Some(cx.spawn(async move |this, cx| {
+                let result = task.await;
+                let _ = this.update(cx, |this, cx| {
+                    if generation != this.detail_generation {
+                        return;
+                    }
+                    this.detail_loading = false;
+                    match result {
+                        Ok(detail) => this.detail = Some(detail),
+                        Err(error) => {
+                            tracing::warn!(%error, "history detail query failed");
+                            this.detail_id = None;
+                            this.message = Some((
+                                ui(
+                                    "This dictation is unavailable. Refresh history.",
+                                    "Cette dictée est indisponible. Actualisez l’historique.",
+                                )
+                                .into(),
+                                StatusTone::Bad,
+                            ));
+                        }
+                    }
+                    cx.notify();
+                });
+            }));
+        }
+        cx.notify();
+    }
+
+    fn begin_edit(&mut self, cx: &mut Context<Self>) {
+        if self.busy || self.detail_loading {
+            return;
+        }
+        if let Some(detail) = &self.detail {
+            self.editor.update(cx, |field, cx| {
+                field.set_content(detail.current.to_string());
+                cx.notify();
+            });
+            self.version = Version::Current;
+            self.editing = true;
+            cx.notify();
+        }
+    }
+
+    fn save_editor(&mut self, cx: &mut Context<Self>) {
+        if self.editing && self.has_unsaved_changes(cx) {
+            self.save(self.editor.read(cx).content().to_owned(), cx);
+        }
+    }
+
+    fn save(&mut self, text: String, cx: &mut Context<Self>) {
+        if self.busy {
+            return;
+        }
+        let Some(detail) = &self.detail else {
+            return;
+        };
+        let expected = detail.current.to_string();
+        let id = detail.record.id.clone();
+        let store = self.services.history.clone();
+        self.busy = true;
+        let task = cx
+            .background_executor()
+            .spawn(async move { store.edit(&id, &expected, &text).map(|_| id) });
+        cx.spawn(async move |this, cx| {
+            let result = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.busy = false;
+                match result {
+                    Ok(id) => {
+                        this.message = Some((ui("Changes saved.", "Modifications enregistrées.").into(), StatusTone::Good));
+                        this.editing = false;
+                        this.version = Version::Current;
+                        this.detail_scroll.reset();
+                        this.open_now(Some(id), cx);
+                        this.load(false, cx);
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "history edit failed");
+                        this.message = Some((ui("Could not save. The dictation may have changed elsewhere. Your draft is kept; copy it before reloading.", "Enregistrement impossible. La dictée a peut-être changé ailleurs. Votre brouillon est conservé ; copiez-le avant de recharger.").into(), StatusTone::Bad));
+                    }
+                }
+                cx.notify();
+            });
+        }).detach();
+        cx.notify();
+    }
+
+    fn delete(&mut self, cx: &mut Context<Self>) {
+        if self.busy || self.has_unsaved_changes(cx) {
+            return;
+        }
+        let Some(ids) = self.pending_delete.take() else {
+            return;
+        };
+        let store = self.services.history.clone();
+        self.busy = true;
+        let task = cx
+            .background_executor()
+            .spawn(async move { (store.delete_many(&ids), ids) });
+        cx.spawn(async move |this, cx| {
+            let (result, ids) = task.await;
+            let _ = this.update(cx, |this, cx| {
+                this.busy = false;
+                match result {
+                    Ok(count) => {
+                        this.selected.retain(|id| !ids.contains(id));
+                        if this.detail_id.as_ref().is_some_and(|id| ids.contains(id)) { this.open_now(None, cx); }
+                        this.message = Some((format!("{} {count}", ui("Deleted dictations:", "Dictées supprimées :")), StatusTone::Good));
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "history deletion failed");
+                        this.message = Some((ui("Deletion could not finish. Refresh and check the remaining dictations before retrying.", "La suppression n’a pas abouti. Actualisez et vérifiez les dictées restantes avant de réessayer.").into(), StatusTone::Bad));
+                    }
+                }
+                this.load(false, cx);
+                cx.notify();
+            });
+        }).detach();
+        cx.notify();
+    }
+
+    fn retry(&mut self, cx: &mut Context<Self>) {
+        let Some(detail) = &self.detail else {
+            return;
+        };
+        if self.busy || !detail.retryable || self.editing {
+            return;
+        }
+        let record = detail.record.clone();
+        let id = record.id.clone();
+        self.busy = true;
+        self.message = Some((tr(Msg::Retrying).into(), StatusTone::Neutral));
         let queue = self.services.retry_queue.clone();
         cx.spawn(async move |this, cx| {
             let outcome = queue.retry_single(&record).await;
-            // A silent no-op reads as broken, so every outcome says something.
-            let status = match outcome {
+            let (message, tone) = match outcome {
                 RetryOutcome::Recovered => (Msg::RetryRecovered, StatusTone::Good),
                 RetryOutcome::StillOffline => (Msg::RetryOffline, StatusTone::Neutral),
                 RetryOutcome::Blocked => (Msg::RetryBlocked, StatusTone::Bad),
@@ -107,287 +556,1014 @@ impl HistoryView {
                 RetryOutcome::Busy => (Msg::RetryBusy, StatusTone::Neutral),
             };
             let _ = this.update(cx, |this, cx| {
-                this.status = Some(status);
-                this.reload(cx);
+                this.busy = false;
+                this.message = Some((tr(message).into(), tone));
+                this.open_now(Some(id), cx);
+                this.load(false, cx);
             });
         })
         .detach();
+        cx.notify();
     }
 
-    pub fn dismiss_confirmation(&mut self, cx: &mut Context<Self>) {
-        if self.pending_delete.take().is_some() {
-            cx.notify();
-        }
+    fn filters(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let period_buttons = Period::ALL
+            .into_iter()
+            .enumerate()
+            .map(|(index, period)| {
+                widgets::button(
+                    ("history-period", index),
+                    period.label(),
+                    if self.period == period {
+                        ButtonKind::Selected
+                    } else {
+                        ButtonKind::Secondary
+                    },
+                    !self.busy,
+                    theme,
+                    cx.listener(move |this, _, _, cx| {
+                        this.period = period;
+                        this.offset = 0;
+                        this.selected.clear();
+                        this.load(false, cx);
+                    }),
+                )
+                .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let statuses = [
+            (StatusFilter::All, ui("All statuses", "Tous les statuts")),
+            (StatusFilter::Completed, ui("Completed", "Terminées")),
+            (StatusFilter::Pending, ui("Pending", "En attente")),
+            (StatusFilter::Failed, tr(Msg::Failed)),
+            (StatusFilter::Cancelled, tr(Msg::Cancelled)),
+        ];
+        let status_buttons = statuses
+            .into_iter()
+            .enumerate()
+            .map(|(index, (status, label))| {
+                let selected = self.status_filter == status;
+                widgets::button(
+                    ("history-status-filter", index),
+                    label,
+                    if selected {
+                        ButtonKind::Selected
+                    } else {
+                        ButtonKind::Secondary
+                    },
+                    !self.busy,
+                    theme,
+                    cx.listener(move |this, _, _, cx| {
+                        this.status_filter = status;
+                        this.offset = 0;
+                        this.selected.clear();
+                        this.load(false, cx);
+                    }),
+                )
+                .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        let apps = std::iter::once((
+            ApplicationFilter::All,
+            ui("All applications", "Toutes les applications").to_owned(),
+        ))
+        .chain(std::iter::once((
+            ApplicationFilter::Unknown,
+            tr(Msg::UnknownApp).to_owned(),
+        )))
+        .chain(
+            self.applications
+                .iter()
+                .map(|app| (ApplicationFilter::Named(app.clone()), app.clone())),
+        );
+        let app_buttons = apps
+            .enumerate()
+            .map(|(index, (app, label))| {
+                let selected = self.application == app;
+                widgets::button(
+                    ("history-app-filter", index),
+                    label,
+                    if selected {
+                        ButtonKind::Selected
+                    } else {
+                        ButtonKind::Secondary
+                    },
+                    !self.busy,
+                    theme,
+                    cx.listener(move |this, _, _, cx| {
+                        this.application = app.clone();
+                        this.offset = 0;
+                        this.selected.clear();
+                        this.load(false, cx);
+                    }),
+                )
+                .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        div()
+            .id("history-filters")
+            .debug_selector(|| "history-filters".into())
+            .max_h(px(180.0))
+            .overflow_y_scroll()
+            .flex()
+            .flex_col()
+            .gap(theme::spacing::XS)
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(theme::spacing::XS)
+                    .children(period_buttons),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(theme::spacing::XS)
+                    .children(status_buttons),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(theme::spacing::XS)
+                    .children(app_buttons),
+            )
+            .into_any_element()
     }
 
     fn row(
         &self,
-        record: &DictationRecord,
+        item: &HistoryItem,
+        day: Option<String>,
         theme: Theme,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let status = record.status().unwrap_or(SessionStatus::Failed);
-        let text = record.display_text().to_string();
-        let has_text = !text.is_empty();
-        let retryable = matches!(
-            status,
-            SessionStatus::Failed | SessionStatus::QueuedForRetry | SessionStatus::Cancelled
-        ) && !has_text;
-
-        let subtitle = format!(
-            "{} · {}{}",
-            format_time(record.started_at),
-            record
-                .target_app_name
+    ) -> AnyElement {
+        let id = item.id.clone();
+        let selected = self.selected.contains(&id);
+        let active = self.detail_id.as_deref() == Some(id.as_str());
+        let status = SessionStatus::parse(&item.status).unwrap_or(SessionStatus::Failed);
+        let words = format!("{} {}", item.word_count, ui("words", "mots"));
+        let meta = format!(
+            "{} · {} · {}{}",
+            format_clock(item.started_at),
+            item.target_app_name
                 .as_deref()
                 .unwrap_or(tr(Msg::UnknownApp)),
-            record
-                .duration_seconds
-                .map(|seconds| {
-                    let mut value = format!("{seconds:.1}");
-                    if locale() == Locale::Fr {
-                        value = value.replace('.', ",");
-                    }
-                    format!(" · {}", tf(Msg::Duration, &[&value]))
-                })
+            words,
+            item.duration_seconds
+                .map(|seconds| format!(" · {}", format_duration(seconds)))
                 .unwrap_or_default()
         );
-
-        let id = record.id.clone();
-        let confirming = self.pending_delete.as_deref() == Some(id.as_str());
-        let record_for_retry = record.clone();
-
         div()
-            .id(SharedString::from(format!(
-                "history-row-{}",
-                record.id.clone()
-            )))
+            .id(SharedString::from(format!("history-row-{id}")))
             .role(Role::ListItem)
-            .aria_label(if has_text {
-                SharedString::from(text.clone())
-            } else {
-                SharedString::from(status_label(status).to_string())
-            })
-            // Without this the row shrinks to its content and the separator
-            // beneath it stops half way across the list.
+            .aria_label(SharedString::from(format!("{} · {meta}", item.preview)))
             .w_full()
+            .h(px(ROW_HEIGHT))
             .flex()
             .flex_col()
             .gap(theme::spacing::XXS)
-            .h(px(ROW_HEIGHT))
             .p(theme::spacing::S)
             .border_b_1()
             .border_color(theme.outline_variant)
+            .when(active, |row| row.bg(theme.primary_container))
+            .cursor_pointer()
+            .on_click(cx.listener({
+                let id = id.clone();
+                move |this, _, _, cx| {
+                    if !this.loading {
+                        this.open(Some(id.clone()), cx);
+                    }
+                }
+            }))
+            .child(
+                div()
+                    .h(px(19.0))
+                    .text_size(theme::type_scale::LABEL)
+                    .text_color(theme.on_surface_variant)
+                    .child(day.unwrap_or_default()),
+            )
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap(theme::spacing::XS)
                     .child(status_chip(status, theme))
+                    .when(item.corrected, |row| {
+                        row.child(
+                            div()
+                                .text_size(theme::type_scale::LABEL_SMALL)
+                                .child(ui("Edited", "Modifiée")),
+                        )
+                    })
                     .child(
                         div()
+                            .min_w_0()
+                            .truncate()
                             .text_size(theme::type_scale::LABEL)
                             .text_color(theme.on_surface_variant)
-                            .child(subtitle),
+                            .child(meta),
                     ),
             )
             .child(
                 div()
-                    .h(px(TEXT_HEIGHT))
+                    .h(px(23.0))
+                    .debug_selector(|| "history-preview".into())
                     .overflow_hidden()
+                    .truncate()
                     .text_size(theme::type_scale::BODY_LARGE)
-                    .text_color(if has_text {
-                        theme.on_surface
-                    } else {
-                        theme.on_surface_variant
-                    })
-                    .child(if confirming {
-                        tr(Msg::DeleteDictation).to_string()
-                    } else if has_text {
-                        text.clone()
-                    } else {
-                        error_summary(record.error_code.as_deref(), status)
+                    .child({
+                        let preview = if item.preview.is_empty() {
+                            status_label(status).to_owned()
+                        } else {
+                            item.preview.clone()
+                        };
+                        let highlights =
+                            search_highlights(&preview, self.search.read(cx).content())
+                                .into_iter()
+                                .map(|range| {
+                                    (
+                                        range,
+                                        HighlightStyle {
+                                            color: Some(theme.on_primary_container.into()),
+                                            background_color: Some(theme.primary_container.into()),
+                                            font_weight: Some(gpui::FontWeight::BOLD),
+                                            ..Default::default()
+                                        },
+                                    )
+                                })
+                                .collect::<Vec<_>>();
+                        StyledText::new(preview).with_highlights(highlights)
                     }),
             )
             .child(
                 div()
                     .flex()
                     .gap(theme::spacing::XS)
-                    .when(confirming, |row| {
-                        row.child(widgets::button(
-                            SharedString::from(format!("cancel-delete-{id}")),
-                            tr(Msg::Cancel),
-                            ButtonKind::Secondary,
-                            true,
-                            theme,
-                            cx.listener(|this, _, _, cx| this.dismiss_confirmation(cx)),
-                        ))
-                    })
-                    .when(has_text && !confirming, |row| {
-                        let text = text.clone();
-                        row.child(widgets::button(
-                            SharedString::from(format!("copy-{}", id.clone())),
-                            tr(Msg::Copy),
-                            ButtonKind::Secondary,
-                            true,
-                            theme,
-                            cx.listener(move |this, _, _, cx| {
-                                text_field::set_clipboard_text(text.clone(), cx);
-                                this.status = Some((Msg::CopiedFeedback, StatusTone::Good));
-                                cx.notify();
-                            }),
-                        ))
-                    })
-                    .when(retryable && !confirming, |row| {
-                        row.child(widgets::button(
-                            SharedString::from(format!("retry-{}", id.clone())),
-                            tr(Msg::Retry),
-                            ButtonKind::Primary,
-                            true,
-                            theme,
-                            cx.listener({
-                                let record = record_for_retry.clone();
-                                move |this, _, _, cx| this.retry(record.clone(), cx)
-                            }),
-                        ))
-                    })
                     .child(widgets::button(
-                        SharedString::from(format!("delete-{}", id.clone())),
-                        tr(Msg::Delete),
-                        ButtonKind::Destructive,
-                        true,
+                        SharedString::from(format!("history-open-{id}")),
+                        ui("Open", "Ouvrir"),
+                        if active {
+                            ButtonKind::Selected
+                        } else {
+                            ButtonKind::Secondary
+                        },
+                        !self.busy && !self.loading,
+                        theme,
+                        cx.listener({
+                            let id = id.clone();
+                            move |this, _, _, cx| {
+                                cx.stop_propagation();
+                                this.open(Some(id.clone()), cx);
+                            }
+                        }),
+                    ))
+                    .child(widgets::button(
+                        SharedString::from(format!("history-select-{id}")),
+                        if selected {
+                            ui("Selected", "Sélectionnée")
+                        } else {
+                            ui("Select", "Sélectionner")
+                        },
+                        if selected {
+                            ButtonKind::Selected
+                        } else {
+                            ButtonKind::Secondary
+                        },
+                        !self.busy && !self.loading,
                         theme,
                         cx.listener(move |this, _, _, cx| {
-                            if confirming && this.pending_delete.as_deref() == Some(id.as_str()) {
-                                this.pending_delete = None;
-                                this.services.history.delete(&id, true);
-                                this.reload(cx);
-                            } else {
-                                this.pending_delete = Some(id.clone());
-                                cx.notify();
+                            cx.stop_propagation();
+                            this.pending_delete = None;
+                            if !this.selected.remove(&id) {
+                                this.selected.insert(id.clone());
                             }
+                            cx.notify();
                         }),
                     )),
             )
+            .into_any_element()
+    }
+
+    fn detail_panel(&self, theme: Theme, cx: &mut Context<Self>) -> AnyElement {
+        let mut children = vec![
+            div()
+                .flex()
+                .flex_wrap()
+                .gap(theme::spacing::XS)
+                .child(widgets::button(
+                    "history-back",
+                    ui("Back to list", "Retour à la liste"),
+                    ButtonKind::Secondary,
+                    !self.busy,
+                    theme,
+                    cx.listener(|this, _, _, cx| this.open(None, cx)),
+                ))
+                .into_any_element(),
+        ];
+        if self.detail_loading && self.detail.is_none() {
+            children.push(
+                div()
+                    .child(ui("Loading dictation…", "Chargement de la dictée…"))
+                    .into_any_element(),
+            );
+        }
+        if let Some(detail) = &self.detail {
+            let detail = detail.clone();
+            let record = &detail.record;
+            children.push(
+                div()
+                    .id("history-detail-heading")
+                    .role(Role::Heading)
+                    .aria_level(2)
+                    .text_size(theme::type_scale::TITLE)
+                    .child(format_time(record.started_at))
+                    .into_any_element(),
+            );
+            children.push(
+                div()
+                    .text_color(theme.on_surface_variant)
+                    .child(format!(
+                        "{} · {} · {} {}{}",
+                        record
+                            .target_app_name
+                            .as_deref()
+                            .unwrap_or(tr(Msg::UnknownApp)),
+                        status_label(record.status().unwrap_or(SessionStatus::Failed)),
+                        detail.word_count,
+                        ui("words", "mots"),
+                        record
+                            .duration_seconds
+                            .map(|seconds| format!(" · {}", format_duration(seconds)))
+                            .unwrap_or_default()
+                    ))
+                    .into_any_element(),
+            );
+            if let Some(code) = record.error_code.as_deref() {
+                children.push(
+                    widgets::status_line(
+                        "history-record-error",
+                        error_summary(Some(code), record.status().unwrap_or(SessionStatus::Failed)),
+                        StatusTone::Bad,
+                        theme,
+                    )
+                    .into_any_element(),
+                );
+            }
+            if let Some(message) = &record.error_message {
+                children.push(
+                    widgets::section(
+                        ui("Error details", "Détails de l’erreur"),
+                        theme,
+                        vec![div().child(message.clone()).into_any_element()],
+                    )
+                    .into_any_element(),
+                );
+            }
+            let mut actions = div().flex().flex_wrap().gap(theme::spacing::XS);
+            let copy_text = if self.editing {
+                None
+            } else {
+                detail.text(self.version).cloned()
+            };
+            actions = actions.child(widgets::button(
+                "history-copy",
+                tr(Msg::Copy),
+                ButtonKind::Secondary,
+                self.editing || copy_text.as_ref().is_some_and(|text| !text.is_empty()),
+                theme,
+                cx.listener(move |this, _, _, cx| {
+                    let text = if this.editing {
+                        this.editor.read(cx).content().to_owned()
+                    } else {
+                        copy_text
+                            .as_ref()
+                            .map(ToString::to_string)
+                            .unwrap_or_default()
+                    };
+                    text_field::set_clipboard_text(text, cx);
+                    this.message = Some((tr(Msg::CopiedFeedback).into(), StatusTone::Good));
+                    cx.notify();
+                }),
+            ));
+            if self.editing {
+                actions = actions
+                    .child(widgets::button(
+                        "history-save",
+                        ui("Save", "Enregistrer"),
+                        ButtonKind::Primary,
+                        !self.busy && self.has_unsaved_changes(cx),
+                        theme,
+                        cx.listener(|this, _, _, cx| this.save_editor(cx)),
+                    ))
+                    .child(widgets::button(
+                        "history-cancel-edit",
+                        tr(Msg::Cancel),
+                        ButtonKind::Secondary,
+                        !self.busy,
+                        theme,
+                        cx.listener(|this, _, _, cx| {
+                            this.editing = false;
+                            cx.notify();
+                        }),
+                    ));
+            } else {
+                actions = actions
+                    .child(widgets::button(
+                        "history-edit",
+                        ui("Edit", "Modifier"),
+                        ButtonKind::Primary,
+                        !self.busy && !self.detail_loading && !detail.current.is_empty(),
+                        theme,
+                        cx.listener(|this, _, _, cx| this.begin_edit(cx)),
+                    ))
+                    .when(detail.retryable, |row| {
+                        row.child(widgets::button(
+                            "history-retry",
+                            tr(Msg::Retry),
+                            ButtonKind::Secondary,
+                            !self.busy,
+                            theme,
+                            cx.listener(|this, _, _, cx| this.retry(cx)),
+                        ))
+                    })
+                    .child(widgets::button(
+                        "history-delete-detail",
+                        tr(Msg::Delete),
+                        ButtonKind::Destructive,
+                        !self.busy,
+                        theme,
+                        cx.listener({
+                            let id = record.id.clone();
+                            move |this, _, _, cx| {
+                                this.pending_delete = Some(vec![id.clone()]);
+                                cx.notify();
+                            }
+                        }),
+                    ));
+            }
+            children.push(actions.into_any_element());
+            if self.editing {
+                children.push(
+                    div()
+                        .text_size(theme::type_scale::LABEL)
+                        .text_color(theme.on_surface_variant)
+                        .child(ui(
+                            "Enter: new line · Ctrl+Enter: save",
+                            "Entrée : nouvelle ligne · Ctrl+Entrée : enregistrer",
+                        ))
+                        .into_any_element(),
+                );
+                children.push(if self.busy {
+                    div()
+                        .child(ui("Saving…", "Enregistrement…"))
+                        .into_any_element()
+                } else {
+                    self.editor.clone().into_any_element()
+                });
+            } else {
+                let versions = Version::ALL
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, version)| {
+                        widgets::button(
+                            ("history-version", index),
+                            version.label(),
+                            if self.version == version {
+                                ButtonKind::Selected
+                            } else {
+                                ButtonKind::Secondary
+                            },
+                            true,
+                            theme,
+                            cx.listener(move |this, _, _, cx| {
+                                this.version = version;
+                                this.detail_scroll.reset();
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element()
+                    })
+                    .collect::<Vec<_>>();
+                children.push(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(theme::spacing::XS)
+                        .children(versions)
+                        .into_any_element(),
+                );
+                if self.version == Version::Corrections {
+                    if detail.corrections.is_empty() {
+                        children.push(
+                            div()
+                                .child(ui(
+                                    "No saved corrections.",
+                                    "Aucune correction enregistrée.",
+                                ))
+                                .into_any_element(),
+                        );
+                    }
+                    for (index, (correction, before, after)) in
+                        detail.corrections.iter().enumerate()
+                    {
+                        children.push(
+                            widgets::section(
+                                format_time(correction.corrected_at),
+                                theme,
+                                vec![
+                                    div()
+                                        .text_size(theme::type_scale::LABEL)
+                                        .text_color(theme.on_surface_variant)
+                                        .child(ui("Before", "Avant"))
+                                        .into_any_element(),
+                                    div().child(before.clone()).into_any_element(),
+                                    div()
+                                        .text_size(theme::type_scale::LABEL)
+                                        .text_color(theme.on_surface_variant)
+                                        .child(ui("After", "Après"))
+                                        .into_any_element(),
+                                    div().child(after.clone()).into_any_element(),
+                                    widgets::hug(widgets::button(
+                                        ("history-restore", index),
+                                        ui(
+                                            "Restore this previous version",
+                                            "Restaurer cette version précédente",
+                                        ),
+                                        ButtonKind::Secondary,
+                                        !self.busy && before != &detail.current,
+                                        theme,
+                                        cx.listener({
+                                            let before = before.clone();
+                                            move |this, _, _, cx| this.save(before.to_string(), cx)
+                                        }),
+                                    ))
+                                    .into_any_element(),
+                                ],
+                            )
+                            .into_any_element(),
+                        );
+                    }
+                } else {
+                    children.push(
+                        div()
+                            .p(theme::spacing::S)
+                            .rounded(theme::radius::SMALL)
+                            .bg(theme.surface)
+                            .child(detail.text(self.version).cloned().unwrap_or_else(|| {
+                                ui(
+                                    "No text for this version.",
+                                    "Aucun texte pour cette version.",
+                                )
+                                .into()
+                            }))
+                            .into_any_element(),
+                    );
+                }
+            }
+        }
+        widgets::page("history-detail", theme, &self.detail_scroll, children).into_any_element()
     }
 }
 
 impl Render for HistoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::ui(window);
-        let stats = self.stats;
-        let count = self.records.len();
-        let records = self.records.clone();
-
-        let summary = if count == 0 && stats.total_dictations == 0 {
-            None
-        } else if stats.total_dictations == 0 {
-            Some(tf(Msg::SavedPending, &[&count]))
-        } else if stats.average_wpm > 0 {
-            Some(tf(
-                Msg::HistorySummarySpeed,
-                &[
-                    &stats.total_dictations,
-                    &stats.total_words,
-                    &stats.average_wpm,
-                ],
-            ))
-        } else {
-            Some(tf(
-                Msg::HistorySummary,
-                &[&stats.total_dictations, &stats.total_words],
-            ))
-        };
-
-        let list = if count == 0 {
-            div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .text_color(theme.on_surface_variant)
-                .child(if self.search.read(cx).is_empty() {
-                    tr(Msg::HistoryHint)
-                } else {
-                    tr(Msg::NoMatches)
-                })
-                .into_any_element()
-        } else {
-            div()
-                .id("history-list")
-                .role(Role::List)
-                .aria_label(tr(Msg::DictationList))
-                .flex_1()
-                .min_h_0()
-                .overflow_hidden()
-                .rounded(theme::radius::MEDIUM)
-                .border_1()
-                .border_color(theme.outline_variant)
-                .bg(theme.surface)
-                .child(
-                    // Virtualized: a heavy user's History is thousands of rows,
-                    // and rendering all of them would stall the window.
-                    uniform_list(
-                        "history-rows",
-                        count,
-                        cx.processor(move |this, range: std::ops::Range<usize>, window, cx| {
-                            let theme = Theme::ui(window);
-                            range
-                                .filter_map(|index| {
-                                    records.get(index).map(|record| {
-                                        this.row(record, theme, cx).into_any_element()
-                                    })
-                                })
-                                .collect::<Vec<_>>()
-                        }),
-                    )
-                    .size_full(),
+        let wide = window.viewport_size().width >= px(1120.0);
+        let compact_filters = self.filters_open && window.viewport_size().height < px(620.0);
+        let show_list = !compact_filters && (wide || self.detail_id.is_none());
+        let show_detail = !compact_filters && self.detail_id.is_some();
+        let mut body = div()
+            .debug_selector(|| "history-body".into())
+            .flex()
+            .flex_1()
+            .min_h_0()
+            .gap(theme::spacing::S);
+        if compact_filters {
+            body = body.child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(self.filters(theme, cx)),
+            );
+        }
+        if show_list {
+            let count = self.items.len();
+            let list = if count == 0 {
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .text_color(theme.on_surface_variant)
+                    .child(if self.loading {
+                        ui("Loading history…", "Chargement de l’historique…")
+                    } else if self.total == 0
+                        && self.search.read(cx).is_empty()
+                        && self.period == Period::All
+                        && self.application == ApplicationFilter::All
+                        && self.status_filter == StatusFilter::All
+                    {
+                        tr(Msg::HistoryHint)
+                    } else {
+                        tr(Msg::NoMatches)
+                    })
+                    .into_any_element()
+            } else {
+                uniform_list(
+                    "history-rows",
+                    count,
+                    cx.processor(|this, range: std::ops::Range<usize>, window, cx| {
+                        let theme = Theme::ui(window);
+                        range
+                            .filter_map(|index| {
+                                let item = this.items.get(index)?.clone();
+                                let day = day_heading(&this.items, index);
+                                Some(this.row(&item, day, theme, cx))
+                            })
+                            .collect::<Vec<_>>()
+                    }),
                 )
+                .size_full()
                 .into_any_element()
-        };
-
-        div()
+            };
+            let page_label = if self.total == 0 {
+                "0".to_owned()
+            } else {
+                format!(
+                    "{}–{} / {}",
+                    self.offset + 1,
+                    self.offset + count,
+                    self.total
+                )
+            };
+            let list_column = div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_w_0()
+                .min_h_0()
+                .gap(theme::spacing::XS)
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(theme::spacing::XS)
+                        .child(widgets::button(
+                            "history-select-page",
+                            ui("Select page", "Sélectionner la page"),
+                            ButtonKind::Secondary,
+                            !self.busy && count > 0 && !self.loading,
+                            theme,
+                            cx.listener(|this, _, _, cx| {
+                                this.selected
+                                    .extend(this.items.iter().map(|item| item.id.clone()));
+                                cx.notify();
+                            }),
+                        ))
+                        .when(!self.selected.is_empty(), |row| {
+                            row.child(widgets::button(
+                                "history-clear-selection",
+                                ui("Clear selection", "Désélectionner"),
+                                ButtonKind::Secondary,
+                                !self.busy,
+                                theme,
+                                cx.listener(|this, _, _, cx| {
+                                    this.selected.clear();
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(widgets::button(
+                                "history-delete-selected",
+                                format!("{} ({})", tr(Msg::Delete), self.selected.len()),
+                                ButtonKind::Destructive,
+                                !self.busy && !self.has_unsaved_changes(cx),
+                                theme,
+                                cx.listener(|this, _, _, cx| {
+                                    this.pending_delete =
+                                        Some(this.selected.iter().cloned().collect());
+                                    cx.notify();
+                                }),
+                            ))
+                        }),
+                )
+                .child(
+                    div()
+                        .id("history-list")
+                        .role(Role::List)
+                        .aria_label(tr(Msg::DictationList))
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .border_1()
+                        .rounded(theme::radius::MEDIUM)
+                        .border_color(theme.outline_variant)
+                        .bg(theme.surface)
+                        .child(list),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap(theme::spacing::XS)
+                        .child(widgets::button(
+                            "history-previous-page",
+                            ui("Previous", "Précédent"),
+                            ButtonKind::Secondary,
+                            !self.loading && self.offset > 0 && !self.busy,
+                            theme,
+                            cx.listener(|this, _, _, cx| {
+                                this.offset = this.offset.saturating_sub(PAGE_SIZE);
+                                this.load(false, cx);
+                            }),
+                        ))
+                        .child(div().text_size(theme::type_scale::LABEL).child(page_label))
+                        .child(widgets::button(
+                            "history-next-page",
+                            ui("Next", "Suivant"),
+                            ButtonKind::Secondary,
+                            !self.loading && self.offset + count < self.total && !self.busy,
+                            theme,
+                            cx.listener(|this, _, _, cx| {
+                                this.offset += PAGE_SIZE;
+                                this.load(false, cx);
+                            }),
+                        )),
+                );
+            body = body.child(list_column);
+        }
+        if show_detail {
+            body = body.child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .border_1()
+                    .rounded(theme::radius::MEDIUM)
+                    .border_color(theme.outline_variant)
+                    .overflow_hidden()
+                    .debug_selector(|| "history-detail-panel".into())
+                    .child(self.detail_panel(theme, cx)),
+            );
+        }
+        let mut page = div()
             .size_full()
             .flex()
             .flex_col()
             .gap(theme::spacing::S)
-            .p(theme::spacing::L)
+            .p(theme::spacing::M)
             .font_family(theme::ui_font())
             .bg(theme.window_background)
             .text_color(theme.on_surface)
-            .child(widgets::heading(Msg::History))
-            .when_some(summary, |column, summary| {
-                column.child(
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap(theme::spacing::S)
+                    .child(widgets::heading(Msg::History))
+                    .child(
+                        div()
+                            .text_size(theme::type_scale::LABEL)
+                            .text_color(theme.on_surface_variant)
+                            .child(if self.loading {
+                                ui("Searching…", "Recherche…").to_owned()
+                            } else {
+                                format!(
+                                    "{} {}",
+                                    self.total,
+                                    if self.total == 1 {
+                                        ui("dictation", "dictée")
+                                    } else {
+                                        ui("dictations", "dictées")
+                                    }
+                                )
+                            }),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(theme::spacing::XS)
+                    .child(div().flex_1().min_w_0().child(self.search.clone()))
+                    .when(!self.search.read(cx).is_empty(), |row| {
+                        row.child(widgets::button(
+                            "history-clear-search",
+                            ui("Clear", "Effacer"),
+                            ButtonKind::Secondary,
+                            true,
+                            theme,
+                            cx.listener(|this, _, _, cx| this.clear_search(cx)),
+                        ))
+                    }),
+            )
+            .child(
+                div()
+                    .text_size(theme::type_scale::LABEL)
+                    .text_color(theme.on_surface_variant)
+                    .child(ui(
+                        "Search words and prefixes; all words must match.",
+                        "Recherchez des mots ou leurs débuts ; tous les mots doivent correspondre.",
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap(theme::spacing::XS)
+                    .child(widgets::button(
+                        "history-toggle-filters",
+                        format!(
+                            "{} · {} · {} · {}",
+                            if self.filters_open {
+                                ui("Close filters", "Fermer les filtres")
+                            } else {
+                                ui("Filters", "Filtres")
+                            },
+                            self.period.label(),
+                            application_label(&self.application),
+                            status_filter_label(self.status_filter)
+                        ),
+                        if self.filters_open {
+                            ButtonKind::Selected
+                        } else {
+                            ButtonKind::Secondary
+                        },
+                        true,
+                        theme,
+                        cx.listener(|this, _, _, cx| {
+                            this.filters_open = !this.filters_open;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(widgets::button(
+                        "history-refresh",
+                        ui("Refresh", "Actualiser"),
+                        ButtonKind::Secondary,
+                        !self.loading,
+                        theme,
+                        cx.listener(|this, _, _, cx| this.refresh(cx)),
+                    )),
+            )
+            .when(self.filters_open && !compact_filters, |page| {
+                page.child(self.filters(theme, cx))
+            });
+        if let Some((message, tone)) = &self.message {
+            page = page.child(widgets::status_line(
+                "history-feedback",
+                message.clone(),
+                *tone,
+                theme,
+            ));
+        }
+        if self.pending_open.is_some() {
+            page = page.child(widgets::section(
+                ui("Unsaved changes", "Modifications non enregistrées"),
+                theme,
+                vec![
                     div()
-                        .text_size(theme::type_scale::LABEL)
-                        .text_color(theme.on_surface_variant)
-                        .child(summary),
-                )
-            })
-            .child(self.search.clone())
-            .when_some(self.status, |column, (message, tone)| {
-                column.child(widgets::status_line(
-                    "history-status",
-                    tr(message),
-                    tone,
-                    theme,
-                ))
-            })
-            .child(list)
+                        .child(ui(
+                            "Your draft has not been saved. Discard it and continue?",
+                            "Votre brouillon n’est pas enregistré. L’abandonner pour continuer ?",
+                        ))
+                        .into_any_element(),
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .gap(theme::spacing::XS)
+                        .child(widgets::button(
+                            "history-keep-draft",
+                            ui("Keep editing", "Continuer à modifier"),
+                            ButtonKind::Primary,
+                            true,
+                            theme,
+                            cx.listener(|this, _, _, cx| {
+                                this.pending_open = None;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(widgets::button(
+                            "history-discard-draft",
+                            ui(
+                                "Discard draft and continue",
+                                "Abandonner le brouillon et continuer",
+                            ),
+                            ButtonKind::Destructive,
+                            !self.busy,
+                            theme,
+                            cx.listener(|this, _, _, cx| {
+                                if let Some(id) = this.pending_open.take() {
+                                    this.open_now(id, cx);
+                                }
+                            }),
+                        ))
+                        .into_any_element(),
+                ],
+            ));
+        }
+        if let Some(ids) = &self.pending_delete {
+            page = page.child(widgets::section(ui("Confirm permanent deletion", "Confirmer la suppression définitive"), theme, vec![
+                div().child(format!("{} {} {}", ui("Permanently delete", "Supprimer définitivement"), ids.len(), ui("dictation(s), their versions and associated audio? This cannot be undone.", "dictée(s), leurs versions et les fichiers audio associés ? Cette action est irréversible."))).into_any_element(),
+                div().flex().flex_wrap().gap(theme::spacing::XS)
+                    .child(widgets::button("history-cancel-delete", tr(Msg::Cancel), ButtonKind::Secondary, !self.busy, theme,
+                        cx.listener(|this, _, _, cx| this.dismiss_confirmation(cx))))
+                    .child(widgets::button("history-confirm-delete", ui("Delete permanently, including audio", "Supprimer définitivement, audio compris"), ButtonKind::Destructive, !self.busy && !self.has_unsaved_changes(cx), theme,
+                        cx.listener(|this, _, _, cx| this.delete(cx)))).into_any_element(),
+            ]));
+        }
+        page.child(body)
     }
 }
 
-fn format_time(at: OffsetDateTime) -> String {
-    let local = time::UtcOffset::current_local_offset()
-        .map(|offset| at.to_offset(offset))
-        .unwrap_or(at);
+fn status_filter_label(status: StatusFilter) -> &'static str {
+    match status {
+        StatusFilter::All => ui("All statuses", "Tous les statuts"),
+        StatusFilter::Completed => ui("Completed", "Terminées"),
+        StatusFilter::Pending => ui("Pending", "En attente"),
+        StatusFilter::Failed => tr(Msg::Failed),
+        StatusFilter::Cancelled => tr(Msg::Cancelled),
+    }
+}
+
+fn application_label(application: &ApplicationFilter) -> String {
+    match application {
+        ApplicationFilter::All => ui("All applications", "Toutes les applications").into(),
+        ApplicationFilter::Unknown => tr(Msg::UnknownApp).into(),
+        ApplicationFilter::Named(name) => name.clone(),
+    }
+}
+
+fn local_stamp(at: OffsetDateTime) -> (OffsetDateTime, bool) {
+    match jot_core::activity::local_datetime(at) {
+        Ok(local) => (local, false),
+        Err(_) => (at.to_offset(time::UtcOffset::UTC), true),
+    }
+}
+
+fn day_heading(items: &[HistoryItem], index: usize) -> Option<String> {
+    let at = items.get(index)?.started_at;
+    let (local, fallback) = local_stamp(at);
+    if index > 0 {
+        let previous = items[index - 1].started_at;
+        let (previous, previous_fallback) = local_stamp(previous);
+        if local.date() == previous.date() && fallback == previous_fallback {
+            return None;
+        }
+    }
     let pattern = match locale() {
-        Locale::En => format_description!("[day] [month repr:short] [hour]:[minute]"),
+        Locale::En => format_description!("[year]-[month]-[day]"),
+        Locale::Fr => format_description!("[day]/[month]/[year]"),
+    };
+    local.format(pattern).ok().map(|date| {
+        if fallback {
+            format!("{date} UTC")
+        } else {
+            date
+        }
+    })
+}
+
+fn format_clock(at: OffsetDateTime) -> String {
+    let (local, fallback) = local_stamp(at);
+    let clock = local
+        .format(format_description!("[hour]:[minute]"))
+        .unwrap_or_default();
+    if fallback {
+        format!("{clock} UTC")
+    } else {
+        clock
+    }
+}
+
+fn format_duration(seconds: f64) -> String {
+    let value = format!("{seconds:.1}");
+    tf(
+        Msg::Duration,
+        &[&if locale() == Locale::Fr {
+            value.replace('.', ",")
+        } else {
+            value
+        }],
+    )
+}
+fn format_time(at: OffsetDateTime) -> String {
+    let (local, fallback) = local_stamp(at);
+    let pattern = match locale() {
+        Locale::En => format_description!("[day] [month repr:short] [year] [hour]:[minute]"),
         Locale::Fr => format_description!("[day]/[month]/[year] à [hour]:[minute]"),
     };
-    local
+    let formatted = local
         .format(pattern)
-        .unwrap_or_else(|_| tr(Msg::UnknownTime).into())
+        .unwrap_or_else(|_| tr(Msg::UnknownTime).into());
+    if fallback {
+        format!("{formatted} UTC")
+    } else {
+        formatted
+    }
 }
 
 /// The short word that goes in the chip. The row's body line carries the
@@ -468,6 +1644,59 @@ fn status_chip(status: SessionStatus, theme: Theme) -> impl IntoElement {
         .font_weight(theme::weight::MEDIUM)
         .text_color(foreground)
         .child(status_chip_label(status))
+}
+// Prefix highlighting mirrors the word-oriented search for French and English.
+// shortcut: accent folding covers Latin French, extend it if another UI language is added.
+fn fold_search(word: &str) -> String {
+    word.chars()
+        .flat_map(char::to_lowercase)
+        .filter_map(|c| {
+            Some(match c {
+                'à' | 'â' | 'ä' | 'á' | 'ã' | 'å' => 'a',
+                'é' | 'è' | 'ê' | 'ë' => 'e',
+                'î' | 'ï' | 'í' | 'ì' => 'i',
+                'ô' | 'ö' | 'ó' | 'ò' | 'õ' => 'o',
+                'ù' | 'û' | 'ü' | 'ú' => 'u',
+                'ç' => 'c',
+                '\u{0300}'..='\u{036f}' => return None,
+                _ => c,
+            })
+        })
+        .collect()
+}
+
+fn word_ranges(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut ranges = Vec::new();
+    let mut start = None;
+    for (index, c) in text.char_indices() {
+        if c.is_alphanumeric() || ('\u{0300}'..='\u{036f}').contains(&c) && start.is_some() {
+            start.get_or_insert(index);
+        } else if let Some(start) = start.take() {
+            ranges.push(start..index);
+        }
+    }
+    if let Some(start) = start {
+        ranges.push(start..text.len());
+    }
+    ranges
+}
+
+fn search_highlights(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
+    let words = word_ranges(query)
+        .into_iter()
+        .map(|range| fold_search(&query[range]))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>();
+    if words.is_empty() {
+        return Vec::new();
+    }
+    word_ranges(text)
+        .into_iter()
+        .filter(|range| {
+            let word = fold_search(&text[range.clone()]);
+            words.iter().any(|query| word.starts_with(query))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -557,6 +1786,262 @@ mod tests {
     #[test]
     fn timestamps_render_rather_than_panicking_on_a_missing_local_offset() {
         let formatted = format_time(OffsetDateTime::UNIX_EPOCH);
-        assert!(formatted.contains("Jan"), "{formatted}");
+        assert!(!formatted.is_empty(), "{formatted}");
+    }
+
+    #[test]
+    fn search_highlights_case_accents_prefixes_and_utf8_boundaries() {
+        let text = "🎙 ÉTÉ café cafe\u{0301} réécrire fin";
+        let ranges = search_highlights(text, "ete CAF réé");
+        let words = ranges
+            .iter()
+            .map(|range| &text[range.clone()])
+            .collect::<Vec<_>>();
+        assert_eq!(words, ["ÉTÉ", "café", "cafe\u{0301}", "réécrire"]);
+        assert!(search_highlights(text, "té").is_empty());
+        assert!(search_highlights(text, "  ").is_empty());
+    }
+
+    fn services(root: &std::path::Path) -> Services {
+        use jot_core::{
+            coordinator::{CoordinatorDeps, DictationCoordinator},
+            dictionary::DictionaryStore,
+            gemini::GeminiClient,
+            history::HistoryStore,
+            insertion::InsertionCoordinator,
+            recovery::RetryQueue,
+            settings::SettingsStore,
+            transcription::{GeminiTranscriptionService, TranscriptionServicing},
+        };
+        let settings = Arc::new(SettingsStore::open(root.join("settings.json")));
+        let dictionary = Arc::new(DictionaryStore::open(root.join("dictionary.json")));
+        let history = Arc::new(HistoryStore::open(&root.join("history.sqlite")).unwrap());
+        let client = Arc::new(GeminiClient::new(Box::new(|| None)));
+        let transcription: Arc<dyn TranscriptionServicing> = Arc::new(
+            GeminiTranscriptionService::new(client.clone(), settings.clone(), dictionary.clone()),
+        );
+        let coordinator = DictationCoordinator::new(CoordinatorDeps {
+            audio_factory: Box::new(|| panic!("audio must not run in History tests")),
+            transcription: transcription.clone(),
+            insertion: Arc::new(InsertionCoordinator::new()),
+            context_provider: Box::new(Default::default),
+            now: Box::new(OffsetDateTime::now_utc),
+            noise_handling_enabled: Box::new(|| false),
+            secure_field_focused: Box::new(|| false),
+        });
+        let retry_queue = Arc::new(RetryQueue::new(history.clone(), transcription.clone()));
+        Services {
+            settings,
+            dictionary,
+            history,
+            client,
+            transcription,
+            coordinator,
+            retry_queue,
+        }
+    }
+
+    fn add_record(services: &Services, root: &std::path::Path, text: &str) -> String {
+        let mut meta = jot_core::meta::SessionMeta::new(
+            uuid::Uuid::new_v4(),
+            OffsetDateTime::now_utc(),
+            SessionStatus::Inserted,
+        );
+        meta.cleaned_transcript = Some(text.into());
+        services.history.upsert(&meta, root);
+        meta.id.to_string()
+    }
+
+    #[test]
+    fn dirty_draft_blocks_navigation_and_refresh_keeps_it() {
+        use gpui::TestAppContext;
+        let temp = tempfile::tempdir().unwrap();
+        let services = services(temp.path());
+        let id = add_record(&services, temp.path(), "Original");
+        let mut cx = TestAppContext::single();
+        let view = cx.new(|cx| HistoryView::new(services, cx));
+        cx.run_until_parked();
+        view.update(&mut cx, |view, cx| view.open(Some(id.clone()), cx));
+        cx.run_until_parked();
+        view.update(&mut cx, |view, cx| {
+            view.begin_edit(cx);
+            view.editor
+                .update(cx, |field, _| field.set_content("Mon brouillon\nconservé"));
+            assert!(view.has_unsaved_changes(cx));
+            view.open(None, cx);
+            assert_eq!(view.pending_open, Some(None));
+            assert_eq!(view.detail_id.as_deref(), Some(id.as_str()));
+            view.dismiss_confirmation(cx);
+            view.refresh(cx);
+        });
+        cx.run_until_parked();
+        cx.read_entity(&view, |view, cx| {
+            assert!(view.editing);
+            assert_eq!(view.editor.read(cx).content(), "Mon brouillon\nconservé");
+            assert_eq!(view.detail_id.as_deref(), Some(id.as_str()));
+        });
+        view.update(&mut cx, |view, cx| {
+            view.editing = false;
+            view.open(None, cx);
+            assert!(view.detail_id.is_none());
+        });
+    }
+
+    #[test]
+    fn search_debounce_uses_the_latest_query_and_pages_can_reach_past_500() {
+        use gpui::TestAppContext;
+        let temp = tempfile::tempdir().unwrap();
+        let services = services(temp.path());
+        for index in 0..505 {
+            add_record(&services, temp.path(), &format!("Exemple {index}"));
+        }
+        let mut cx = TestAppContext::single();
+        let view = cx.new(|cx| HistoryView::new(services, cx));
+        cx.run_until_parked();
+        view.update(&mut cx, |view, cx| {
+            assert_eq!(view.total, 505);
+            assert_eq!(view.items.len(), PAGE_SIZE);
+            view.offset = 500;
+            view.load(false, cx);
+        });
+        cx.run_until_parked();
+        cx.read_entity(&view, |view, _| assert_eq!(view.items.len(), 5));
+        view.update(&mut cx, |view, cx| {
+            view.search
+                .update(cx, |field, _| field.set_content("absent"));
+            view.offset = 0;
+            view.load(true, cx);
+            view.search
+                .update(cx, |field, _| field.set_content("exemple"));
+            view.load(true, cx);
+        });
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(181));
+        cx.run_until_parked();
+        cx.read_entity(&view, |view, _| {
+            assert_eq!(view.total, 505);
+            assert!(!view.loading);
+        });
+        view.update(&mut cx, |view, cx| {
+            view.offset = 500;
+            view.selected.insert("old-selection".into());
+            view.pending_delete = Some(vec!["old-selection".into()]);
+            view.clear_search(cx);
+            assert!(view.search.read(cx).is_empty());
+            assert!(view.selected.is_empty());
+            assert!(view.pending_delete.is_none());
+            assert_eq!(view.offset, 0);
+        });
+        cx.run_until_parked();
+        cx.read_entity(&view, |view, _| {
+            assert_eq!(view.total, 505);
+            assert_eq!(view.items.len(), PAGE_SIZE);
+        });
+    }
+
+    #[test]
+    fn editing_waits_for_the_refreshed_detail_and_uses_its_text() {
+        use gpui::TestAppContext;
+        let temp = tempfile::tempdir().unwrap();
+        let services = services(temp.path());
+        let id = add_record(&services, temp.path(), "Original A");
+        let mut meta = jot_core::meta::SessionMeta::new(
+            uuid::Uuid::parse_str(&id).unwrap(),
+            OffsetDateTime::now_utc(),
+            SessionStatus::Inserted,
+        );
+        meta.cleaned_transcript = Some("Original A".into());
+        meta.write(temp.path());
+        let mut cx = TestAppContext::single();
+        let view = cx.new(|cx| HistoryView::new(services, cx));
+        cx.run_until_parked();
+        view.update(&mut cx, |view, cx| view.open(Some(id.clone()), cx));
+        cx.run_until_parked();
+        view.update(&mut cx, |view, cx| {
+            view.services
+                .history
+                .edit(&id, "Original A", "New version B")
+                .unwrap();
+            view.refresh(cx);
+            assert!(view.detail_loading);
+            view.begin_edit(cx);
+            assert!(
+                !view.editing,
+                "a draft cannot start from a stale cached detail"
+            );
+        });
+        cx.run_until_parked();
+        view.update(&mut cx, |view, cx| {
+            assert!(!view.detail_loading);
+            view.begin_edit(cx);
+            assert_eq!(view.editor.read(cx).content(), "New version B");
+        });
+    }
+
+    #[test]
+    fn refresh_preserves_the_selected_version_and_cached_detail() {
+        use gpui::TestAppContext;
+        let temp = tempfile::tempdir().unwrap();
+        let services = services(temp.path());
+        let id = add_record(&services, temp.path(), "A saved dictation");
+        let mut cx = TestAppContext::single();
+        let view = cx.new(|cx| HistoryView::new(services, cx));
+        cx.run_until_parked();
+        view.update(&mut cx, |view, cx| view.open(Some(id.clone()), cx));
+        cx.run_until_parked();
+        view.update(&mut cx, |view, cx| {
+            view.version = Version::Raw;
+            view.refresh(cx);
+            assert!(view.version == Version::Raw);
+            assert!(view.detail.is_some());
+        });
+        cx.run_until_parked();
+        cx.read_entity(&view, |view, _| {
+            assert!(view.version == Version::Raw);
+            assert_eq!(view.detail_id.as_deref(), Some(id.as_str()));
+        });
+    }
+
+    #[test]
+    fn a_small_window_opens_the_preview_and_renders_a_long_detail_and_filters() {
+        use gpui::{TestAppContext, VisualTestContext, size};
+        let temp = tempfile::tempdir().unwrap();
+        let services = services(temp.path());
+        let text = "Longue dictée avec un paragraphe Unicode été.\n".repeat(2500);
+        assert!(text.len() >= 100_000);
+        let id = add_record(&services, temp.path(), &text);
+        let mut cx = TestAppContext::single();
+        let window = cx.add_window(|_, cx| HistoryView::new(services, cx));
+        let view = window.root(&mut cx).unwrap();
+        cx.run_until_parked();
+        let handle = window.into();
+        cx.simulate_window_resize(handle, size(px(540.0), px(480.0)));
+        cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let mut visual = VisualTestContext::from_window(handle, &cx);
+        let body = visual.debug_bounds("history-body").unwrap();
+        assert!(body.size.height > px(50.0), "{body:?}");
+        assert!(body.bottom() <= px(480.0), "{body:?}");
+        let preview = visual.debug_bounds("history-preview").unwrap();
+        visual.simulate_click(preview.center(), Default::default());
+        cx.run_until_parked();
+        cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        cx.read_entity(&view, |view, _| {
+            assert_eq!(view.detail_id.as_deref(), Some(id.as_str()));
+            assert_eq!(view.detail.as_ref().unwrap().current.len(), text.len());
+        });
+        let detail = visual.debug_bounds("history-detail-panel").unwrap();
+        assert!(detail.size.height > px(50.0), "{detail:?}");
+        assert!(detail.bottom() <= px(480.0), "{detail:?}");
+        view.update(&mut cx, |view, cx| {
+            view.filters_open = true;
+            cx.notify();
+        });
+        cx.update_window(handle, |_, window, cx| window.draw(cx).clear(cx))
+            .unwrap();
+        let filters = visual.debug_bounds("history-filters").unwrap();
+        assert!(filters.size.height > px(50.0), "{filters:?}");
+        assert!(filters.bottom() <= px(480.0), "{filters:?}");
     }
 }

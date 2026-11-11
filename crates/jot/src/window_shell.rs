@@ -83,10 +83,10 @@ pub fn make_overlay(window: &Window, bottom_margin: f32) -> anyhow::Result<()> {
 /// Moves the HUD to the bottom centre of the display holding the foreground
 /// window — where the text is about to land.
 pub fn place_on_active_display(window: &Window, bottom_margin: f32) {
-    if let Some(hwnd) = hwnd_of(window) {
-        if let Err(error) = platform::place_on_active_display(hwnd, bottom_margin) {
-            tracing::error!(%error, "could not position the HUD");
-        }
+    if let Some(hwnd) = hwnd_of(window)
+        && let Err(error) = platform::place_on_active_display(hwnd, bottom_margin)
+    {
+        tracing::error!(%error, "could not position the HUD");
     }
 }
 

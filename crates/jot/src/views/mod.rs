@@ -167,7 +167,20 @@ impl WorkspaceView {
         view
     }
 
+    fn can_leave_history(&mut self, cx: &mut Context<Self>) -> bool {
+        if let Some(history) = &self.history
+            && history.read(cx).has_unsaved_changes(cx)
+        {
+            history.update(cx, history::HistoryView::prevent_navigation);
+            return false;
+        }
+        true
+    }
+
     fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
+        if self.route != route && !self.can_leave_history(cx) {
+            return;
+        }
         if self.route != route {
             match self.route {
                 Route::Dashboard => {
@@ -223,6 +236,12 @@ impl WorkspaceView {
 
 impl Render for WorkspaceView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let entity = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |_, cx| {
+            entity
+                .update(cx, |view, cx| view.can_leave_history(cx))
+                .unwrap_or(true)
+        });
         let theme = Theme::ui(window);
         let wide = window.viewport_size().width >= px(820.0);
         let entity = cx.entity().downgrade();

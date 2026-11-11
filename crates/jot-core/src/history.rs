@@ -18,6 +18,9 @@
 //! database only makes History fast to search and stats cheap, so a corrupt
 //! index is a rebuild rather than a data loss.
 
+mod library;
+pub use library::*;
+
 use crate::activity::{Activity, LocalCalendar, Totals};
 use crate::file_layout;
 use crate::meta::{SessionMeta, SessionStatus};
@@ -71,6 +74,7 @@ pub struct DictationRecord {
     pub duration_seconds: Option<f64>,
     pub raw_transcript: Option<String>,
     pub cleaned_transcript: Option<String>,
+    pub user_transcript: Option<String>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
     pub pipeline_seconds: Option<f64>,
@@ -88,6 +92,7 @@ impl DictationRecord {
             duration_seconds: meta.audio_duration_seconds,
             raw_transcript: meta.raw_transcript.clone(),
             cleaned_transcript: meta.cleaned_transcript.clone(),
+            user_transcript: None,
             error_code: meta.error_code.clone(),
             error_message: meta.error_message.clone(),
             pipeline_seconds: meta.pipeline_seconds,
@@ -95,14 +100,19 @@ impl DictationRecord {
     }
 
     pub fn display_text(&self) -> &str {
-        self.cleaned_transcript
+        self.user_transcript
             .as_deref()
+            .or(self.cleaned_transcript.as_deref())
             .or(self.raw_transcript.as_deref())
             .unwrap_or("")
     }
 
     pub fn status(&self) -> Option<SessionStatus> {
         SessionStatus::parse(&self.status)
+    }
+
+    pub fn word_count(&self) -> usize {
+        count_words(self.display_text()) as usize
     }
 }
 
@@ -216,6 +226,7 @@ impl HistoryStore {
              WHERE {}",
             activity_filter()
         ))?;
+        library::migrate(&transaction)?;
         transaction.commit()?;
         Ok(())
     }
@@ -286,12 +297,16 @@ impl HistoryStore {
         meta: &SessionMeta,
         folder: &Path,
     ) -> rusqlite::Result<usize> {
-        let record = DictationRecord::from_meta(meta, folder);
+        let mut record = DictationRecord::from_meta(meta, folder);
+        record.user_transcript = library::read_corrections(folder, &record.id)
+            .map_err(|error| rusqlite::Error::ToSqlConversionFailure(error.into()))?
+            .last()
+            .map(|correction| correction.after.clone());
         connection.execute(
             "INSERT INTO dictation (id, folder, started_at, status, target_app_name,
                  target_app_exe, duration_seconds, raw_transcript, cleaned_transcript,
-                 error_code, error_message, pipeline_seconds, word_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+                 error_code, error_message, pipeline_seconds, word_count, user_transcript)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
              ON CONFLICT(id) DO UPDATE SET
                  folder = excluded.folder, started_at = excluded.started_at,
                  status = excluded.status, target_app_name = excluded.target_app_name,
@@ -300,15 +315,16 @@ impl HistoryStore {
                  raw_transcript = excluded.raw_transcript,
                  cleaned_transcript = excluded.cleaned_transcript,
                  error_code = excluded.error_code, error_message = excluded.error_message,
-                 pipeline_seconds = excluded.pipeline_seconds, word_count = excluded.word_count
+                 pipeline_seconds = excluded.pipeline_seconds, word_count = excluded.word_count,
+                 user_transcript = excluded.user_transcript
              WHERE (dictation.folder, dictation.started_at, dictation.status, dictation.target_app_name,
                     dictation.target_app_exe, dictation.duration_seconds, dictation.raw_transcript,
                     dictation.cleaned_transcript, dictation.error_code, dictation.error_message,
-                    dictation.pipeline_seconds, dictation.word_count)
+                    dictation.pipeline_seconds, dictation.word_count, dictation.user_transcript)
                 IS NOT (excluded.folder, excluded.started_at, excluded.status, excluded.target_app_name,
                         excluded.target_app_exe, excluded.duration_seconds, excluded.raw_transcript,
                         excluded.cleaned_transcript, excluded.error_code, excluded.error_message,
-                        excluded.pipeline_seconds, excluded.word_count)",
+                        excluded.pipeline_seconds, excluded.word_count, excluded.user_transcript)",
             params![
                 record.id,
                 record.folder.to_string_lossy(),
@@ -323,6 +339,7 @@ impl HistoryStore {
                 record.error_message,
                 record.pipeline_seconds,
                 count_words(record.display_text()),
+                record.user_transcript,
             ],
         )
     }
@@ -393,6 +410,7 @@ impl HistoryStore {
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir()
+                && !entry.file_name().to_string_lossy().starts_with(".deleted-")
                 && let Some(meta) = SessionMeta::read(&path)
             {
                 self.upsert(&meta, &path);
@@ -435,7 +453,7 @@ impl HistoryStore {
         }
     }
 
-    fn record(&self, id: &str) -> Option<DictationRecord> {
+    pub fn record(&self, id: &str) -> Option<DictationRecord> {
         self.query(
             "SELECT * FROM dictation WHERE id = ?1",
             &[&id],
@@ -623,6 +641,7 @@ fn row_to_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<DictationRecord> {
         duration_seconds: row.get("duration_seconds")?,
         raw_transcript: row.get("raw_transcript")?,
         cleaned_transcript: row.get("cleaned_transcript")?,
+        user_transcript: row.get("user_transcript")?,
         error_code: row.get("error_code")?,
         error_message: row.get("error_message")?,
         pipeline_seconds: row.get("pipeline_seconds")?,
@@ -1037,5 +1056,47 @@ mod tests {
             policy.purge_expired_audio(temp.path(), OffsetDateTime::now_utc()),
             0
         );
+    }
+}
+#[cfg(test)]
+mod library_contract_test {
+    use super::*;
+    #[test]
+    fn fts_is_accent_insensitive_and_preserves_original_correction() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = HistoryStore::open(&temp.path().join("history.sqlite")).unwrap();
+        let folder = temp.path().join("session");
+        std::fs::create_dir(&folder).unwrap();
+        let mut meta = SessionMeta::new(
+            uuid::Uuid::new_v4(),
+            OffsetDateTime::now_utc(),
+            SessionStatus::Inserted,
+        );
+        meta.raw_transcript = Some("été Proxmocks".into());
+        meta.cleaned_transcript = Some("Été Proxmocks.".into());
+        meta.write(&folder);
+        store.upsert(&meta, &folder);
+        store
+            .edit(&meta.id.to_string(), "Été Proxmocks.", "Été Proxmox.")
+            .unwrap();
+        assert_eq!(
+            SessionMeta::read(&folder)
+                .unwrap()
+                .cleaned_transcript
+                .as_deref(),
+            Some("Été Proxmocks.")
+        );
+        let page = store
+            .page(
+                &HistoryFilter {
+                    search: "ETE proxmox".into(),
+                    ..Default::default()
+                },
+                0,
+                50,
+            )
+            .unwrap();
+        assert_eq!(page.total, 1);
+        assert!(page.items[0].corrected);
     }
 }

@@ -118,11 +118,7 @@ messages! {
     CopiedFeedback => "Transcript copied.", "Transcription copiée.";
     Retry => "Retry", "Réessayer";
     Delete => "Delete", "Supprimer";
-    DeleteDictation => "Delete this dictation and its recording?", "Supprimer cette dictée et son enregistrement ?";
     HistoryHint => "Your dictations appear here after you use your dictation shortcut.", "Utilisez votre raccourci de dictée pour remplir votre historique.";
-    SavedPending => "{0} saved · no transcripts yet", "Dictées enregistrées : {0} · Aucune transcription";
-    HistorySummarySpeed => "Dictations: {0} · Words: {1} · About {2} words/min", "Dictées : {0} · Mots : {1} · Environ {2} mots/min";
-    HistorySummary => "Dictations: {0} · Words: {1}", "Dictées : {0} · Mots : {1}";
     NoMatches => "No dictations match your search.", "Aucune dictée ne correspond à votre recherche.";
     DictationList => "Your dictations", "Vos dictées";
     UnknownTime => "Time unknown", "Heure inconnue";

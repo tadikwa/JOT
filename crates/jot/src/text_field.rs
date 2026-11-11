@@ -12,33 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! A single-line text field with IME support.
+//! Text fields with IME support and an optional multiline editor.
 //!
-//! GPUI ships no text input at the pinned revision, and Jot needs four: an API
-//! key, a dictionary term, its misspelling, and a History search.
+//! GPUI ships no text input at the pinned revision. Settings and search use
+//! single-line fields; History editing opts into wrapped multiline text.
 //!
 //! Text does NOT arrive through key events. `WM_CHAR` and `WM_IME_COMPOSITION`
 //! are routed by the platform into the [`EntityInputHandler`] installed during
 //! paint, which is what makes Chinese, Japanese, Korean and Vietnamese input
 //! work — the composition is marked, shown underlined, and committed as one
-//! edit. Key events are only used for the operations an IME does not own:
-//! caret movement, deletion, select-all, copy and paste.
+//! edit. Key events handle caret movement, deletion, selection, clipboard
+//! commands, and multiline Enter because Windows filters control characters.
 //!
-//! What it still is not: a full editor. The IME candidate window is placed
-//! against the field rather than the caret, and there is no word-wise motion or
-//! double-click-to-select-word.
+//! This is not a full editor: there is no word-wise motion or double-click
+//! selection. Multiline IME candidates follow the shaped caret.
 
 use crate::i18n::{Msg, tr};
 use crate::theme::{self, Theme};
 use gpui::{
     Bounds, ClipboardItem, Context, ElementInputHandler, EntityInputHandler, FocusHandle,
     Focusable, Font, FontFeatures, FontStyle, FontWeight, KeyDownEvent, MouseDownEvent, Pixels,
-    Point, Role, SharedString, TextRun, UTF16Selection, Window, canvas, div, prelude::*, px,
+    Point, Role, SharedString, TextRun, UTF16Selection, Window, WrappedLine, canvas, div, fill,
+    point, prelude::*, px, size,
 };
 use std::ops::Range;
 
-/// How many edits back a field remembers. A single-line field holds an API key
-/// or a model name, not a document, so this is generous rather than tuned.
+/// Maximum number of undo snapshots retained by a field.
 const UNDO_DEPTH: usize = 64;
 
 /// A restorable moment: the text and where the caret was in it.
@@ -48,8 +47,68 @@ struct Snapshot {
     selection: Range<usize>,
 }
 
-/// Emitted when the user presses Enter.
+/// Emitted on Enter in a single-line field, or Ctrl+Enter in a multiline field.
 pub struct Submit;
+
+/// Emitted by user edits; loading a value with `set_content` stays silent.
+pub struct Changed;
+
+const EDITOR_LINE_HEIGHT: Pixels = px(22.0);
+
+struct EditorLine {
+    start: usize,
+    top: Pixels,
+    shaped: WrappedLine,
+}
+
+struct EditorLayout {
+    lines: Vec<EditorLine>,
+    height: Pixels,
+}
+
+impl EditorLayout {
+    fn position(&self, index: usize, wrap_end: bool) -> Point<Pixels> {
+        for line in &self.lines {
+            if index <= line.start + line.shaped.len() {
+                if !wrap_end {
+                    for (row, boundary) in line.shaped.wrap_boundaries().iter().enumerate() {
+                        let glyph = &line.shaped.runs()[boundary.run_ix].glyphs[boundary.glyph_ix];
+                        if line.start + glyph.index == index {
+                            return point(px(0.0), line.top + EDITOR_LINE_HEIGHT * (row + 1));
+                        }
+                    }
+                }
+                let position = line
+                    .shaped
+                    .position_for_index(index.saturating_sub(line.start), EDITOR_LINE_HEIGHT)
+                    .unwrap_or_default();
+                return point(position.x, line.top + position.y);
+            }
+        }
+        point(px(0.0), self.height - EDITOR_LINE_HEIGHT)
+    }
+
+    fn index_at(&self, position: Point<Pixels>) -> usize {
+        let Some(line) = self
+            .lines
+            .iter()
+            .rev()
+            .find(|line| position.y >= line.top)
+            .or_else(|| self.lines.first())
+        else {
+            return 0;
+        };
+        let y = (position.y - line.top).clamp(
+            px(0.0),
+            line.shaped.size(EDITOR_LINE_HEIGHT).height - px(1.0),
+        );
+        line.start
+            + line
+                .shaped
+                .closest_index_for_position(point(position.x, y), EDITOR_LINE_HEIGHT)
+                .unwrap_or_else(|index| index)
+    }
+}
 
 pub enum FieldLabel {
     Fixed(&'static str),
@@ -99,9 +158,16 @@ pub struct TextField {
     /// True while a run of single characters is being typed, so that a word
     /// undoes as a word instead of one letter per press.
     coalescing: bool,
+    multiline: bool,
+    layout: Option<EditorLayout>,
+    scroll_offset: Pixels,
+    reveal_caret: bool,
+    edit_revision: u64,
+    wrap_end: bool,
 }
 
 impl gpui::EventEmitter<Submit> for TextField {}
+impl gpui::EventEmitter<Changed> for TextField {}
 
 impl Focusable for TextField {
     fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
@@ -127,7 +193,18 @@ impl TextField {
             undo: Vec::new(),
             redo: Vec::new(),
             coalescing: false,
+            multiline: false,
+            layout: None,
+            scroll_offset: px(0.0),
+            reveal_caret: true,
+            edit_revision: 0,
+            wrap_end: false,
         }
+    }
+
+    pub fn multiline(mut self) -> Self {
+        self.multiline = true;
+        self
     }
 
     pub fn masked(mut self) -> Self {
@@ -141,6 +218,10 @@ impl TextField {
 
     pub fn set_content(&mut self, text: impl Into<String>) {
         self.content = text.into();
+        self.wrap_end = false;
+        self.layout = None;
+        self.scroll_offset = px(0.0);
+        self.reveal_caret = true;
         self.selection = self.content.len()..self.content.len();
         self.marked = None;
         // Filling a field from settings is not an edit the user made, so there
@@ -246,7 +327,11 @@ impl TextField {
     }
 
     fn restore(&mut self, snapshot: Snapshot) {
+        if self.content != snapshot.content {
+            self.edit_revision += 1;
+        }
         self.content = snapshot.content;
+        self.wrap_end = false;
         let end = self.content.len();
         self.selection = snapshot.selection.start.min(end)..snapshot.selection.end.min(end);
         // An in-flight composition describes text that no longer exists.
@@ -256,22 +341,26 @@ impl TextField {
 
     /// Replaces `range` with `text` and leaves the caret after it.
     ///
-    /// A single-line field: newlines become spaces rather than silently
-    /// truncating whatever came after them, which is how a pasted API key with
-    /// a trailing newline used to lose its second half.
+    /// Single-line fields replace newlines with spaces; multiline fields
+    /// preserve line breaks and normalize CRLF/CR to LF.
     fn replace(&mut self, range: Range<usize>, text: &str) {
-        let sanitized = text.replace(['\n', '\r'], " ");
-        let range = range.start.min(self.content.len())..range.end.min(self.content.len());
+        let sanitized = self.sanitize(text);
+        let range = range.start.min(range.end).min(self.content.len())
+            ..range.start.max(range.end).min(self.content.len());
+        if self.content[range.clone()] != sanitized {
+            self.edit_revision += 1;
+        }
         self.content.replace_range(range.clone(), &sanitized);
         let caret = range.start + sanitized.len();
         self.selection = caret..caret;
         self.marked = None;
+        self.wrap_end = false;
     }
 
     fn delete_backwards(&mut self) {
         self.checkpoint(false);
         if self.selection.start != self.selection.end {
-            let range = self.selection.clone();
+            let range = self.selection_range();
             self.replace(range, "");
             return;
         }
@@ -285,7 +374,7 @@ impl TextField {
     fn delete_forwards(&mut self) {
         self.checkpoint(false);
         if self.selection.start != self.selection.end {
-            let range = self.selection.clone();
+            let range = self.selection_range();
             self.replace(range, "");
             return;
         }
@@ -302,6 +391,25 @@ impl TextField {
             self.selection = self.selection.start..to;
         } else {
             self.selection = to..to;
+        }
+    }
+
+    fn selection_range(&self) -> Range<usize> {
+        self.selection.start.min(self.selection.end)..self.selection.start.max(self.selection.end)
+    }
+
+    fn sanitize(&self, text: &str) -> String {
+        if self.multiline && !self.masked {
+            text.replace("\r\n", "\n").replace('\r', "\n")
+        } else {
+            text.replace(['\n', '\r'], " ")
+        }
+    }
+
+    fn changed_since(&mut self, revision: u64, cx: &mut Context<Self>) {
+        if revision != self.edit_revision {
+            self.reveal_caret = true;
+            cx.emit(Changed);
         }
     }
 
@@ -330,6 +438,14 @@ impl TextField {
     /// a bullet is three bytes and the key behind it usually is not.
     fn caret_from_click(&self, at: Point<Pixels>, window: &Window) -> Option<usize> {
         let bounds = self.last_bounds?;
+        if self.multiline && !self.masked {
+            let local = at - bounds.origin - point(theme::spacing::S, theme::spacing::S)
+                + point(px(0.0), self.scroll_offset);
+            return self
+                .layout
+                .as_ref()
+                .map(|layout| layout.index_at(local).min(self.content.len()));
+        }
         let visible = self.rendered(0..self.content.len());
         if visible.is_empty() {
             return Some(0);
@@ -375,15 +491,24 @@ impl TextField {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        let revision = self.edit_revision;
         let keystroke = &event.keystroke;
         let modifiers = keystroke.modifiers;
 
         if modifiers.control || modifiers.platform {
             match keystroke.key.as_str() {
+                "enter" if self.multiline && !self.masked => {
+                    cx.stop_propagation();
+                    _window.prevent_default();
+                    cx.emit(Submit);
+                    return;
+                }
+                "home" => self.move_caret(0, modifiers.shift),
+                "end" => self.move_caret(self.content.len(), modifiers.shift),
                 "v" => {
                     if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                         self.checkpoint(false);
-                        let range = self.selection.clone();
+                        let range = self.selection_range();
                         self.replace(range, &text);
                     }
                 }
@@ -395,11 +520,14 @@ impl TextField {
                 "y" => self.redo(),
                 // Never from a masked field: the API key does not leave here.
                 "c" if self.selection.start != self.selection.end && !self.masked => {
-                    let selected = self.content[self.selection.clone()].to_string();
+                    let selected = self.content[self.selection_range()].to_string();
                     cx.write_to_clipboard(ClipboardItem::new_string(selected));
                 }
                 _ => return,
             }
+            self.changed_since(revision, cx);
+            self.reveal_caret = true;
+            self.coalescing = false;
             cx.notify();
             return;
         }
@@ -408,15 +536,50 @@ impl TextField {
             "backspace" => self.delete_backwards(),
             "delete" => self.delete_forwards(),
             "left" => {
-                let to = self.previous_boundary();
+                let to = if !modifiers.shift && self.selection.start != self.selection.end {
+                    self.selection_range().start
+                } else {
+                    self.previous_boundary()
+                };
+                self.wrap_end = false;
                 self.move_caret(to, modifiers.shift);
             }
             "right" => {
-                let to = self.next_boundary();
+                let to = if !modifiers.shift && self.selection.start != self.selection.end {
+                    self.selection_range().end
+                } else {
+                    self.next_boundary()
+                };
+                self.wrap_end = false;
                 self.move_caret(to, modifiers.shift);
+            }
+            "up" | "down" | "home" | "end" if self.multiline && !self.masked => {
+                if let Some(layout) = &self.layout {
+                    let mut position = layout.position(self.selection.end, self.wrap_end);
+                    match keystroke.key.as_str() {
+                        "up" => position.y -= EDITOR_LINE_HEIGHT,
+                        "down" => position.y += EDITOR_LINE_HEIGHT,
+                        "home" => position.x = px(0.0),
+                        "end" => position.x = Pixels::MAX,
+                        _ => unreachable!(),
+                    }
+                    let to = layout.index_at(position);
+                    self.wrap_end = layout.position(to, false).y > position.y;
+                    self.move_caret(to, modifiers.shift);
+                }
             }
             "home" => self.move_caret(0, modifiers.shift),
             "end" => self.move_caret(self.content.len(), modifiers.shift),
+            "enter" if self.multiline && !self.masked => {
+                // Enter commits an IME candidate while a composition is active.
+                if self.marked.is_some() {
+                    return;
+                }
+                self.checkpoint(false);
+                self.replace(self.selection_range(), "\n");
+                cx.stop_propagation();
+                _window.prevent_default();
+            }
             "enter" => {
                 cx.emit(Submit);
                 return;
@@ -426,7 +589,186 @@ impl TextField {
             // character twice and break composition outright.
             _ => return,
         }
+        self.changed_since(revision, cx);
+        self.reveal_caret = true;
+        if !matches!(keystroke.key.as_str(), "backspace" | "delete") {
+            self.coalescing = false;
+        }
         cx.notify();
+    }
+
+    fn editor_layout(&self, width: Pixels, theme: Theme, window: &Window) -> EditorLayout {
+        let display = if self.content.is_empty() {
+            self.placeholder.text()
+        } else {
+            &self.content
+        };
+        let selection = self.selection_range();
+        let mut layout = EditorLayout {
+            lines: Vec::new(),
+            height: px(0.0),
+        };
+        let mut start = 0;
+        for paragraph in display.split('\n') {
+            let end = start + paragraph.len();
+            let mut boundaries = vec![start, end];
+            if !self.content.is_empty() {
+                boundaries.extend([
+                    selection.start.clamp(start, end),
+                    selection.end.clamp(start, end),
+                ]);
+                if let Some(marked) = &self.marked {
+                    boundaries
+                        .extend([marked.start.clamp(start, end), marked.end.clamp(start, end)]);
+                }
+            }
+            boundaries.sort_unstable();
+            boundaries.dedup();
+            let runs: Vec<_> = boundaries
+                .windows(2)
+                .map(|range| TextRun {
+                    len: range[1] - range[0],
+                    font: Font {
+                        family: theme::ui_font(),
+                        features: FontFeatures::default(),
+                        fallbacks: None,
+                        weight: FontWeight::NORMAL,
+                        style: FontStyle::Normal,
+                    },
+                    color: if self.content.is_empty() {
+                        theme.on_surface_variant.into()
+                    } else {
+                        theme.on_surface.into()
+                    },
+                    background_color: (!self.content.is_empty()
+                        && range[0] >= selection.start
+                        && range[1] <= selection.end)
+                        .then(|| crate::views::widgets::with_alpha(theme.primary, 0.35).into()),
+                    underline: self
+                        .marked
+                        .as_ref()
+                        .is_some_and(|marked| range[0] >= marked.start && range[1] <= marked.end)
+                        .then_some(gpui::UnderlineStyle {
+                            thickness: px(1.0),
+                            color: None,
+                            wavy: false,
+                        }),
+                    strikethrough: None,
+                })
+                .collect();
+            match window.text_system().shape_text(
+                paragraph.to_owned().into(),
+                theme::type_scale::BODY,
+                &runs,
+                Some(width.max(px(1.0))),
+                None,
+            ) {
+                Ok(shaped) => {
+                    for shaped in shaped {
+                        let height = shaped.size(EDITOR_LINE_HEIGHT).height;
+                        layout.lines.push(EditorLine {
+                            start,
+                            top: layout.height,
+                            shaped,
+                        });
+                        layout.height += height;
+                    }
+                }
+                Err(error) => tracing::error!(%error, "Text field layout failed"),
+            }
+            start = end + 1;
+        }
+        layout.height = layout.height.max(EDITOR_LINE_HEIGHT);
+        layout
+    }
+
+    fn render_multiline(&mut self, window: &Window, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let theme = Theme::ui(window);
+        let focused = self.focus_handle.is_focused(window);
+        let entity = cx.entity();
+        let focus_handle = self.focus_handle.clone();
+        div().id(self.id.clone()).role(Role::TextInput).aria_label(self.placeholder.text())
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                this.focus_handle.focus(window, cx);
+                if let Some(bounds) = this.last_bounds
+                    && event.position.x >= bounds.right() - px(12.0) {
+                        let viewport = bounds.size.height - theme::spacing::S * 2.0;
+                        let height = this.layout.as_ref().map_or(viewport, |layout| layout.height);
+                        let progress = ((event.position.y - bounds.origin.y) / bounds.size.height).clamp(0.0, 1.0);
+                        this.scroll_offset = (height - viewport).max(px(0.0)) * progress;
+                        this.reveal_caret = false;
+                        cx.notify();
+                        return;
+                }
+                if let Some(caret) = this.caret_from_click(event.position, window) {
+                    this.wrap_end = this.layout.as_ref().zip(this.last_bounds).is_some_and(|(layout, bounds)| {
+                        layout.position(caret, false).y > event.position.y - bounds.origin.y - theme::spacing::S + this.scroll_offset
+                    });
+                    this.move_caret(caret, event.modifiers.shift);
+                    this.coalescing = false;
+                    this.reveal_caret = true;
+                }
+                cx.notify();
+            }))
+            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
+                if let (Some(bounds), Some(layout)) = (this.last_bounds, &this.layout) {
+                    let viewport = bounds.size.height - theme::spacing::S * 2.0;
+                    this.scroll_offset = (this.scroll_offset - event.delta.pixel_delta(EDITOR_LINE_HEIGHT).y)
+                        .clamp(px(0.0), (layout.height - viewport).max(px(0.0)));
+                    this.reveal_caret = false;
+                    cx.stop_propagation();
+                    cx.notify();
+                }
+            }))
+            .w_full().h(px(220.0)).flex_none().rounded(theme::radius::SMALL)
+            .border_1().border_color(if focused { theme.primary } else { theme.outline_variant })
+            .bg(theme.surface).cursor_text().overflow_hidden()
+            .child(canvas(move |bounds, _, _| bounds, move |bounds, _, window, cx| {
+                entity.update(cx, |field, cx| {
+                    field.last_bounds = Some(bounds);
+                    let viewport = Bounds::new(bounds.origin + point(theme::spacing::S, theme::spacing::S),
+                        size((bounds.size.width - theme::spacing::S * 2.0 - px(12.0)).max(px(1.0)),
+                             (bounds.size.height - theme::spacing::S * 2.0).max(EDITOR_LINE_HEIGHT)));
+                    let layout = field.editor_layout(viewport.size.width, theme, window);
+                    let caret = if field.content.is_empty() { point(px(0.0), px(0.0)) } else { layout.position(field.selection.end, field.wrap_end) };
+                    if field.reveal_caret {
+                        if caret.y < field.scroll_offset { field.scroll_offset = caret.y; }
+                        if caret.y + EDITOR_LINE_HEIGHT > field.scroll_offset + viewport.size.height {
+                            field.scroll_offset = caret.y + EDITOR_LINE_HEIGHT - viewport.size.height;
+                        }
+                        field.reveal_caret = false;
+                    }
+                    let overflow = (layout.height - viewport.size.height).max(px(0.0));
+                    field.scroll_offset = field.scroll_offset.clamp(px(0.0), overflow);
+                    let origin = viewport.origin - point(px(0.0), field.scroll_offset);
+                    window.with_content_mask(Some(gpui::ContentMask { bounds: viewport }), |window| {
+                        for line in &layout.lines {
+                            let at = origin + point(px(0.0), line.top);
+                            let height = line.shaped.size(EDITOR_LINE_HEIGHT).height;
+                            if at.y + height < viewport.origin.y || at.y > viewport.bottom() { continue; }
+                            if let Err(error) = line.shaped.paint_background(at, EDITOR_LINE_HEIGHT, gpui::TextAlign::Left, None, window, cx) {
+                                tracing::error!(%error, "Text field selection paint failed");
+                            }
+                            if let Err(error) = line.shaped.paint(at, EDITOR_LINE_HEIGHT, gpui::TextAlign::Left, None, window, cx) {
+                                tracing::error!(%error, "Text field paint failed");
+                            }
+                        }
+                        if focused {
+                            window.paint_quad(fill(Bounds::new(origin + caret, size(px(1.5), EDITOR_LINE_HEIGHT)), theme.primary));
+                        }
+                    });
+                    if overflow > px(0.0) {
+                        let height = (viewport.size.height * (viewport.size.height / layout.height)).max(px(20.0)).min(viewport.size.height);
+                        let top = (viewport.size.height - height) * (field.scroll_offset / overflow);
+                        window.paint_quad(fill(Bounds::new(point(bounds.right() - px(8.0), viewport.origin.y + top), size(px(4.0), height)),
+                            crate::views::widgets::with_alpha(theme.on_surface_variant, 0.6)).corner_radii(px(2.0)));
+                    }
+                    field.layout = Some(layout);
+                });
+                window.handle_input(&focus_handle, ElementInputHandler::new(bounds, entity.clone()), cx);
+            }).size_full()).into_any_element()
     }
 
     fn rendered(&self, range: Range<usize>) -> String {
@@ -458,8 +800,8 @@ impl EntityInputHandler for TextField {
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
         Some(UTF16Selection {
-            range: self.utf16_range(self.selection.clone()),
-            reversed: false,
+            range: self.utf16_range(self.selection_range()),
+            reversed: self.selection.start > self.selection.end,
         })
     }
 
@@ -488,13 +830,23 @@ impl EntityInputHandler for TextField {
         // a committed composition replaces the text it was composing.
         let range = match range_utf16 {
             Some(range) => self.byte_range(range),
-            None => self.marked.clone().unwrap_or(self.selection.clone()),
+            None => self
+                .marked
+                .clone()
+                .unwrap_or_else(|| self.selection_range()),
         };
         // One character landing on a caret is typing and coalesces; a longer
         // string is a committed composition or a platform paste, and is not.
-        let typing = text.chars().count() == 1 && range.start == range.end;
-        self.checkpoint(typing);
+        let revision = self.edit_revision;
+        let typing = self.marked.is_none()
+            && text.chars().count() == 1
+            && text != "\n"
+            && range.start == range.end;
+        if self.marked.is_none() {
+            self.checkpoint(typing);
+        }
         self.replace(range, text);
+        self.changed_since(revision, cx);
         cx.notify();
     }
 
@@ -508,7 +860,10 @@ impl EntityInputHandler for TextField {
     ) {
         let range = match range_utf16 {
             Some(range) => self.byte_range(range),
-            None => self.marked.clone().unwrap_or(self.selection.clone()),
+            None => self
+                .marked
+                .clone()
+                .unwrap_or_else(|| self.selection_range()),
         };
         // Only the start of a composition is worth remembering: every keystroke
         // inside one rewrites the same marked run, and each would otherwise
@@ -516,8 +871,13 @@ impl EntityInputHandler for TextField {
         if self.marked.is_none() {
             self.checkpoint(false);
         }
-        let sanitized = new_text.replace(['\n', '\r'], " ");
-        let range = range.start.min(self.content.len())..range.end.min(self.content.len());
+        let revision = self.edit_revision;
+        let sanitized = self.sanitize(new_text);
+        let range = range.start.min(range.end).min(self.content.len())
+            ..range.start.max(range.end).min(self.content.len());
+        if self.content[range.clone()] != sanitized {
+            self.edit_revision += 1;
+        }
         self.content.replace_range(range.clone(), &sanitized);
 
         let marked = range.start..(range.start + sanitized.len());
@@ -525,39 +885,50 @@ impl EntityInputHandler for TextField {
         // its end when it does not say.
         self.selection = match new_selected_range {
             Some(selected) => {
-                let within = self.content[marked.clone()]
-                    .char_indices()
-                    .map(|(byte, _)| byte)
-                    .nth(selected.start)
-                    .unwrap_or(sanitized.len());
-                (marked.start + within)..(marked.start + within)
+                let start = self.byte_to_utf16(marked.start);
+                let length = sanitized.encode_utf16().count();
+                self.byte_range(
+                    (start + selected.start.min(length))..(start + selected.end.min(length)),
+                )
             }
             None => marked.end..marked.end,
         };
         self.marked = (!sanitized.is_empty()).then_some(marked);
+        self.changed_since(revision, cx);
         cx.notify();
     }
 
     fn bounds_for_range(
         &mut self,
-        _range_utf16: Range<usize>,
+        range_utf16: Range<usize>,
         element_bounds: Bounds<Pixels>,
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        // The whole field, not the caret: nothing here measures glyph
-        // positions, so the candidate window is placed against the control
-        // rather than pretending to know where the caret is.
+        // Multiline fields use the same shaped coordinates as hit testing.
+        if self.multiline && !self.masked {
+            let bounds = self.last_bounds?;
+            let position = self
+                .layout
+                .as_ref()?
+                .position(self.utf16_to_byte(range_utf16.start), self.wrap_end);
+            return Some(Bounds::new(
+                bounds.origin + point(theme::spacing::S, theme::spacing::S) + position
+                    - point(px(0.0), self.scroll_offset),
+                size(px(1.5), EDITOR_LINE_HEIGHT),
+            ));
+        }
         Some(self.last_bounds.unwrap_or(element_bounds))
     }
 
     fn character_index_for_point(
         &mut self,
-        _point: Point<Pixels>,
-        _window: &mut Window,
+        point: Point<Pixels>,
+        window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
-        None
+        self.caret_from_click(point, window)
+            .map(|index| self.byte_to_utf16(index))
     }
 
     fn text_length_utf16(
@@ -571,6 +942,9 @@ impl EntityInputHandler for TextField {
 
 impl Render for TextField {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.multiline && !self.masked {
+            return self.render_multiline(window, cx);
+        }
         let theme = Theme::ui(window);
         let focused = self.focus_handle.is_focused(window);
         let empty = self.content.is_empty();
@@ -599,8 +973,9 @@ impl Render for TextField {
             if focused && !has_selection && start == caret_at {
                 runs = runs.child(caret(theme));
             }
-            let selected =
-                has_selection && start >= self.selection.start && end <= self.selection.end;
+            let selected = has_selection
+                && start >= self.selection_range().start
+                && end <= self.selection_range().end;
             let composing = self
                 .marked
                 .as_ref()
@@ -705,6 +1080,7 @@ impl Render for TextField {
                     .text_color(theme.on_surface)
                     .into_any_element()
             })
+            .into_any_element()
     }
 }
 
@@ -969,5 +1345,221 @@ mod tests {
             assert!(field.is_empty());
             assert_eq!(field.selection, 0..0);
         });
+    }
+    #[gpui::test]
+    fn multiline_paste_preserves_lines_and_undo_selection(cx: &mut TestAppContext) {
+        let field = cx.new(|cx| TextField::new("editor", "text", cx).multiline());
+        let window = cx.add_window(|_, _| gpui::Empty);
+        cx.update_window(window.into(), |_, window, cx| {
+            field.update(cx, |field, cx| {
+                field.set_content("d\u{e9}but \u{1f600} fin");
+                field.selection = 7..11;
+                field.replace_text_in_range(None, "un\r\ndeux\rtrois", window, cx);
+                assert_eq!(field.content(), "d\u{e9}but un\ndeux\ntrois fin");
+                field.undo();
+                assert_eq!(field.content(), "d\u{e9}but \u{1f600} fin");
+                assert_eq!(field.selection, 7..11);
+                field.redo();
+                assert_eq!(field.content(), "d\u{e9}but un\ndeux\ntrois fin");
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn backwards_selection_can_be_replaced_and_reported_to_ime(cx: &mut TestAppContext) {
+        let field = field(cx);
+        let window = cx.add_window(|_, _| gpui::Empty);
+        cx.update_window(window.into(), |_, window, cx| {
+            field.update(cx, |field, cx| {
+                field.set_content("a\u{1f600}b");
+                field.move_caret(5, false);
+                field.move_caret(1, true);
+                let selected = field.selected_text_range(false, window, cx).unwrap();
+                assert_eq!(selected.range, 1..3);
+                assert!(selected.reversed);
+                field.replace_text_in_range(None, "\u{e9}", window, cx);
+                assert_eq!(field.content(), "a\u{e9}b");
+            });
+        })
+        .unwrap();
+    }
+    fn key(field: &mut TextField, key: &str, window: &mut Window, cx: &mut Context<TextField>) {
+        field.on_key_down(
+            &KeyDownEvent {
+                keystroke: gpui::Keystroke::parse(key).unwrap(),
+                is_held: false,
+                prefer_character_input: false,
+            },
+            window,
+            cx,
+        );
+    }
+
+    #[gpui::test]
+    fn editor_layout_tracks_newlines_wrapping_and_click_positions(cx: &mut TestAppContext) {
+        let field = cx.new(|cx| TextField::new("editor", "text", cx).multiline());
+        let window = cx.add_window(|_, _| gpui::Empty);
+        cx.update_window(window.into(), |_, window, cx| {
+            field.update(cx, |field, _| {
+                field.set_content("ab\n\u{1f600}\nlast\n");
+                let layout = field.editor_layout(px(400.0), Theme::ui(window), window);
+                assert_eq!(
+                    layout
+                        .lines
+                        .iter()
+                        .map(|line| line.start)
+                        .collect::<Vec<_>>(),
+                    [0, 3, 8, 13]
+                );
+                assert_eq!(layout.position(13, false).y, EDITOR_LINE_HEIGHT * 3);
+                assert_eq!(layout.index_at(point(px(0.0), EDITOR_LINE_HEIGHT)), 3);
+                assert_eq!(layout.index_at(point(px(500.0), EDITOR_LINE_HEIGHT)), 7);
+
+                field.set_content("alpha beta gamma delta epsilon zeta eta theta");
+                let layout = field.editor_layout(px(80.0), Theme::ui(window), window);
+                assert!(!layout.lines[0].shaped.wrap_boundaries().is_empty());
+                let boundary = layout.lines[0].shaped.wrap_boundaries()[0];
+                let index =
+                    layout.lines[0].shaped.runs()[boundary.run_ix].glyphs[boundary.glyph_ix].index;
+                let next_row = layout.position(index, false);
+                assert_eq!(next_row.x, px(0.0));
+                assert_eq!(next_row.y, EDITOR_LINE_HEIGHT);
+                assert_eq!(layout.position(index, true).y, px(0.0));
+                assert_eq!(layout.index_at(next_row), index);
+                field.last_bounds = Some(Bounds::new(
+                    point(px(10.0), px(20.0)),
+                    size(px(120.0), px(220.0)),
+                ));
+                field.layout = Some(layout);
+                assert_eq!(
+                    field.caret_from_click(
+                        point(
+                            px(10.0) + theme::spacing::S,
+                            px(20.0) + theme::spacing::S + EDITOR_LINE_HEIGHT
+                        ),
+                        window
+                    ),
+                    Some(index)
+                );
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn multiline_keys_move_by_line_and_enter_inserts_one_undoable_newline(cx: &mut TestAppContext) {
+        let field = cx.new(|cx| TextField::new("editor", "text", cx).multiline());
+        let submitted = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = submitted.clone();
+        let _subscription = cx
+            .update(|cx| cx.subscribe(&field, move |_, _: &Submit, _| count.set(count.get() + 1)));
+        let window = cx.add_window(|_, _| gpui::Empty);
+        cx.update_window(window.into(), |_, window, cx| {
+            field.update(cx, |field, cx| {
+                field.set_content("ab\ncd\nef");
+                field.layout = Some(field.editor_layout(px(400.0), Theme::ui(window), window));
+                field.move_caret(1, false);
+                key(field, "down", window, cx);
+                assert_eq!(field.selection, 4..4);
+                key(field, "home", window, cx);
+                assert_eq!(field.selection, 3..3);
+                key(field, "shift-end", window, cx);
+                assert_eq!(field.selection, 3..5);
+                key(field, "left", window, cx);
+                assert_eq!(
+                    field.selection,
+                    3..3,
+                    "left collapses a selection to its start"
+                );
+                key(field, "enter", window, cx);
+                assert_eq!(field.content(), "ab\n\ncd\nef");
+                key(field, "ctrl-z", window, cx);
+                assert_eq!(field.content(), "ab\ncd\nef");
+                key(field, "ctrl-enter", window, cx);
+                assert_eq!(field.content(), "ab\ncd\nef");
+            });
+        })
+        .unwrap();
+        assert_eq!(submitted.get(), 1);
+    }
+
+    #[gpui::test]
+    fn changed_reports_user_edits_undo_redo_but_not_reload_or_noop(cx: &mut TestAppContext) {
+        let field = field(cx);
+        let changed = std::rc::Rc::new(std::cell::Cell::new(0));
+        let count = changed.clone();
+        let _subscription = cx
+            .update(|cx| cx.subscribe(&field, move |_, _: &Changed, _| count.set(count.get() + 1)));
+        let window = cx.add_window(|_, _| gpui::Empty);
+        cx.update_window(window.into(), |_, window, cx| {
+            field.update(cx, |field, cx| {
+                field.set_content("loaded");
+                field.replace_text_in_range(None, "", window, cx);
+            });
+        })
+        .unwrap();
+        assert_eq!(changed.get(), 0);
+        cx.update_window(window.into(), |_, window, cx| {
+            field.update(cx, |field, cx| {
+                field.replace_text_in_range(None, "!", window, cx);
+                key(field, "ctrl-z", window, cx);
+                key(field, "ctrl-y", window, cx);
+            });
+        })
+        .unwrap();
+        assert_eq!(changed.get(), 3);
+    }
+
+    #[gpui::test]
+    fn ime_selection_counts_utf16_and_composition_undoes_once(cx: &mut TestAppContext) {
+        let field = field(cx);
+        let window = cx.add_window(|_, _| gpui::Empty);
+        cx.update_window(window.into(), |_, window, cx| {
+            field.update(cx, |field, cx| {
+                field.set_content("x");
+                field.replace_and_mark_text_in_range(
+                    None,
+                    "\u{1f600}\u{e9}",
+                    Some(2..3),
+                    window,
+                    cx,
+                );
+                assert_eq!(field.selection, 5..7);
+                field.replace_text_in_range(None, "ok", window, cx);
+                assert_eq!(field.content(), "xok");
+                field.undo();
+                assert_eq!(field.content(), "x");
+                assert!(field.undo.is_empty());
+            });
+        })
+        .unwrap();
+    }
+
+    #[gpui::test]
+    fn painting_a_long_editor_keeps_the_caret_in_the_scrolling_viewport(cx: &mut TestAppContext) {
+        let window = cx.add_window(|_, cx| TextField::new("editor", "text", cx).multiline());
+        let field = window.root(cx).unwrap();
+        cx.update_window(window.into(), |_, window, cx| {
+            field.update(cx, |field, cx| {
+                field.set_content("a long editable paragraph with Unicode \u{1f600}\n".repeat(100));
+                field.focus_handle.focus(window, cx);
+            });
+            window.draw(cx).clear(cx);
+            field.update(cx, |field, cx| {
+                assert!(field.scroll_offset > px(0.0));
+                let bounds = field.last_bounds.unwrap();
+                let length = field.text_length_utf16(window, cx).unwrap();
+                let caret = field
+                    .bounds_for_range(length..length, bounds, window, cx)
+                    .unwrap();
+                assert!(caret.origin.y >= bounds.origin.y);
+                assert!(caret.bottom() <= bounds.bottom());
+                key(field, "ctrl-home", window, cx);
+            });
+            window.draw(cx).clear(cx);
+            field.update(cx, |field, _| assert_eq!(field.scroll_offset, px(0.0)));
+        })
+        .unwrap();
     }
 }

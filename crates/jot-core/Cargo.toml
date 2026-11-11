@@ -24,6 +24,7 @@ cpal = "0.15"
 hound = "3.5"
 rusqlite = { version = "0.32", features = ["bundled", "time", "functions"] }
 unicode-segmentation = "1"
+tempfile = "3"
 keyring = { version = "3", features = ["windows-native"] }
 
 [target.'cfg(target_os = "windows")'.dependencies.windows]
@@ -44,5 +45,4 @@ features = [
 ]
 
 [dev-dependencies]
-tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }

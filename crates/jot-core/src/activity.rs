@@ -191,6 +191,10 @@ impl LocalCalendar {
     }
 
     pub(crate) fn date(&self, timestamp: OffsetDateTime) -> anyhow::Result<Date> {
+        Ok(self.datetime(timestamp)?.date())
+    }
+
+    fn datetime(&self, timestamp: OffsetDateTime) -> anyhow::Result<OffsetDateTime> {
         use windows::Win32::{
             Foundation::SYSTEMTIME, System::Time::SystemTimeToTzSpecificLocalTimeEx,
         };
@@ -206,11 +210,18 @@ impl LocalCalendar {
         };
         let mut local = SYSTEMTIME::default();
         unsafe { SystemTimeToTzSpecificLocalTimeEx(Some(&self.0), &universal, &mut local)? };
-        Ok(Date::from_calendar_date(
+        let wall = Date::from_calendar_date(
             local.wYear.into(),
             u8::try_from(local.wMonth)?.try_into()?,
             local.wDay.try_into()?,
-        )?)
+        )?
+        .with_hms(
+            local.wHour.try_into()?,
+            local.wMinute.try_into()?,
+            local.wSecond.try_into()?,
+        )?;
+        let seconds = wall.assume_utc().unix_timestamp() - utc.unix_timestamp();
+        Ok(timestamp.to_offset(time::UtcOffset::from_whole_seconds(seconds.try_into()?)?))
     }
 }
 
@@ -227,6 +238,18 @@ impl LocalCalendar {
         Ok(timestamp
             .to_offset(time::UtcOffset::local_offset_at(timestamp)?)
             .date())
+    }
+}
+
+/// Converts an instant using the operating system's time zone rules at that date.
+pub fn local_datetime(at: OffsetDateTime) -> anyhow::Result<OffsetDateTime> {
+    #[cfg(windows)]
+    {
+        LocalCalendar::current()?.datetime(at)
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(at.to_offset(time::UtcOffset::local_offset_at(at)?))
     }
 }
 
