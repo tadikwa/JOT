@@ -41,7 +41,7 @@ fn ui(en: &'static str, fr: &'static str) -> &'static str {
 }
 
 /// "2,56 Go" / "2.56 GB".
-fn size_label(bytes: u64) -> String {
+pub(super) fn size_label(bytes: u64) -> String {
     let gb = format!("{:.2}", bytes as f64 / 1e9);
     match crate::i18n::locale() {
         crate::i18n::Locale::En => format!("{gb} GB"),
@@ -49,7 +49,7 @@ fn size_label(bytes: u64) -> String {
     }
 }
 
-fn pack_source(pack: Pack) -> &'static str {
+pub(super) fn pack_source(pack: Pack) -> &'static str {
     match pack {
         Pack::Transcription => ui(
             "llama.cpp b12289 (MIT) from github.com/ggml-org, Qwen3-ASR 1.7B Q8_0 (Apache-2.0) from huggingface.co/ggml-org",

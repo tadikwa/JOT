@@ -29,32 +29,51 @@ use jot_core::audio;
 use jot_core::credentials;
 use jot_core::gemini::KeyCheck;
 use jot_core::hotkey::DictationActivationMode;
+use jot_core::local::{self, Download, Pack};
+use jot_core::settings::TranscriptionEngine;
 use jot_core::state_machine::{DictationOutcome, DictationState};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
+    Engine,
     Key,
+    Models,
     Microphone,
     TryIt,
     Done,
 }
 
-impl Step {
-    fn index(self) -> usize {
-        match self {
-            Step::Key => 1,
-            Step::Microphone => 2,
-            Step::TryIt => 3,
-            Step::Done => 4,
-        }
+/// What the first screen asks: no key is needed for local only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Choice {
+    Gemini,
+    Local,
+    Both,
+}
+
+/// The steps a choice goes through; before choosing, the Gemini path is shown.
+fn route(choice: Option<Choice>) -> &'static [Step] {
+    use Step::*;
+    match choice {
+        Some(Choice::Local) => &[Engine, Models, Microphone, TryIt, Done],
+        Some(Choice::Both) => &[Engine, Key, Models, Microphone, TryIt, Done],
+        _ => &[Engine, Key, Microphone, TryIt, Done],
     }
 }
 
-const TOTAL_STEPS: usize = 4;
+/// The local packs the "100 % local" choice installs: transcription and the
+/// fast editing model, the benchmarked default.
+const LOCAL_PACKS: [Pack; 2] = [Pack::Transcription, Pack::Fast];
 
 pub struct OnboardingView {
     services: Services,
     step: Step,
+    choice: Option<Choice>,
+    /// The pack being downloaded, once the user confirmed.
+    download: Option<Arc<Download>>,
     api_key: Entity<TextField>,
     status: Option<(LocalizedText, StatusTone)>,
     checking: bool,
@@ -101,16 +120,11 @@ impl OnboardingView {
         })
         .detach();
 
-        // Someone reopening setup with a key already stored starts past step 1.
-        let step = if credentials::api_key().is_some() {
-            Step::Microphone
-        } else {
-            Step::Key
-        };
-
         Self {
             services,
-            step,
+            step: Step::Engine,
+            choice: None,
+            download: None,
             api_key,
             status: None,
             checking: false,
@@ -165,7 +179,7 @@ impl OnboardingView {
                 match check {
                     KeyCheck::Valid if model.is_some() => {
                         this.status = Some((Msg::KeyWorks.into(), StatusTone::Good));
-                        this.step = Step::Microphone;
+                        this.step = this.after(Step::Key);
                     }
                     KeyCheck::Valid => {
                         // The key is fine; this model is not available to it.
@@ -184,13 +198,101 @@ impl OnboardingView {
                     KeyCheck::Unreachable => {
                         // Never strand someone behind a captive portal.
                         this.status = Some((Msg::KeyUnreachable.into(), StatusTone::Neutral));
-                        this.step = Step::Microphone;
+                        this.step = this.after(Step::Key);
                     }
                 }
                 cx.notify();
             });
         })
         .detach();
+    }
+
+    /// The step after `step` on the chosen route, past what is already done:
+    /// a stored key, installed models.
+    fn after(&self, step: Step) -> Step {
+        let route = route(self.choice);
+        let position = route.iter().position(|s| *s == step).unwrap_or(0);
+        route[position + 1..]
+            .iter()
+            .copied()
+            .find(|next| match next {
+                Step::Key => credentials::api_key().is_none(),
+                Step::Models => !LOCAL_PACKS.iter().all(|p| p.installed()),
+                _ => true,
+            })
+            .unwrap_or(Step::Done)
+    }
+
+    fn choose(&mut self, choice: Choice, cx: &mut Context<Self>) {
+        self.choice = Some(choice);
+        // "Both" starts on Gemini, which works the moment the key is checked;
+        // the local models are one click away in Settings once downloaded.
+        let engine = match choice {
+            Choice::Local => TranscriptionEngine::Local,
+            Choice::Gemini | Choice::Both => TranscriptionEngine::Gemini,
+        };
+        self.services
+            .settings
+            .update(Some("transcriptionEngine"), |s| {
+                s.transcription_engine = engine
+            });
+        self.status = None;
+        self.step = self.after(Step::Engine);
+        cx.notify();
+    }
+
+    /// Only after the explicit click on the button that states the size.
+    fn download_models(&mut self, cx: &mut Context<Self>) {
+        self.status = None;
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            for pack in LOCAL_PACKS.into_iter().filter(|p| !p.installed()) {
+                let progress = Arc::new(Download::default());
+                if this
+                    .update(cx, |this, cx| {
+                        this.download = Some(progress.clone());
+                        cx.notify();
+                    })
+                    .is_err()
+                {
+                    progress.cancel.store(true, Ordering::Relaxed);
+                    return;
+                }
+                jot_core::runtime::spawn(local::install(pack, progress.clone()));
+                while !progress.finished.load(Ordering::Acquire) {
+                    executor.timer(Duration::from_millis(300)).await;
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        // The window closed: do not keep downloading unseen.
+                        progress.cancel.store(true, Ordering::Relaxed);
+                        return;
+                    }
+                }
+                let error = progress.error.lock().clone();
+                if let Some(error) = error {
+                    let _ = this.update(cx, |this, cx| {
+                        this.download = None;
+                        this.status = Some(if error == local::CANCELLED {
+                            (Msg::ModelsLater.into(), StatusTone::Neutral)
+                        } else {
+                            (
+                                LocalizedText::with(Msg::ModelsFailed, &[&error]),
+                                StatusTone::Bad,
+                            )
+                        });
+                        cx.notify();
+                    });
+                    return;
+                }
+            }
+            let _ = this.update(cx, |this, cx| {
+                this.download = None;
+                this.status = Some((Msg::ModelsReady.into(), StatusTone::Good));
+                this.step = this.after(Step::Models);
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn check_microphone(&mut self, cx: &mut Context<Self>) {
@@ -232,6 +334,145 @@ impl OnboardingView {
         let key = hotkey_binding(settings.hotkey_binding());
         let toggle = settings.dictation_activation_mode == DictationActivationMode::Toggle;
         match self.step {
+            Step::Engine => {
+                let local_size = super::settings::size_label(
+                    LOCAL_PACKS.iter().map(|p| p.missing_bytes()).sum(),
+                );
+                let option = |id: &'static str,
+                              label: Msg,
+                              hint: String,
+                              choice: Choice,
+                              cx: &mut Context<Self>| {
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(theme::spacing::XS)
+                        .child(widgets::hug(widgets::button(
+                            id,
+                            tr(label),
+                            ButtonKind::Secondary,
+                            true,
+                            theme,
+                            cx.listener(move |this, _, _, cx| this.choose(choice, cx)),
+                        )))
+                        .child(paragraph(&hint, theme))
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(theme::spacing::M)
+                    .child(paragraph(tr(Msg::SetupEngineHint), theme))
+                    .child(option(
+                        "choose-gemini",
+                        Msg::ChooseGemini,
+                        tr(Msg::ChooseGeminiHint).to_string(),
+                        Choice::Gemini,
+                        cx,
+                    ))
+                    .child(option(
+                        "choose-local",
+                        Msg::ChooseLocal,
+                        tf(Msg::ChooseLocalHint, &[&local_size]),
+                        Choice::Local,
+                        cx,
+                    ))
+                    .child(option(
+                        "choose-both",
+                        Msg::ChooseBoth,
+                        tr(Msg::ChooseBothHint).to_string(),
+                        Choice::Both,
+                        cx,
+                    ))
+                    .into_any_element()
+            }
+
+            Step::Models => {
+                let missing: u64 = LOCAL_PACKS.iter().map(|p| p.missing_bytes()).sum();
+                let files = LOCAL_PACKS
+                    .iter()
+                    .flat_map(|pack| pack.artifacts())
+                    .map(|artifact| {
+                        paragraph(
+                            &format!(
+                                "• {} — {} — SHA-256 {}…",
+                                artifact.file,
+                                super::settings::size_label(artifact.bytes),
+                                &artifact.sha256[..16]
+                            ),
+                            theme,
+                        )
+                    });
+                let licences = LOCAL_PACKS
+                    .iter()
+                    .map(|pack| paragraph(super::settings::pack_source(*pack), theme));
+                let action = match &self.download {
+                    Some(progress) => {
+                        let progress = progress.clone();
+                        div()
+                            .flex()
+                            .flex_wrap()
+                            .items_center()
+                            .gap_2()
+                            .child(tf(
+                                Msg::DownloadingModels,
+                                &[&format!("{:.0}", progress.fraction() * 100.0)],
+                            ))
+                            .child(widgets::button(
+                                "cancel-models",
+                                tr(Msg::CancelDownload),
+                                ButtonKind::Secondary,
+                                true,
+                                theme,
+                                move |_, _, _| progress.cancel.store(true, Ordering::Relaxed),
+                            ))
+                            .into_any_element()
+                    }
+                    None => div()
+                        .flex()
+                        .flex_wrap()
+                        .gap_2()
+                        .child(widgets::button(
+                            "download-models",
+                            tf(
+                                Msg::DownloadModels,
+                                &[&super::settings::size_label(missing)],
+                            ),
+                            ButtonKind::Primary,
+                            true,
+                            theme,
+                            cx.listener(|this, _, _, cx| this.download_models(cx)),
+                        ))
+                        .child(widgets::button(
+                            "models-later",
+                            tr(Msg::ModelsLater),
+                            ButtonKind::Secondary,
+                            true,
+                            theme,
+                            cx.listener(|this, _, _, cx| {
+                                this.step = this.after(Step::Models);
+                                cx.notify();
+                            }),
+                        ))
+                        .into_any_element(),
+                };
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(theme::spacing::S)
+                    .child(paragraph(tr(Msg::SetupModelsHint), theme))
+                    .children(files)
+                    .children(licences)
+                    .child(paragraph(
+                        &tf(
+                            Msg::ModelsVerified,
+                            &[&local::local_root().display().to_string()],
+                        ),
+                        theme,
+                    ))
+                    .child(action)
+                    .into_any_element()
+            }
+
             Step::Key => div()
                 .flex()
                 .flex_col()
@@ -355,7 +596,7 @@ impl Render for OnboardingView {
             &self.scroll,
             vec![
                 widgets::heading(Msg::Setup).into_any_element(),
-                progress(step, theme).into_any_element(),
+                progress(step, self.choice, theme).into_any_element(),
                 body,
                 div()
                     .when_some(self.status.as_ref(), |row, (message, tone)| {
@@ -389,8 +630,13 @@ impl Render for OnboardingView {
     }
 }
 
-fn progress(step: Step, theme: Theme) -> impl IntoElement {
+fn progress(step: Step, choice: Option<Choice>, theme: Theme) -> impl IntoElement {
+    let route = route(choice);
+    let index = route.iter().position(|s| *s == step).unwrap_or(0) + 1;
+    let total = route.len();
     let label = match step {
+        Step::Engine => Msg::StepEngine,
+        Step::Models => Msg::StepModels,
         Step::Key => Msg::StepKey,
         Step::Microphone => Msg::StepMicrophone,
         Step::TryIt => Msg::StepTry,
@@ -407,16 +653,12 @@ fn progress(step: Step, theme: Theme) -> impl IntoElement {
                 .flex()
                 .items_center()
                 .gap(theme::spacing::XS)
-                .children((1..=TOTAL_STEPS).map(|index| {
+                .children((1..=total).map(|dot| {
                     div()
                         .h(px(6.0))
-                        .w(if index == step.index() {
-                            px(24.0)
-                        } else {
-                            px(6.0)
-                        })
+                        .w(if dot == index { px(24.0) } else { px(6.0) })
                         .rounded_full()
-                        .bg(if index <= step.index() {
+                        .bg(if dot <= index {
                             theme.primary
                         } else {
                             theme.outline_variant
@@ -432,13 +674,13 @@ fn progress(step: Step, theme: Theme) -> impl IntoElement {
                     div()
                         .text_size(theme::type_scale::LABEL)
                         .text_color(theme.on_surface_variant)
-                        .child(tf(Msg::Step, &[&step.index(), &TOTAL_STEPS])),
+                        .child(tf(Msg::Step, &[&index, &total])),
                 )
                 .child(div().font_weight(theme::weight::MEDIUM).child(tr(label))),
         )
 }
 
-fn paragraph(text: &str, theme: Theme) -> impl IntoElement {
+fn paragraph(text: &str, theme: Theme) -> impl IntoElement + use<> {
     div()
         .text_size(theme::type_scale::BODY)
         .text_color(theme.on_surface)
@@ -476,10 +718,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn every_step_is_within_the_advertised_count() {
-        for step in [Step::Key, Step::Microphone, Step::TryIt, Step::Done] {
-            assert!(step.index() >= 1 && step.index() <= TOTAL_STEPS);
+    fn local_only_never_asks_for_a_key_and_every_route_ends_done() {
+        assert!(!route(Some(Choice::Local)).contains(&Step::Key));
+        assert!(!route(Some(Choice::Gemini)).contains(&Step::Models));
+        assert!(route(Some(Choice::Both)).contains(&Step::Key));
+        assert!(route(Some(Choice::Both)).contains(&Step::Models));
+        for choice in [
+            None,
+            Some(Choice::Gemini),
+            Some(Choice::Local),
+            Some(Choice::Both),
+        ] {
+            let steps = route(choice);
+            assert_eq!(steps.first(), Some(&Step::Engine));
+            assert_eq!(steps.last(), Some(&Step::Done));
         }
-        assert_eq!(Step::Done.index(), TOTAL_STEPS);
     }
 }
