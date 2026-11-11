@@ -17,6 +17,11 @@
     rust-toolchain.toml; pass it explicitly if RUSTUP_TOOLCHAIN is set in your
     environment, because that variable overrides the pin.
 
+.PARAMETER TestBuild
+    Stage the isolated test variant: a jot-test-profile marker beside the
+    executable (data in <folder>\profile, startup entry locked) and the test
+    installer, which uses its own app id and never writes the real Run key.
+
 .PARAMETER CertificateThumbprint
     Optional. When given, signs the executable with that certificate from the
     current user's store before packaging.
@@ -29,7 +34,8 @@
 [CmdletBinding()]
 param(
     [string]$Toolchain,
-    [string]$CertificateThumbprint
+    [string]$CertificateThumbprint,
+    [switch]$TestBuild
 )
 
 $ErrorActionPreference = 'Stop'
@@ -68,7 +74,8 @@ try {
     $argv = Get-CargoArgv @('metadata', '--no-deps', '--format-version', '1')
     $manifest = & cargo @argv | ConvertFrom-Json
     $version = ($manifest.packages | Where-Object { $_.name -eq 'jot' }).version
-    $exe = Join-Path $root 'target/release/jot.exe'
+    # Honours CARGO_TARGET_DIR instead of assuming <repo>/target.
+    $exe = Join-Path $manifest.target_directory 'release/jot.exe'
     if (-not (Test-Path $exe)) { throw "missing $exe" }
 
     if ($CertificateThumbprint) {
@@ -80,7 +87,9 @@ try {
         Write-Warning 'No certificate given: the binary is UNSIGNED and SmartScreen will warn on first run.'
     }
 
-    $stage = Join-Path $root "target/dist/Jot-$version"
+    $suffix = if ($TestBuild) { '-test' } else { '' }
+    $dist = Join-Path $root 'target/dist'
+    $stage = Join-Path $dist "Jot-$version$suffix"
     if (Test-Path $stage) { Remove-Item -Recurse -Force $stage }
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
 
@@ -88,10 +97,29 @@ try {
     foreach ($file in @('LICENSE', 'THIRD_PARTY_NOTICES.md', 'README.md')) {
         Copy-Item (Join-Path $root $file) $stage
     }
+    Copy-Item (Join-Path $root 'docs/v15/NOTICE.md') (Join-Path $stage 'NOTICE-FR.md')
+    if ($TestBuild) { New-Item -ItemType File -Path (Join-Path $stage 'jot-test-profile') | Out-Null }
 
-    $zip = Join-Path $root "target/dist/Jot-$version-windows-x64.zip"
+    $zipName = if ($TestBuild) { "Jot-$version-test-portable.zip" } else { "Jot-$version-windows-x64.zip" }
+    $zip = Join-Path $dist $zipName
     if (Test-Path $zip) { Remove-Item -Force $zip }
     Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
+
+    $iscc = @(
+        (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source,
+        (Join-Path $env:LOCALAPPDATA 'Programs/Inno Setup 6/ISCC.exe'),
+        (Join-Path ${env:ProgramFiles(x86)} 'Inno Setup 6/ISCC.exe')
+    ) | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+    $setup = $null
+    if ($iscc) {
+        [string[]]$isccArgs = @("/DAppVersion=$version", "/DStage=$stage", "/DOutDir=$dist", '/Q')
+        if ($TestBuild) { $isccArgs += '/DTestBuild' }
+        & $iscc @isccArgs (Join-Path $root 'packaging/inno/jot.iss')
+        if ($LASTEXITCODE -ne 0) { throw 'installer compilation failed' }
+        $setup = Join-Path $dist "Jot-$version$suffix-setup.exe"
+    } else {
+        Write-Warning 'Inno Setup 6 (ISCC.exe) not found: no installer built, only the zip.'
+    }
 
     $signature = (Get-AuthenticodeSignature $exe).Status
     # The winget manifest needs this, and computing it by hand is a step people
@@ -101,11 +129,15 @@ try {
     Write-Host "Staged:  $stage"
     Write-Host "Zip:     $zip"
     Write-Host "SHA256:  $hash"
+    if ($setup) {
+        Write-Host "Setup:   $setup"
+        Write-Host "SHA256:  $((Get-FileHash -Path $setup -Algorithm SHA256).Hash)"
+    }
     Write-Host "Signed:  $signature"
     Write-Host ''
-    Write-Host 'Jot is portable: it needs no installer, keeps its data in'
-    Write-Host '%LOCALAPPDATA%\Jot, and adds itself to startup only when the user'
-    Write-Host 'turns that on in Settings.'
+    Write-Host 'The zip is the portable mode: no installer, data in %LOCALAPPDATA%\Jot'
+    Write-Host '(or <folder>\profile for a test build). The setup installs per user,'
+    Write-Host 'without administrator rights, and keeps the data when uninstalled.'
 }
 finally {
     Pop-Location
