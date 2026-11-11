@@ -18,14 +18,17 @@
 //! database only makes History fast to search and stats cheap, so a corrupt
 //! index is a rebuild rather than a data loss.
 
+use crate::activity::{Activity, LocalCalendar, Totals};
 use crate::file_layout;
 use crate::meta::{SessionMeta, SessionStatus};
 use anyhow::{Context, Result};
 use parking_lot::Mutex;
-use rusqlite::{Connection, OpenFlags, params};
+use rusqlite::{Connection, OpenFlags, functions::FunctionFlags, params};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use time::OffsetDateTime;
+use time::{Date, OffsetDateTime};
 use tokio::sync::broadcast;
+use unicode_segmentation::UnicodeSegmentation;
 
 /// History is a library of words plus things needing attention — never an event
 /// log. Visible: anything with a transcript; retryable failures and
@@ -41,6 +44,21 @@ const VISIBLE: &str = "(raw_transcript IS NOT NULL OR cleaned_transcript IS NOT 
 
 /// Error codes that a retry could plausibly clear.
 const RETRYABLE_ERROR_CODES: [&str; 3] = ["network", "timeout", "rate_limit"];
+const SUCCESS: &str =
+    "status IN ('inserted','copiedToClipboard','awaitingChip','heldSecure','recovered')
+    AND word_count > 0";
+const RETAINED_CANCEL: &str = "status = 'cancelled' AND duration_seconds >= 10";
+const HAS_DURATION: &str = "duration_seconds > 0 AND duration_seconds <= 1.7976931348623157e308";
+const HAS_PIPELINE: &str = "status != 'recovered' AND pipeline_seconds >= 0
+    AND pipeline_seconds <= 1.7976931348623157e308";
+
+fn activity_filter() -> String {
+    format!("({SUCCESS}) OR status IN ('failed','queuedForRetry') OR ({RETAINED_CANCEL})")
+}
+
+fn count_words(text: &str) -> i64 {
+    text.unicode_words().count() as i64
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DictationRecord {
@@ -96,8 +114,9 @@ pub struct Stats {
 }
 
 pub struct HistoryStore {
+    path: PathBuf,
     connection: Mutex<Connection>,
-    changes: broadcast::Sender<()>,
+    changes: broadcast::Sender<bool>,
 }
 
 impl HistoryStore {
@@ -112,6 +131,7 @@ impl HistoryStore {
         let connection = Self::open_or_recreate(path)?;
         let (changes, _) = broadcast::channel(16);
         let store = Self {
+            path: path.to_path_buf(),
             connection: Mutex::new(connection),
             changes,
         };
@@ -151,7 +171,10 @@ impl HistoryStore {
     }
 
     fn migrate(&self) -> Result<()> {
-        self.connection.lock().execute_batch(
+        let mut connection = self.connection.lock();
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS dictation (
                  id TEXT PRIMARY KEY,
                  folder TEXT NOT NULL,
@@ -164,33 +187,111 @@ impl HistoryStore {
                  cleaned_transcript TEXT,
                  error_code TEXT,
                  error_message TEXT,
-                 pipeline_seconds REAL
+                 pipeline_seconds REAL,
+                 word_count INTEGER NOT NULL DEFAULT 0
              );
              CREATE INDEX IF NOT EXISTS dictation_started_at ON dictation (started_at);
              CREATE INDEX IF NOT EXISTS dictation_status ON dictation (status);",
         )?;
+        let has_count: bool = transaction.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info('dictation') WHERE name = 'word_count')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_count {
+            transaction.create_scalar_function(
+                "jot_word_count",
+                1,
+                FunctionFlags::SQLITE_DETERMINISTIC,
+                |ctx| Ok(count_words(ctx.get_raw(0).as_str()?)),
+            )?;
+            transaction.execute_batch(
+                "ALTER TABLE dictation ADD COLUMN word_count INTEGER NOT NULL DEFAULT 0;
+                 UPDATE dictation SET word_count = jot_word_count(coalesce(cleaned_transcript, raw_transcript, ''));",
+            )?;
+        }
+        transaction.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS dictation_activity
+             ON dictation (started_at, status, word_count, duration_seconds, pipeline_seconds)
+             WHERE {}",
+            activity_filter()
+        ))?;
+        transaction.commit()?;
         Ok(())
     }
 
     /// Fires after any write so an open History pane refreshes as dictations
     /// land, retries drain, or rows are deleted — no polling.
-    pub fn subscribe(&self) -> broadcast::Receiver<()> {
+    /// The payload says whether the write can affect dashboard totals.
+    pub fn subscribe(&self) -> broadcast::Receiver<bool> {
         self.changes.subscribe()
     }
 
-    fn notify(&self) {
-        let _ = self.changes.send(());
+    fn notify(&self, affects_activity: bool) {
+        let _ = self.changes.send(affects_activity);
     }
 
     // ----- Writes
 
     pub fn upsert(&self, meta: &SessionMeta, folder: &Path) {
+        let connection = self.connection.lock();
+        let affects_activity = !meta.status.is_in_flight()
+            || connection
+                .query_row(
+                    &format!(
+                        "SELECT EXISTS (SELECT 1 FROM dictation WHERE id = ?1 AND ({}))",
+                        activity_filter()
+                    ),
+                    [meta.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap_or(true);
+        let result = Self::write_record(&connection, meta, folder);
+        drop(connection);
+        self.finish_upsert(result, affects_activity);
+    }
+
+    /// A retry may finish while the user deletes its original recording.
+    pub(crate) fn save_retry(&self, meta: &SessionMeta, folder: &Path) -> bool {
+        let result = (|| {
+            let connection = self.connection.lock();
+            let exists: bool = connection.query_row(
+                "SELECT EXISTS (SELECT 1 FROM dictation WHERE id = ?1)",
+                [meta.id.to_string()],
+                |row| row.get(0),
+            )?;
+            if !exists || !folder.is_dir() {
+                return Ok(None);
+            }
+            meta.write(folder);
+            Self::write_record(&connection, meta, folder).map(Some)
+        })();
+        match result {
+            Ok(None) => false,
+            Ok(Some(changed)) => {
+                if changed > 0 {
+                    self.notify(true);
+                }
+                true
+            }
+            Err(error) => {
+                self.finish_upsert(Err(error), true);
+                false
+            }
+        }
+    }
+
+    fn write_record(
+        connection: &Connection,
+        meta: &SessionMeta,
+        folder: &Path,
+    ) -> rusqlite::Result<usize> {
         let record = DictationRecord::from_meta(meta, folder);
-        let result = self.connection.lock().execute(
+        connection.execute(
             "INSERT INTO dictation (id, folder, started_at, status, target_app_name,
                  target_app_exe, duration_seconds, raw_transcript, cleaned_transcript,
-                 error_code, error_message, pipeline_seconds)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 error_code, error_message, pipeline_seconds, word_count)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
              ON CONFLICT(id) DO UPDATE SET
                  folder = excluded.folder, started_at = excluded.started_at,
                  status = excluded.status, target_app_name = excluded.target_app_name,
@@ -199,7 +300,15 @@ impl HistoryStore {
                  raw_transcript = excluded.raw_transcript,
                  cleaned_transcript = excluded.cleaned_transcript,
                  error_code = excluded.error_code, error_message = excluded.error_message,
-                 pipeline_seconds = excluded.pipeline_seconds",
+                 pipeline_seconds = excluded.pipeline_seconds, word_count = excluded.word_count
+             WHERE (dictation.folder, dictation.started_at, dictation.status, dictation.target_app_name,
+                    dictation.target_app_exe, dictation.duration_seconds, dictation.raw_transcript,
+                    dictation.cleaned_transcript, dictation.error_code, dictation.error_message,
+                    dictation.pipeline_seconds, dictation.word_count)
+                IS NOT (excluded.folder, excluded.started_at, excluded.status, excluded.target_app_name,
+                        excluded.target_app_exe, excluded.duration_seconds, excluded.raw_transcript,
+                        excluded.cleaned_transcript, excluded.error_code, excluded.error_message,
+                        excluded.pipeline_seconds, excluded.word_count)",
             params![
                 record.id,
                 record.folder.to_string_lossy(),
@@ -213,10 +322,15 @@ impl HistoryStore {
                 record.error_code,
                 record.error_message,
                 record.pipeline_seconds,
+                count_words(record.display_text()),
             ],
-        );
+        )
+    }
+
+    fn finish_upsert(&self, result: rusqlite::Result<usize>, affects_activity: bool) {
         match result {
-            Ok(_) => self.notify(),
+            Ok(changed) if changed > 0 => self.notify(affects_activity),
+            Ok(_) => {}
             Err(error) => tracing::error!(%error, "history upsert failed"),
         }
     }
@@ -232,7 +346,7 @@ impl HistoryStore {
                 if remove_folder && let Some(folder) = folder {
                     let _ = std::fs::remove_dir_all(folder);
                 }
-                self.notify();
+                self.notify(true);
             }
             Err(error) => tracing::error!(%error, "history delete failed"),
         }
@@ -246,7 +360,7 @@ impl HistoryStore {
         if let Err(error) = self.connection.lock().execute("DELETE FROM dictation", []) {
             tracing::error!(%error, "history delete-all failed");
         }
-        self.notify();
+        self.notify(true);
         if !remove_folders {
             return;
         }
@@ -400,34 +514,100 @@ impl HistoryStore {
     }
 
     pub fn stats(&self) -> Stats {
-        let rows: Vec<(String, Option<f64>)> = self.query(
-            "SELECT cleaned_transcript, duration_seconds FROM dictation
-             WHERE cleaned_transcript IS NOT NULL",
+        self.query(
+            &format!(
+                "SELECT coalesce(sum(word_count), 0), count(*),
+                        coalesce(60.0 * sum(word_count) FILTER (WHERE {HAS_DURATION})
+                                 / sum(duration_seconds) FILTER (WHERE {HAS_DURATION}), 0)
+                 FROM dictation WHERE {SUCCESS}"
+            ),
             &[],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok(Stats {
+                    total_words: row.get(0)?,
+                    total_dictations: row.get(1)?,
+                    average_wpm: row.get::<_, f64>(2)?.round() as u32,
+                })
+            },
+        )
+        .pop()
+        .unwrap_or_default()
+    }
+
+    pub fn activity(&self, now: OffsetDateTime) -> Result<Activity> {
+        let calendar = LocalCalendar::current()?;
+        let today = calendar.date(now)?;
+        self.activity_with(now, today, move |utc| calendar.date(utc))
+    }
+
+    fn activity_with(
+        &self,
+        now: OffsetDateTime,
+        today: Date,
+        local_date: impl Fn(OffsetDateTime) -> Result<Date> + Send + 'static,
+    ) -> Result<Activity> {
+        // WAL keeps this snapshot off the coordinator's write connection.
+        let connection = Connection::open_with_flags(&self.path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        connection.create_scalar_function(
+            "jot_local_day",
+            1,
+            FunctionFlags::SQLITE_DETERMINISTIC,
+            move |ctx| {
+                let timestamp = ctx.get::<i64>(0)?;
+                OffsetDateTime::from_unix_timestamp(timestamp)
+                    .map_err(anyhow::Error::from)
+                    .and_then(&local_date)
+                    .map(Date::to_julian_day)
+                    .map_err(|error| rusqlite::Error::UserFunctionError(error.into()))
+            },
+        )?;
+        let sql = format!(
+            "SELECT jot_local_day(started_at) AS day,
+                    coalesce(sum(word_count) FILTER (WHERE success), 0),
+                    count(*) FILTER (WHERE success),
+                    coalesce(sum(word_count) FILTER (WHERE timed), 0),
+                    count(*) FILTER (WHERE timed),
+                    coalesce(sum(duration_seconds) FILTER (WHERE timed), 0.0),
+                    count(*) FILTER (WHERE timed AND pipeline),
+                    coalesce(sum(pipeline_seconds) FILTER (WHERE timed AND pipeline), 0.0),
+                    count(*) FILTER (WHERE status = 'failed'),
+                    count(*) FILTER (WHERE status = 'cancelled'),
+                    count(*) FILTER (WHERE status = 'queuedForRetry')
+             FROM (
+                 SELECT started_at, word_count, status, duration_seconds, pipeline_seconds,
+                        ({SUCCESS}) AS success,
+                        ({SUCCESS}) AND ({HAS_DURATION}) AS timed,
+                        ({HAS_PIPELINE}) AS pipeline
+                 FROM dictation INDEXED BY dictation_activity
+                 WHERE ({}) AND started_at <= ?1
+             )
+             GROUP BY day ORDER BY day",
+            activity_filter(),
         );
-        let mut total_words = 0;
-        let mut timed_words = 0;
-        let mut speech = 0.0;
-        for (text, duration) in &rows {
-            // Whitespace-aware split, so newlines count as separators too.
-            let count = text.split_whitespace().count();
-            total_words += count;
-            if let Some(duration) = duration.filter(|d| *d > 0.0) {
-                timed_words += count;
-                speech += duration;
+        let mut statement = connection.prepare(&sql)?;
+        let mut rows = statement.query([now.unix_timestamp()])?;
+        let mut days = BTreeMap::new();
+        while let Some(row) = rows.next()? {
+            let date = Date::from_julian_day(row.get(0)?)?;
+            if date <= today {
+                days.insert(
+                    date,
+                    Totals {
+                        words: row.get(1)?,
+                        dictations: row.get(2)?,
+                        timed_words: row.get(3)?,
+                        timed_dictations: row.get(4)?,
+                        audio_seconds: row.get(5)?,
+                        measured_pipeline: row.get(6)?,
+                        pipeline_seconds: row.get(7)?,
+                        failed: row.get(8)?,
+                        cancelled: row.get(9)?,
+                        queued: row.get(10)?,
+                    },
+                );
             }
         }
-        Stats {
-            total_words,
-            total_dictations: rows.len(),
-            // Words per minute only over rows that actually have a duration.
-            average_wpm: if speech > 10.0 {
-                (timed_words as f64 / (speech / 60.0)) as u32
-            } else {
-                0
-            },
-        }
+        Ok(Activity { today, days })
     }
 }
 
@@ -630,6 +810,128 @@ mod tests {
         assert_eq!(stats.total_words, 6);
         assert_eq!(stats.total_dictations, 2);
         assert_eq!(stats.average_wpm, 4);
+    }
+
+    #[test]
+    fn dashboard_uses_final_words_weighted_duration_and_latest_session_status() {
+        use time::macros::{date, datetime, offset};
+        let (temp, store) = store();
+        let now = datetime!(2026-09-02 22:30 UTC);
+        let local_day = date!(2026 - 09 - 03);
+        let snapshot = || {
+            store
+                .activity_with(now, local_day, |utc| Ok(utc.to_offset(offset!(+2)).date()))
+                .unwrap()
+        };
+        let mut changes = store.subscribe();
+        let mut first = SessionMeta::new(uuid::Uuid::new_v4(), now, SessionStatus::Inserted);
+        first.cleaned_transcript = Some("L’heure\tarrive.\nÉcoute-moi ! 🎙".into());
+        first.raw_transcript = Some("ignored raw text".into());
+        first.audio_duration_seconds = Some(15.0);
+        first.pipeline_seconds = Some(3.0);
+        store.upsert(&first, temp.path());
+        assert_eq!(changes.try_recv(), Ok(true));
+        assert_eq!(snapshot().days[&local_day].words, 4);
+
+        let mut retry = SessionMeta::new(uuid::Uuid::new_v4(), now, SessionStatus::Failed);
+        retry.audio_duration_seconds = Some(45.0);
+        store.upsert(&retry, temp.path());
+        assert_eq!(snapshot().days[&local_day].failed, 1);
+        retry.status = SessionStatus::Recovered;
+        retry.raw_transcript = Some("un deux".into());
+        retry.pipeline_seconds = Some(99.0);
+        assert!(store.save_retry(&retry, temp.path()));
+        assert!(store.save_retry(&retry, temp.path()));
+        let mut untimed = SessionMeta::new(uuid::Uuid::new_v4(), now, SessionStatus::HeldSecure);
+        untimed.cleaned_transcript = Some("encore".into());
+        store.upsert(&untimed, temp.path());
+        for status in [
+            SessionStatus::Silent,
+            SessionStatus::Transcribing,
+            SessionStatus::Cancelled,
+            SessionStatus::QueuedForRetry,
+        ] {
+            let mut row = SessionMeta::new(uuid::Uuid::new_v4(), now, status);
+            row.raw_transcript = Some("do not count".into());
+            row.audio_duration_seconds = Some(20.0);
+            store.upsert(&row, temp.path());
+        }
+
+        let totals = snapshot().days[&local_day];
+        assert_eq!(totals.words, 7);
+        assert_eq!(totals.dictations, 3);
+        assert_eq!((totals.failed, totals.cancelled, totals.queued), (0, 1, 1));
+        assert_eq!(totals.timed_dictations, 2);
+        assert_eq!(totals.measured_pipeline, 1);
+        assert_eq!(totals.wpm(), Some(6.0));
+        assert_eq!(totals.estimated_seconds_saved(30), Some(-51.0));
+        assert_eq!(Totals::default().estimated_seconds_saved(30), None);
+
+        first.cleaned_transcript = Some("texte corrigé".into());
+        store.upsert(&first, temp.path());
+        assert_eq!(snapshot().days[&local_day].words, 5);
+        while changes.try_recv().is_ok() {}
+        store.delete(&retry.id.to_string(), false);
+        assert_eq!(changes.try_recv(), Ok(true));
+        assert!(!store.save_retry(&retry, temp.path()));
+        assert_eq!(snapshot().days[&local_day].words, 3);
+        store.delete_all(false, None);
+        assert_eq!(changes.try_recv(), Ok(true));
+        assert!(snapshot().days.is_empty());
+    }
+
+    #[test]
+    fn dashboard_backfills_a_legacy_index_without_altering_transcripts() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy.sqlite");
+        let connection = Connection::open(&path).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE dictation (
+                id TEXT PRIMARY KEY, folder TEXT NOT NULL, started_at INTEGER NOT NULL, status TEXT NOT NULL,
+                target_app_name TEXT, target_app_exe TEXT, duration_seconds REAL, raw_transcript TEXT,
+                cleaned_transcript TEXT, error_code TEXT, error_message TEXT, pipeline_seconds REAL
+             );
+             INSERT INTO dictation (id, folder, started_at, status, raw_transcript)
+             VALUES ('old', 'old', 1770000000, 'recovered', 'Déjà là !');",
+        ).unwrap();
+        drop(connection);
+        for _ in 0..2 {
+            let store = HistoryStore::open(&path).unwrap();
+            assert_eq!(store.stats().total_words, 2);
+            assert_eq!(
+                store.record("old").unwrap().raw_transcript.as_deref(),
+                Some("Déjà là !")
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "performance measurement on an isolated 100,000-row index"]
+    fn dashboard_large_history() {
+        let (_temp, store) = store();
+        let mut connection = store.connection.lock();
+        let transaction = connection.transaction().unwrap();
+        transaction.execute_batch(
+            "WITH RECURSIVE samples(n) AS (VALUES(0) UNION ALL SELECT n + 1 FROM samples WHERE n < 99999)
+             INSERT INTO dictation (id, folder, started_at, status, cleaned_transcript, word_count, duration_seconds)
+             SELECT n, 'fixture', 1740000000 + n * 360, 'inserted',
+                    replace(hex(zeroblob(256)), '0', 'a') || ' words', 2, 4 FROM samples;",
+        ).unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let result = store.activity(OffsetDateTime::now_utc()).unwrap();
+            let elapsed = started.elapsed();
+            assert_eq!(
+                result.days.values().map(|day| day.words).sum::<u64>(),
+                200_000
+            );
+            eprintln!(
+                "100,000 sessions → {} local days in {elapsed:?}",
+                result.days.len()
+            );
+        }
     }
 
     #[test]

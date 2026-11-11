@@ -2977,7 +2977,7 @@ dependencies = [
 
 [[package]]
 name = "jot"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "gpui",
@@ -2988,6 +2988,7 @@ dependencies = [
  "rodio",
  "serde",
  "serde_json",
+ "tempfile",
  "time",
  "tokio",
  "tracing",
@@ -2999,7 +3000,7 @@ dependencies = [
 
 [[package]]
 name = "jot-core"
-version = "1.1.0"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3018,6 +3019,7 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
+ "unicode-segmentation",
  "uuid",
  "windows 0.58.0",
 ]

@@ -25,7 +25,7 @@ pub const ENTRY_NAME: &str = "Jot";
 /// path with spaces (`C:\Program Files\...`) is not split into arguments.
 pub fn launch_command() -> Option<String> {
     let exe = std::env::current_exe().ok()?;
-    Some(format!("\"{}\"", exe.display()))
+    Some(format!("\"{}\" --background", exe.display()))
 }
 
 pub fn is_enabled() -> bool {
@@ -167,7 +167,7 @@ mod tests {
     fn the_command_is_quoted_so_program_files_still_works() {
         let command = launch_command().expect("the running exe has a path");
         assert!(
-            command.starts_with('"') && command.ends_with('"'),
+            command.starts_with('"') && command.ends_with("\" --background"),
             "{command}"
         );
         assert!(command.to_lowercase().contains("jot"), "{command}");

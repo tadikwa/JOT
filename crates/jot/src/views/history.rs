@@ -25,7 +25,7 @@ use crate::text_field::{self, Submit, TextField};
 use crate::theme::{self, Theme};
 use crate::views::widgets::{self, ButtonKind, StatusTone};
 use gpui::{Context, Entity, Role, SharedString, Window, div, prelude::*, px, uniform_list};
-use jot_core::history::DictationRecord;
+use jot_core::history::{DictationRecord, Stats};
 use jot_core::meta::SessionStatus;
 use jot_core::recovery::RetryOutcome;
 use time::OffsetDateTime;
@@ -41,6 +41,7 @@ pub struct HistoryView {
     services: Services,
     search: Entity<TextField>,
     records: Vec<DictationRecord>,
+    stats: Stats,
     pending_delete: Option<String>,
     status: Option<(Msg, StatusTone)>,
     _subscriptions: Vec<gpui::Subscription>,
@@ -57,7 +58,11 @@ impl HistoryView {
         // deleted — no polling.
         let mut changes = services.history.subscribe();
         cx.spawn(async move |this, cx| {
-            while changes.recv().await.is_ok() {
+            while !matches!(
+                changes.recv().await,
+                Err(tokio::sync::broadcast::error::RecvError::Closed)
+            ) {
+                while changes.try_recv().is_ok() {}
                 if this.update(cx, |this, cx| this.reload(cx)).is_err() {
                     break;
                 }
@@ -69,6 +74,7 @@ impl HistoryView {
             services,
             search,
             records: Vec::new(),
+            stats: Stats::default(),
             pending_delete: None,
             status: None,
             _subscriptions: vec![subscription],
@@ -81,6 +87,7 @@ impl HistoryView {
         let query = self.search.read(cx).content().to_string();
         let query = (!query.trim().is_empty()).then_some(query);
         self.records = self.services.history.records(query.as_deref(), PAGE_SIZE);
+        self.stats = self.services.history.stats();
         cx.notify();
     }
 
@@ -268,7 +275,7 @@ impl HistoryView {
 impl Render for HistoryView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = Theme::ui(window);
-        let stats = self.services.history.stats();
+        let stats = self.stats;
         let count = self.records.len();
         let records = self.records.clone();
 

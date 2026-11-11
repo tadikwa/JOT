@@ -16,6 +16,7 @@
 //! formatting, insertion and history. No UI framework leaks in here, so every
 //! failure mode is exercisable without launching the app.
 
+pub mod activity;
 pub mod audio;
 pub mod coordinator;
 pub mod credentials;

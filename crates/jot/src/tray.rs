@@ -31,6 +31,7 @@ pub enum TrayCommand {
     /// Start or stop a hands-free dictation from the menu, for anyone who
     /// cannot hold the key.
     ToggleDictation,
+    OpenDashboard,
     OpenHistory,
     OpenDictionary,
     OpenSettings,
@@ -49,6 +50,7 @@ impl TrayCommand {
             5 => TrayCommand::OpenOnboarding,
             6 => TrayCommand::About,
             7 => TrayCommand::Quit,
+            8 => TrayCommand::OpenDashboard,
             _ => return None,
         })
     }
@@ -62,6 +64,7 @@ impl TrayCommand {
             TrayCommand::OpenOnboarding => 5,
             TrayCommand::About => 6,
             TrayCommand::Quit => 7,
+            TrayCommand::OpenDashboard => 8,
         }
     }
 
@@ -74,6 +77,7 @@ impl TrayCommand {
                     tr(Msg::StartDictation)
                 }
             }
+            TrayCommand::OpenDashboard => tr(Msg::Dashboard),
             TrayCommand::OpenHistory => tr(Msg::History),
             TrayCommand::OpenDictionary => tr(Msg::Dictionary),
             TrayCommand::OpenSettings => tr(Msg::Settings),
@@ -84,8 +88,9 @@ impl TrayCommand {
     }
 }
 
-const MENU_ORDER: [TrayCommand; 7] = [
+const MENU_ORDER: [TrayCommand; 8] = [
     TrayCommand::ToggleDictation,
+    TrayCommand::OpenDashboard,
     TrayCommand::OpenHistory,
     TrayCommand::OpenDictionary,
     TrayCommand::OpenSettings,
@@ -309,7 +314,7 @@ mod platform {
                 match event {
                     // A left click is the fast path to the thing people open
                     // most; the full menu is on the right button.
-                    WM_LBUTTONUP => emit(TrayCommand::OpenHistory),
+                    WM_LBUTTONUP => emit(TrayCommand::OpenDashboard),
                     WM_RBUTTONUP => unsafe { show_menu(hwnd) },
                     _ => {}
                 }

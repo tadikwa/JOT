@@ -195,15 +195,18 @@ impl RetryQueue {
         if meta.raw_transcript.is_some() {
             meta.status = SessionStatus::Recovered;
             meta.error_code = None;
-            self.commit(&meta, &folder);
-            return ProcessResult::Recovered;
+            return if self.store.save_retry(&meta, &folder) {
+                ProcessResult::Recovered
+            } else {
+                ProcessResult::Skipped
+            };
         }
 
         let audio = file_layout::audio_wav(&folder);
         if !audio.exists() {
             meta.status = SessionStatus::Failed;
             meta.error_code = Some("audio_purged".into());
-            self.commit(&meta, &folder);
+            self.store.save_retry(&meta, &folder);
             return ProcessResult::Failed;
         }
 
@@ -225,8 +228,11 @@ impl RetryQueue {
                 // Recovered, NOT AwaitingChip: the text was never put on the
                 // clipboard, so no chip may promise "Ready to paste".
                 meta.status = SessionStatus::Recovered;
-                self.commit(&meta, &folder);
-                ProcessResult::Recovered
+                if self.store.save_retry(&meta, &folder) {
+                    ProcessResult::Recovered
+                } else {
+                    ProcessResult::Skipped
+                }
             }
             Err(
                 error @ (TranscriptionError::Offline
@@ -247,7 +253,7 @@ impl RetryQueue {
                 meta.error_code = Some("model".into());
                 meta.error_message =
                     Some(detail.unwrap_or(format!("model {model} not accessible")));
-                self.commit(&meta, &folder);
+                self.store.save_retry(&meta, &folder);
                 ProcessResult::Failed
             }
             // Permanent: mark it failed so the queue never spins on it.
@@ -255,21 +261,16 @@ impl RetryQueue {
                 meta.status = SessionStatus::Failed;
                 meta.error_code = Some("bad_request".into());
                 meta.error_message = Some(message);
-                self.commit(&meta, &folder);
+                self.store.save_retry(&meta, &folder);
                 ProcessResult::Failed
             }
             Err(error) => {
                 meta.status = SessionStatus::Failed;
                 meta.error_code = Some(format!("retry_{error}"));
-                self.commit(&meta, &folder);
+                self.store.save_retry(&meta, &folder);
                 ProcessResult::Failed
             }
         }
-    }
-
-    fn commit(&self, meta: &SessionMeta, folder: &Path) {
-        meta.write(folder);
-        self.store.upsert(meta, folder);
     }
 }
 
@@ -337,8 +338,7 @@ impl RecoveryScanner {
             // a dead-end "no audio" failure.
             if meta.raw_transcript.is_some() {
                 meta.status = SessionStatus::Recovered;
-                self.commit(&meta, &folder);
-                if index == 0 {
+                if self.store.save_retry(&meta, &folder) && index == 0 {
                     self.announce();
                 }
                 continue;
@@ -348,7 +348,7 @@ impl RecoveryScanner {
             if !audio.exists() {
                 meta.status = SessionStatus::Failed;
                 meta.error_code = Some("no_audio_file".into());
-                self.commit(&meta, &folder);
+                self.store.save_retry(&meta, &folder);
                 continue;
             }
 
@@ -356,7 +356,7 @@ impl RecoveryScanner {
                 // Older interruptions: keep the audio, mark for manual retry.
                 meta.status = SessionStatus::QueuedForRetry;
                 meta.error_code.get_or_insert_with(|| "recovered".into());
-                self.commit(&meta, &folder);
+                self.store.save_retry(&meta, &folder);
                 continue;
             }
 
@@ -378,13 +378,14 @@ impl RecoveryScanner {
                     // Text ready, the user decides in History — never on the
                     // clipboard, because nothing put it there.
                     meta.status = SessionStatus::Recovered;
-                    self.commit(&meta, &folder);
-                    self.announce();
-                    tracing::info!(id = %record.id, "recovered an interrupted dictation");
+                    if self.store.save_retry(&meta, &folder) {
+                        self.announce();
+                        tracing::info!(id = %record.id, "recovered an interrupted dictation");
+                    }
                 }
                 Err(error) => {
                     meta.status = SessionStatus::QueuedForRetry;
-                    self.commit(&meta, &folder);
+                    self.store.save_retry(&meta, &folder);
                     tracing::warn!(%error, "recovery transcription failed — queued");
                 }
             }
@@ -395,11 +396,6 @@ impl RecoveryScanner {
         if let Some(on_recovered) = self.on_recovered.lock().as_ref() {
             on_recovered("Recovered your last dictation — it's in History".into());
         }
-    }
-
-    fn commit(&self, meta: &SessionMeta, folder: &Path) {
-        meta.write(folder);
-        self.store.upsert(meta, folder);
     }
 }
 

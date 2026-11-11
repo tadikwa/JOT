@@ -17,7 +17,7 @@
 
 use crate::i18n::{Msg, tr};
 use crate::services::Services;
-use crate::text_field::TextField;
+use crate::text_field::{Submit, TextField};
 use crate::theme::{self, Theme};
 use crate::views::widgets::{self, ButtonKind, StatusTone};
 use gpui::{AnyElement, Context, Entity, Role, SharedString, Window, div, prelude::*, px};
@@ -76,6 +76,9 @@ pub struct SettingsView {
     endpoint: Entity<TextField>,
     transcribe_model: Entity<TextField>,
     cleanup_model: Entity<TextField>,
+    typing_wpm: Entity<TextField>,
+    typing_status: Option<(Msg, StatusTone)>,
+    _typing_submit: gpui::Subscription,
     key_status: Option<(Msg, StatusTone)>,
     advanced_status: Option<(Msg, StatusTone)>,
     /// True once the user has asked to wipe everything and been shown what
@@ -104,6 +107,14 @@ impl SettingsView {
             cx.new(|cx| TextField::new("settings-transcribe-model", "gemini-3.5-transcribe", cx));
         let cleanup_model =
             cx.new(|cx| TextField::new("settings-cleanup-model", "gemini-3.5-flash-lite", cx));
+        let typing_wpm = cx.new(|cx| {
+            let mut field = TextField::new("settings-typing-wpm", Msg::TypingSpeed, cx);
+            field.set_content(settings.typing_wpm().to_string());
+            field
+        });
+        let typing_submit = cx.subscribe(&typing_wpm, |this, _, _: &Submit, cx| {
+            this.save_typing_wpm(cx);
+        });
 
         endpoint.update(cx, |field, _| {
             field.set_content(settings.endpoint_override.clone().unwrap_or_default())
@@ -128,6 +139,9 @@ impl SettingsView {
             endpoint,
             transcribe_model,
             cleanup_model,
+            typing_wpm,
+            typing_status: None,
+            _typing_submit: typing_submit,
             key_status: None,
             advanced_status: None,
             confirming_delete_all: false,
@@ -232,6 +246,25 @@ impl SettingsView {
         self.advanced_status = Some((Msg::AdvancedSaved, StatusTone::Good));
         cx.notify();
     }
+
+    fn save_typing_wpm(&mut self, cx: &mut Context<Self>) {
+        let value = self.typing_wpm.read(cx).content().trim().parse::<u16>();
+        self.typing_status = match value {
+            Ok(wpm) if Settings::TYPING_WPM_RANGE.contains(&wpm) => {
+                self.services
+                    .settings
+                    .update(Some("typingWpm"), |settings| settings.typing_wpm = wpm);
+                self.typing_wpm.update(cx, |field, cx| {
+                    field.set_content(wpm.to_string());
+                    cx.notify();
+                });
+                Some((Msg::TypingSaved, StatusTone::Good))
+            }
+            _ => Some((Msg::TypingInvalid, StatusTone::Bad)),
+        };
+        cx.refresh_windows();
+        cx.notify();
+    }
 }
 
 impl SettingsView {
@@ -266,6 +299,35 @@ impl SettingsView {
                             "autostart-error",
                             tr(Msg::AutostartError),
                             StatusTone::Bad,
+                            theme,
+                        ))
+                    })
+                    .into_any_element(),
+                widgets::field_row(
+                    tr(Msg::TypingSpeed),
+                    tr(Msg::TypingSpeedHint),
+                    theme,
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(theme::spacing::XS)
+                        .child(div().w(px(110.0)).child(self.typing_wpm.clone()))
+                        .child(widgets::button(
+                            "save-typing-wpm",
+                            tr(Msg::Save),
+                            ButtonKind::Secondary,
+                            true,
+                            theme,
+                            cx.listener(|this, _, _, cx| this.save_typing_wpm(cx)),
+                        )),
+                )
+                .into_any_element(),
+                div()
+                    .when_some(self.typing_status, |row, (message, tone)| {
+                        row.child(widgets::status_line(
+                            "typing-status",
+                            tr(message),
+                            tone,
                             theme,
                         ))
                     })

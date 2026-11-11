@@ -14,6 +14,7 @@
 
 //! Jot’s workspace and auxiliary windows. Closing them leaves dictation available.
 
+pub mod dashboard;
 pub mod dictionary;
 pub mod history;
 pub mod onboarding;
@@ -93,16 +94,23 @@ fn open_tool_window<V: 'static + Render>(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Route {
+    Dashboard,
     History,
     Dictionary,
     Settings,
 }
 
 impl Route {
-    const ALL: [Self; 3] = [Self::History, Self::Dictionary, Self::Settings];
+    const ALL: [Self; 4] = [
+        Self::Dashboard,
+        Self::History,
+        Self::Dictionary,
+        Self::Settings,
+    ];
 
     fn label(self) -> Msg {
         match self {
+            Self::Dashboard => Msg::Dashboard,
             Self::History => Msg::History,
             Self::Dictionary => Msg::Dictionary,
             Self::Settings => Msg::Settings,
@@ -139,6 +147,7 @@ pub fn open_workspace(route: Route, services: &Services, cx: &mut App) {
 struct WorkspaceView {
     route: Route,
     services: Services,
+    dashboard: Option<Entity<dashboard::DashboardView>>,
     history: Option<Entity<history::HistoryView>>,
     dictionary: Option<Entity<dictionary::DictionaryView>>,
     settings: Option<Entity<settings::SettingsView>>,
@@ -149,6 +158,7 @@ impl WorkspaceView {
         let mut view = Self {
             route,
             services,
+            dashboard: None,
             history: None,
             dictionary: None,
             settings: None,
@@ -160,6 +170,11 @@ impl WorkspaceView {
     fn navigate(&mut self, route: Route, cx: &mut Context<Self>) {
         if self.route != route {
             match self.route {
+                Route::Dashboard => {
+                    if let Some(view) = &self.dashboard {
+                        view.update(cx, dashboard::DashboardView::pause);
+                    }
+                }
                 Route::History => {
                     if let Some(view) = &self.history {
                         view.update(cx, history::HistoryView::dismiss_confirmation);
@@ -174,6 +189,17 @@ impl WorkspaceView {
             }
         }
         match route {
+            Route::Dashboard => {
+                let dashboard = self.dashboard.get_or_insert_with(|| {
+                    cx.new(|_| {
+                        dashboard::DashboardView::new(
+                            self.services.history.clone(),
+                            self.services.settings.clone(),
+                        )
+                    })
+                });
+                dashboard.update(cx, dashboard::DashboardView::resume);
+            }
             Route::History => {
                 self.history.get_or_insert_with(|| {
                     cx.new(|cx| history::HistoryView::new(self.services.clone(), cx))
@@ -204,6 +230,7 @@ impl Render for WorkspaceView {
             let _ = entity.update(cx, |view, cx| view.navigate(route, cx));
         });
         let page = match self.route {
+            Route::Dashboard => self.dashboard.as_ref().unwrap().clone().into_any_element(),
             Route::History => self.history.as_ref().unwrap().clone().into_any_element(),
             Route::Dictionary => self.dictionary.as_ref().unwrap().clone().into_any_element(),
             Route::Settings => self.settings.as_ref().unwrap().clone().into_any_element(),
@@ -225,7 +252,7 @@ impl Render for WorkspaceView {
                     .bg(theme.surface_container)
                     .border_color(theme.outline_variant)
                     .when(wide, |rail| rail.w(px(184.0)).flex_col().border_r_1())
-                    .when(!wide, |bar| bar.items_center().border_b_1())
+                    .when(!wide, |bar| bar.items_center().flex_wrap().border_b_1())
                     .child(
                         div()
                             .text_size(px(25.0))
@@ -257,6 +284,7 @@ fn route_tabs(
         .aria_label(tr(Msg::Navigation))
         .flex()
         .gap_2()
+        .when(!wide, |bar| bar.flex_wrap())
         .when(wide, |bar| bar.flex_col().items_stretch())
         .children(Route::ALL.into_iter().enumerate().map(|(index, route)| {
             let select = select.clone();

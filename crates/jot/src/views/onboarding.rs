@@ -223,6 +223,7 @@ impl OnboardingView {
                 // wizard on every launch.
                 settings.has_completed_onboarding = true;
             });
+        super::open_workspace(super::Route::Dashboard, &self.services, cx);
         cx.notify();
     }
 

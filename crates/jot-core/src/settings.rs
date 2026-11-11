@@ -120,6 +120,7 @@ pub enum UiTheme {
 pub struct Settings {
     pub ui_language: UiLanguage,
     pub ui_theme: UiTheme,
+    pub typing_wpm: u16,
     /// True once the user finished onboarding — a deliberate "I'll add it later"
     /// must not re-trap them in the wizard every launch.
     pub has_completed_onboarding: bool,
@@ -165,6 +166,7 @@ impl Default for Settings {
         Self {
             ui_language: UiLanguage::default(),
             ui_theme: UiTheme::default(),
+            typing_wpm: Self::DEFAULT_TYPING_WPM,
             has_completed_onboarding: false,
             endpoint_override: None,
             transcribe_model_override: None,
@@ -215,6 +217,17 @@ mod gate_trip_stamps {
 }
 
 impl Settings {
+    pub const DEFAULT_TYPING_WPM: u16 = 40;
+    pub const TYPING_WPM_RANGE: std::ops::RangeInclusive<u16> = 1..=300;
+
+    pub fn typing_wpm(&self) -> u16 {
+        if Self::TYPING_WPM_RANGE.contains(&self.typing_wpm) {
+            self.typing_wpm
+        } else {
+            Self::DEFAULT_TYPING_WPM
+        }
+    }
+
     /// Single source of truth for endpoint-override validity — the Settings UI
     /// warning and the effective config MUST use the same predicate, or one of
     /// them lies about which endpoint is in use.
@@ -443,6 +456,23 @@ mod tests {
         store.update(Some("soundsEnabled"), |s| s.sounds_enabled = false);
         let reopened = SettingsStore::open(temp.path().join("settings.json"));
         assert!(!reopened.get().sounds_enabled);
+    }
+
+    #[test]
+    fn typing_reference_defaults_validates_and_persists_without_affecting_other_settings() {
+        let (temp, store) = store();
+        assert_eq!(store.get().typing_wpm(), 40);
+        store.update(Some("typingWpm"), |settings| settings.typing_wpm = 75);
+        let reopened = SettingsStore::open(temp.path().join("settings.json"));
+        assert_eq!(reopened.get().typing_wpm(), 75);
+        assert_eq!(reopened.get().hotkey_key, store.get().hotkey_key);
+        for value in [0, 301, u16::MAX] {
+            let settings = Settings {
+                typing_wpm: value,
+                ..Settings::default()
+            };
+            assert_eq!(settings.typing_wpm(), Settings::DEFAULT_TYPING_WPM);
+        }
     }
 
     #[test]

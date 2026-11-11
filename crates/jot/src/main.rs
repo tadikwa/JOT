@@ -174,6 +174,8 @@ fn main() -> Result<()> {
             .detach();
         } else if !app_services.settings.get().has_completed_onboarding {
             views::open_onboarding(&app_services, cx);
+        } else if !std::env::args().any(|arg| arg == "--background") {
+            views::open_workspace(views::Route::Dashboard, &app_services, cx);
         }
     });
 
@@ -446,6 +448,9 @@ fn handle_tray(
                     } else if services.coordinator.handle(HotkeyIntent::Begin) {
                         services.coordinator.handle(HotkeyIntent::LockIn);
                     }
+                }
+                TrayCommand::OpenDashboard => {
+                    views::open_workspace(views::Route::Dashboard, &services, cx)
                 }
                 TrayCommand::OpenHistory => {
                     views::open_workspace(views::Route::History, &services, cx)
