@@ -89,6 +89,74 @@ impl HotkeyKey {
     }
 }
 
+/// Windows modifier bits, deliberately stable in settings JSON.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct HotkeyChord {
+    pub modifiers: u32,
+    pub vk: u32,
+}
+
+impl HotkeyChord {
+    pub const ALT: u32 = 1;
+    pub const CTRL: u32 = 2;
+    pub const SHIFT: u32 = 4;
+    pub const WIN: u32 = 8;
+
+    pub fn validate(self) -> Result<(), &'static str> {
+        // Windows-logo combinations belong to the OS; F12 belongs to the debugger.
+        if self.modifiers == 0 || self.modifiers & !7 != 0 {
+            return Err("use Ctrl, Alt or Shift with a normal key");
+        }
+        if !matches!(self.vk, 0x20 | 0x30..=0x39 | 0x41..=0x5A | 0x70..=0x7A | 0x7C..=0x87) {
+            return Err("unsupported or reserved key");
+        }
+        // OS/task switching, menus and secure-attention sequences are never bindings.
+        if self.modifiers == Self::ALT && self.vk == 0x73
+            || self.modifiers == Self::ALT && self.vk == 0x20
+        {
+            return Err("reserved shortcut");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeyBinding {
+    Bare(HotkeyKey),
+    Chord(HotkeyChord),
+}
+
+impl HotkeyBinding {
+    pub fn vk_code(self) -> u32 {
+        match self {
+            Self::Bare(key) => key.vk_code(),
+            Self::Chord(chord) => chord.vk,
+        }
+    }
+
+    pub fn encode(self) -> u64 {
+        match self {
+            Self::Bare(key) => u64::from(key.vk_code()),
+            Self::Chord(chord) => {
+                (1u64 << 32) | (u64::from(chord.modifiers) << 16) | u64::from(chord.vk)
+            }
+        }
+    }
+
+    pub fn decode(value: u64) -> Option<Self> {
+        let vk = (value & 0xffff) as u32;
+        if value & (1u64 << 32) == 0 {
+            HotkeyKey::from_vk(vk).map(Self::Bare)
+        } else {
+            Some(Self::Chord(HotkeyChord {
+                vk,
+                modifiers: ((value >> 16) & 0xffff) as u32,
+            }))
+        }
+    }
+}
+
 /// How the configured key starts and stops a dictation.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -159,6 +227,8 @@ enum Phase {
     Pressed {
         down_at: Duration,
         mode: DictationActivationMode,
+        chord: bool,
+        double_tap: bool,
     },
     /// First short tap released; waiting for a possible second tap. Still recording.
     PendingSecondTap { session_start_at: Duration },
@@ -190,6 +260,8 @@ pub struct HotkeyProcessor {
     /// Keep tracking the physical press even if the gesture ends before key-up.
     key_down: bool,
     pub activation_mode: DictationActivationMode,
+    /// Chords have an unambiguous release: even a short hold finalizes.
+    pub chord_binding: bool,
     /// When off, a short tap hints immediately and never arms the double-tap
     /// window. Default OFF: firm taps routinely exceed the hold threshold,
     /// misreading tap-tap as hold→finalize. Space-while-holding replaced it.
@@ -217,6 +289,7 @@ impl HotkeyProcessor {
             self.phase,
             Phase::Pressed {
                 mode: DictationActivationMode::Hold,
+                chord: false,
                 ..
             }
         )
@@ -245,6 +318,8 @@ impl HotkeyProcessor {
                 self.phase = Phase::Pressed {
                     down_at: now,
                     mode: self.activation_mode,
+                    chord: self.chord_binding,
+                    double_tap: self.double_tap_lock_enabled,
                 };
                 fx.intents.push(HotkeyIntent::Begin);
             }
@@ -261,11 +336,19 @@ impl HotkeyProcessor {
                 self.phase = Phase::Locked;
                 fx.intents.push(HotkeyIntent::LockIn);
             }
-            (Phase::Pressed { down_at, .. }, E::HotkeyUp) => {
-                if now.saturating_sub(down_at) >= tuning::HOLD_THRESHOLD {
+            (
+                Phase::Pressed {
+                    down_at,
+                    chord,
+                    double_tap,
+                    ..
+                },
+                E::HotkeyUp,
+            ) => {
+                if chord || now.saturating_sub(down_at) >= tuning::HOLD_THRESHOLD {
                     self.phase = Phase::Idle;
                     fx.intents.push(HotkeyIntent::Finalize);
-                } else if self.double_tap_lock_enabled {
+                } else if double_tap {
                     self.phase = Phase::PendingSecondTap {
                         session_start_at: down_at,
                     };
@@ -529,5 +612,90 @@ mod tests {
             assert_eq!(HotkeyKey::from_vk(key.vk_code()), Some(key));
         }
         assert_eq!(HotkeyKey::from_vk(0x41), None);
+    }
+}
+
+#[cfg(test)]
+mod chord_binding_tests {
+    use super::*;
+    #[test]
+    fn chords_are_stable_and_reject_reserved_keys() {
+        for chord in [
+            HotkeyChord {
+                modifiers: 3,
+                vk: 0x20,
+            },
+            HotkeyChord {
+                modifiers: 6,
+                vk: 0x44,
+            },
+        ] {
+            chord.validate().unwrap();
+            let binding = HotkeyBinding::Chord(chord);
+            assert_eq!(HotkeyBinding::decode(binding.encode()), Some(binding));
+            assert_eq!(
+                serde_json::from_str::<HotkeyChord>(&serde_json::to_string(&chord).unwrap())
+                    .unwrap(),
+                chord
+            );
+        }
+        for chord in [
+            HotkeyChord {
+                modifiers: 0,
+                vk: 0x44,
+            },
+            HotkeyChord {
+                modifiers: 8,
+                vk: 0x44,
+            },
+            HotkeyChord {
+                modifiers: 2,
+                vk: 0x7b,
+            },
+            HotkeyChord {
+                modifiers: 1,
+                vk: 0x73,
+            },
+            HotkeyChord {
+                modifiers: 1,
+                vk: 0x20,
+            },
+            HotkeyChord {
+                modifiers: 2,
+                vk: 0x1b,
+            },
+            HotkeyChord {
+                modifiers: 3,
+                vk: 0x2e,
+            },
+            HotkeyChord {
+                modifiers: 2,
+                vk: 0xffff,
+            },
+        ] {
+            assert!(chord.validate().is_err(), "{chord:?}");
+        }
+        for key in HotkeyKey::ALL {
+            let binding = HotkeyBinding::Bare(key);
+            assert_eq!(HotkeyBinding::decode(binding.encode()), Some(binding));
+        }
+    }
+    #[test]
+    fn chord_hold_finalizes_even_when_released_quickly() {
+        let mut processor = HotkeyProcessor::new();
+        processor.chord_binding = true;
+        assert_eq!(
+            processor
+                .handle(HotkeyEvent::HotkeyDown, Duration::ZERO)
+                .intents,
+            vec![HotkeyIntent::Begin]
+        );
+        assert!(!processor.can_space_lock());
+        assert_eq!(
+            processor
+                .handle(HotkeyEvent::HotkeyUp, Duration::from_millis(10))
+                .intents,
+            vec![HotkeyIntent::Finalize]
+        );
     }
 }

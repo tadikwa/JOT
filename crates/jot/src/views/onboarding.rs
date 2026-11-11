@@ -19,7 +19,7 @@
 //! VPN coming up — must let the user continue, or setup strands people whose
 //! key is fine.
 
-use crate::i18n::{LocalizedText, Msg, hotkey, tf, tr};
+use crate::i18n::{LocalizedText, Msg, hotkey_binding, tf, tr};
 use crate::services::Services;
 use crate::text_field::{Submit, TextField};
 use crate::theme::{self, Theme};
@@ -229,7 +229,7 @@ impl OnboardingView {
 
     fn body(&self, theme: Theme, cx: &mut Context<Self>) -> gpui::AnyElement {
         let settings = self.services.settings.get();
-        let key = hotkey(settings.hotkey_key);
+        let key = hotkey_binding(settings.hotkey_binding());
         let toggle = settings.dictation_activation_mode == DictationActivationMode::Toggle;
         match self.step {
             Step::Key => div()
@@ -239,12 +239,18 @@ impl OnboardingView {
                 .child(paragraph(tr(Msg::SetupKeyHint), theme))
                 .child(widgets::hug(widgets::button(
                     "open-key-page",
-                    "Google AI Studio",
+                    tr(Msg::GetGeminiKey),
                     ButtonKind::Secondary,
                     true,
                     theme,
-                    |_, _, cx| cx.open_url("https://aistudio.google.com/apikey"),
+                    cx.listener(|this, _, _, cx| {
+                        if open_gemini_key_page().is_err() {
+                            this.status = Some((Msg::BrowserOpenFailed.into(), StatusTone::Bad));
+                            cx.notify();
+                        }
+                    }),
                 )))
+                .child(paragraph(tr(Msg::GetGeminiKeyHint), theme))
                 .child(self.api_key.clone())
                 .child(widgets::hug(widgets::button(
                     "save-key",
@@ -437,6 +443,32 @@ fn paragraph(text: &str, theme: Theme) -> impl IntoElement {
         .text_size(theme::type_scale::BODY)
         .text_color(theme.on_surface)
         .child(text.to_string())
+}
+
+/// ShellExecute reports association/launch failures that GPUI's fire-and-forget open_url hides.
+pub(super) fn open_gemini_key_page() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        use windows::Win32::UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL};
+        use windows::core::w;
+        let result = unsafe {
+            ShellExecuteW(
+                None,
+                w!("open"),
+                w!("https://aistudio.google.com/apikey"),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        anyhow::ensure!(
+            result.0 as isize > 32,
+            "Windows could not launch the browser"
+        );
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    anyhow::bail!("browser launch is implemented for Windows")
 }
 
 #[cfg(test)]

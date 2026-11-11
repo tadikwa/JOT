@@ -24,7 +24,7 @@ use gpui::{AnyElement, Context, Entity, Role, SharedString, Window, div, prelude
 use jot_core::audio;
 use jot_core::credentials;
 use jot_core::gemini::KeyCheck;
-use jot_core::hotkey::{DictationActivationMode, HotkeyKey};
+use jot_core::hotkey::{DictationActivationMode, HotkeyBinding, HotkeyKey};
 use jot_core::settings::{Settings, UiLanguage, UiTheme};
 
 /// Audio retention options, in the order they read as a sentence.
@@ -80,10 +80,14 @@ pub struct SettingsView {
     typing_status: Option<(Msg, StatusTone)>,
     _typing_submit: gpui::Subscription,
     key_status: Option<(Msg, StatusTone)>,
+    capturing_hotkey: bool,
+    captured_hotkey: Option<HotkeyBinding>,
+    hotkey_status: Option<(Msg, StatusTone)>,
     advanced_status: Option<(Msg, StatusTone)>,
     /// True once the user has asked to wipe everything and been shown what
     /// that means.
     confirming_delete_all: bool,
+    deletion_status: Option<Msg>,
     confirming_remove_key: bool,
     autostart_error: bool,
     category: Category,
@@ -143,8 +147,12 @@ impl SettingsView {
             typing_status: None,
             _typing_submit: typing_submit,
             key_status: None,
+            capturing_hotkey: false,
+            captured_hotkey: None,
+            hotkey_status: None,
             advanced_status: None,
             confirming_delete_all: false,
+            deletion_status: None,
             confirming_remove_key: false,
             autostart_error: false,
             category: Category::Shortcuts,
@@ -156,6 +164,82 @@ impl SettingsView {
     pub fn dismiss_confirmations(&mut self, cx: &mut Context<Self>) {
         self.confirming_delete_all = false;
         self.confirming_remove_key = false;
+        self.cancel_hotkey_capture();
+        cx.notify();
+    }
+
+    fn cancel_hotkey_capture(&mut self) {
+        self.capturing_hotkey = false;
+        self.captured_hotkey = None;
+        crate::hotkey_hook::stop_capture();
+    }
+
+    fn record_hotkey(&mut self, cx: &mut Context<Self>) {
+        if crate::hotkey_hook::binding_error() == Some(crate::hotkey_hook::BindError::Unavailable) {
+            self.hotkey_status = Some((Msg::ShortcutUnavailable, StatusTone::Bad));
+            cx.notify();
+            return;
+        }
+        self.capturing_hotkey = true;
+        self.captured_hotkey = None;
+        self.hotkey_status = None;
+        crate::hotkey_hook::start_capture();
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                executor.timer(std::time::Duration::from_millis(50)).await;
+                let keep = this
+                    .update(cx, |this, cx| {
+                        if !this.capturing_hotkey {
+                            return false;
+                        }
+                        match crate::hotkey_hook::captured_binding() {
+                            Some(Ok(binding)) => {
+                                this.captured_hotkey = Some(binding);
+                                cx.notify();
+                            }
+                            Some(Err(())) => {
+                                this.cancel_hotkey_capture();
+                                cx.notify();
+                                return false;
+                            }
+                            None => {}
+                        }
+                        true
+                    })
+                    .unwrap_or(false);
+                if !keep {
+                    break;
+                }
+            }
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn save_hotkey(&mut self, binding: HotkeyBinding, cx: &mut Context<Self>) {
+        use crate::hotkey_hook::{self, BindError};
+        let result = hotkey_hook::prepare_binding(binding);
+        self.hotkey_status = Some(match result {
+            Err(error) => (
+                match error {
+                    BindError::Invalid => Msg::ShortcutInvalid,
+                    BindError::Conflict => Msg::ShortcutConflict,
+                    BindError::Unavailable => Msg::ShortcutUnavailable,
+                },
+                StatusTone::Bad,
+            ),
+            Ok(()) => {
+                if self.services.settings.set_hotkey_binding(binding).is_err() {
+                    let _ =
+                        hotkey_hook::prepare_binding(self.services.settings.get().hotkey_binding());
+                    (Msg::ShortcutSaveFailed, StatusTone::Bad)
+                } else {
+                    self.cancel_hotkey_capture();
+                    (Msg::ShortcutSaved, StatusTone::Good)
+                }
+            }
+        });
         cx.notify();
     }
 
@@ -164,6 +248,16 @@ impl SettingsView {
         // destroy the dictation in flight.
         let active = self.services.coordinator.active_session_folder();
         self.services.history.delete_all(true, active.as_deref());
+        let purge = self
+            .services
+            .history
+            .correction_session_ids()
+            .and_then(|ids| {
+                self.services
+                    .dictionary
+                    .purge_orphan_suggestions(&ids.into_iter().collect())
+            });
+        self.deletion_status = purge.err().map(|_| Msg::PurgeSuggestionsFailed);
         // A user wiping their words expects them gone from the paste-last
         // buffer too.
         self.services.coordinator.clear_last_result();
@@ -340,8 +434,7 @@ impl SettingsView {
     fn shortcuts(&self, theme: Theme, settings: &Settings, cx: &mut Context<Self>) -> AnyElement {
         let mut hotkey_row = div().flex().flex_wrap().gap(theme::spacing::XS);
         for key in HotkeyKey::ALL {
-            let selected = settings.hotkey_key == key;
-            let store = self.services.settings.clone();
+            let selected = settings.custom_hotkey.is_none() && settings.hotkey_key == key;
             hotkey_row = hotkey_row.child(widgets::button(
                 ("hotkey", key.vk_code()),
                 crate::i18n::hotkey(key),
@@ -352,10 +445,7 @@ impl SettingsView {
                 },
                 true,
                 theme,
-                move |_, _, cx| {
-                    store.update(Some("hotkeyKey"), |settings| settings.hotkey_key = key);
-                    cx.refresh_windows();
-                },
+                cx.listener(move |this, _, _, cx| this.save_hotkey(HotkeyBinding::Bare(key), cx)),
             ));
         }
 
@@ -438,8 +528,117 @@ impl SettingsView {
                     .text_color(theme.on_surface_variant)
                     .child(tr(Msg::CancelShortcut))
                     .into_any_element(),
-                widgets::field_row(tr(Msg::Hotkey), tr(Msg::HotkeyHint), theme, hotkey_row)
-                    .into_any_element(),
+                widgets::field_row(
+                    tr(Msg::Hotkey),
+                    tr(Msg::HotkeyHint),
+                    theme,
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .text_size(theme::type_scale::BODY)
+                                .child(crate::i18n::hotkey_binding(settings.hotkey_binding())),
+                        )
+                        .child(hotkey_row)
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .child(widgets::button(
+                                    "record-hotkey",
+                                    tr(Msg::RecordShortcut),
+                                    ButtonKind::Secondary,
+                                    !self.capturing_hotkey
+                                        && matches!(
+                                            self.services.coordinator.state(),
+                                            jot_core::state_machine::DictationState::Idle
+                                                | jot_core::state_machine::DictationState::Done(_)
+                                        ),
+                                    theme,
+                                    cx.listener(|this, _, _, cx| this.record_hotkey(cx)),
+                                ))
+                                .child(widgets::button(
+                                    "reset-hotkey",
+                                    tr(Msg::RestoreDefaultShortcut),
+                                    ButtonKind::Secondary,
+                                    !self.capturing_hotkey,
+                                    theme,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.save_hotkey(
+                                            HotkeyBinding::Bare(HotkeyKey::default()),
+                                            cx,
+                                        )
+                                    }),
+                                )),
+                        )
+                        .when(self.capturing_hotkey, |column| {
+                            column
+                                .child(widgets::status_line(
+                                    "capture-instructions",
+                                    tr(Msg::ShortcutListening),
+                                    StatusTone::Neutral,
+                                    theme,
+                                ))
+                                .when_some(self.captured_hotkey, |column, binding| {
+                                    column.child(div().child(crate::i18n::hotkey_binding(binding)))
+                                })
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_wrap()
+                                        .gap_2()
+                                        .child(widgets::button(
+                                            "confirm-hotkey",
+                                            tr(Msg::ConfirmShortcut),
+                                            ButtonKind::Primary,
+                                            self.captured_hotkey.is_some(),
+                                            theme,
+                                            cx.listener(|this, _, _, cx| {
+                                                if let Some(binding) = this.captured_hotkey {
+                                                    this.save_hotkey(binding, cx);
+                                                }
+                                            }),
+                                        ))
+                                        .child(widgets::button(
+                                            "cancel-hotkey",
+                                            tr(Msg::Cancel),
+                                            ButtonKind::Secondary,
+                                            true,
+                                            theme,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.cancel_hotkey_capture();
+                                                cx.notify();
+                                            }),
+                                        )),
+                                )
+                        })
+                        .when_some(self.hotkey_status, |column, (message, tone)| {
+                            column.child(widgets::status_line(
+                                "hotkey-status",
+                                tr(message),
+                                tone,
+                                theme,
+                            ))
+                        })
+                        .when(crate::hotkey_hook::binding_error().is_some(), |column| {
+                            column.child(widgets::status_line(
+                                "hotkey-inactive",
+                                tr(Msg::ShortcutInactive),
+                                StatusTone::Bad,
+                                theme,
+                            ))
+                        })
+                        .child(
+                            div()
+                                .text_size(theme::type_scale::LABEL)
+                                .text_color(theme.on_surface_variant)
+                                .child(tr(Msg::ShortcutCollisionLimit)),
+                        ),
+                )
+                .into_any_element(),
                 widgets::toggle(
                     "double-tap",
                     tr(Msg::DoubleTap),
@@ -638,6 +837,26 @@ impl SettingsView {
                         .flex_col()
                         .gap(theme::spacing::XS)
                         .child(self.api_key.clone())
+                        .child(widgets::hug(widgets::button(
+                            "get-gemini-key",
+                            tr(Msg::GetGeminiKey),
+                            ButtonKind::Secondary,
+                            true,
+                            theme,
+                            cx.listener(|this, _, _, cx| {
+                                if super::onboarding::open_gemini_key_page().is_err() {
+                                    this.key_status =
+                                        Some((Msg::BrowserOpenFailed, StatusTone::Bad));
+                                    cx.notify();
+                                }
+                            }),
+                        )))
+                        .child(
+                            div()
+                                .text_size(theme::type_scale::LABEL)
+                                .text_color(theme.on_surface_variant)
+                                .child(tr(Msg::GetGeminiKeyHint)),
+                        )
                         .child(
                             div()
                                 .flex()
@@ -756,6 +975,16 @@ impl SettingsView {
                     ))
                     .into_any_element()
                 },
+                div()
+                    .when_some(self.deletion_status, |column, message| {
+                        column.child(widgets::status_line(
+                            "purge-suggestions-status",
+                            tr(message),
+                            StatusTone::Bad,
+                            theme,
+                        ))
+                    })
+                    .into_any_element(),
             ],
         )
         .into_any_element()
@@ -967,6 +1196,7 @@ impl Render for SettingsView {
                             theme,
                             cx.listener(move |this, _, _, cx| {
                                 this.category = category;
+                                this.cancel_hotkey_capture();
                                 this.confirming_delete_all = false;
                                 this.confirming_remove_key = false;
                                 this.scroll.reset();
@@ -995,5 +1225,13 @@ impl Render for SettingsView {
                 section,
             ],
         )
+    }
+}
+
+impl Drop for SettingsView {
+    fn drop(&mut self) {
+        if self.capturing_hotkey {
+            crate::hotkey_hook::stop_capture();
+        }
     }
 }

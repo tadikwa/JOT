@@ -68,6 +68,32 @@ pub fn hwnd_of(window: &Window) -> Option<isize> {
     }
 }
 
+/// Gives interactive windows their own DPI-sized icons; the HUD never calls this.
+pub fn install_window_icons<V: 'static>(
+    view: &gpui::Entity<V>,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
+    #[cfg(windows)]
+    if let Some(hwnd) = hwnd_of(window) {
+        match platform::WindowIcons::new(hwnd) {
+            Ok(mut icons) => view.update(cx, |_, cx| {
+                cx.observe_window_bounds(window, move |_, window, _| {
+                    if let Some(hwnd) = hwnd_of(window)
+                        && let Err(error) = icons.refresh(hwnd)
+                    {
+                        tracing::warn!(%error, "could not resize window icons");
+                    }
+                })
+                .detach();
+            }),
+            Err(error) => tracing::error!(%error, "could not install Jot window icons"),
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = (view, window, cx);
+}
+
 /// Marks a window as a passive overlay — never focused, never clicked — and
 /// places it inside the work area of the active display.
 ///
@@ -113,6 +139,95 @@ mod platform {
 
     /// `DWMWA_COLOR_NONE` — documented, but not exported by the `windows` crate.
     const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+
+    pub(super) struct WindowIcons {
+        dpi: u32,
+        small: windows::Win32::UI::WindowsAndMessaging::HICON,
+        big: windows::Win32::UI::WindowsAndMessaging::HICON,
+    }
+
+    impl WindowIcons {
+        pub(super) fn new(hwnd: isize) -> anyhow::Result<Self> {
+            let mut icons = Self {
+                dpi: 0,
+                small: Default::default(),
+                big: Default::default(),
+            };
+            icons.refresh(hwnd)?;
+            Ok(icons)
+        }
+
+        pub(super) fn refresh(&mut self, hwnd: isize) -> anyhow::Result<()> {
+            use windows::Win32::Foundation::{LPARAM, WPARAM};
+            use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+            use windows::Win32::UI::HiDpi::GetSystemMetricsForDpi;
+            use windows::Win32::UI::WindowsAndMessaging::{
+                DestroyIcon, HICON, ICON_BIG, ICON_SMALL, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW,
+                SM_CXICON, SM_CXSMICON, SM_CYICON, SM_CYSMICON, SendMessageW, WM_SETICON,
+            };
+            use windows::core::PCWSTR;
+            let hwnd = HWND(hwnd as *mut _);
+            let dpi = unsafe { GetDpiForWindow(hwnd) };
+            anyhow::ensure!(dpi != 0, "window icon DPI unavailable");
+            if dpi == self.dpi {
+                return Ok(());
+            }
+            let module = unsafe { GetModuleHandleW(None) }?;
+            let load = |x, y| unsafe {
+                LoadImageW(
+                    module,
+                    PCWSTR(std::ptr::without_provenance(1)),
+                    IMAGE_ICON,
+                    GetSystemMetricsForDpi(x, dpi),
+                    GetSystemMetricsForDpi(y, dpi),
+                    LR_DEFAULTCOLOR,
+                )
+                .map(|handle| HICON(handle.0))
+            };
+            let small = load(SM_CXSMICON, SM_CYSMICON)?;
+            let big = match load(SM_CXICON, SM_CYICON) {
+                Ok(big) => big,
+                Err(error) => {
+                    unsafe {
+                        let _ = DestroyIcon(small);
+                    }
+                    return Err(error.into());
+                }
+            };
+            unsafe {
+                SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    WPARAM(ICON_SMALL as usize),
+                    LPARAM(small.0 as isize),
+                );
+                SendMessageW(
+                    hwnd,
+                    WM_SETICON,
+                    WPARAM(ICON_BIG as usize),
+                    LPARAM(big.0 as isize),
+                );
+            }
+            // The observer owns both handles until this native window closes.
+            let old = std::mem::replace(self, Self { dpi, small, big });
+            drop(old);
+            Ok(())
+        }
+    }
+
+    impl Drop for WindowIcons {
+        fn drop(&mut self) {
+            use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
+            unsafe {
+                if !self.small.0.is_null() {
+                    let _ = DestroyIcon(self.small);
+                }
+                if !self.big.0.is_null() {
+                    let _ = DestroyIcon(self.big);
+                }
+            }
+        }
+    }
 
     pub fn high_contrast() -> bool {
         use windows::Win32::UI::Accessibility::HIGHCONTRASTW;
@@ -290,6 +405,125 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn executable_contains_small_and_large_jot_icons() {
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            DestroyIcon, HICON, IMAGE_ICON, LR_DEFAULTCOLOR, LoadImageW,
+        };
+        use windows::core::PCWSTR;
+        let module = unsafe { GetModuleHandleW(None) }.unwrap();
+        for pixels in [16, 20, 24, 32, 40, 48, 64] {
+            let icon = unsafe {
+                LoadImageW(
+                    module,
+                    PCWSTR(std::ptr::without_provenance(1)),
+                    IMAGE_ICON,
+                    pixels,
+                    pixels,
+                    LR_DEFAULTCOLOR,
+                )
+            };
+            assert!(
+                icon.is_ok(),
+                "Jot executable must embed icon resource 1 at {pixels}px"
+            );
+            let icon = icon.unwrap();
+            assert_eq!(icon_width(icon.0 as isize), pixels);
+            unsafe { DestroyIcon(HICON(icon.0)) }.unwrap();
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn interactive_window_gets_both_native_icons_and_keeps_them_until_closed() {
+        use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+        use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DestroyWindow, GWL_EXSTYLE, GetWindowLongPtrW, ICON_BIG, ICON_SMALL,
+            SM_CXICON, SM_CXSMICON, SendMessageW, WINDOW_EX_STYLE, WM_GETICON, WS_EX_TOOLWINDOW,
+            WS_OVERLAPPEDWINDOW,
+        };
+        use windows::core::w;
+        struct NativeWindow(HWND);
+        impl Drop for NativeWindow {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                }
+            }
+        }
+        let hwnd = NativeWindow(
+            unsafe {
+                CreateWindowExW(
+                    WINDOW_EX_STYLE::default(),
+                    w!("STATIC"),
+                    w!("Jot icon test"),
+                    WS_OVERLAPPEDWINDOW,
+                    0,
+                    0,
+                    200,
+                    100,
+                    None,
+                    None,
+                    GetModuleHandleW(None).unwrap(),
+                    None,
+                )
+            }
+            .unwrap(),
+        );
+        let mut icons = platform::WindowIcons::new(hwnd.0.0 as isize).unwrap();
+        let small =
+            unsafe { SendMessageW(hwnd.0, WM_GETICON, WPARAM(ICON_SMALL as usize), LPARAM(0)) }.0;
+        let big =
+            unsafe { SendMessageW(hwnd.0, WM_GETICON, WPARAM(ICON_BIG as usize), LPARAM(0)) }.0;
+        assert_ne!(small, 0);
+        assert_ne!(big, 0);
+        assert_ne!(small, big);
+        let dpi = unsafe { GetDpiForWindow(hwnd.0) };
+        assert_eq!(icon_width(small), unsafe {
+            GetSystemMetricsForDpi(SM_CXSMICON, dpi)
+        });
+        assert_eq!(icon_width(big), unsafe {
+            GetSystemMetricsForDpi(SM_CXICON, dpi)
+        });
+        icons.refresh(hwnd.0.0 as isize).unwrap();
+        assert_eq!(
+            small,
+            unsafe { SendMessageW(hwnd.0, WM_GETICON, WPARAM(ICON_SMALL as usize), LPARAM(0)) }.0
+        );
+        assert_eq!(
+            unsafe { GetWindowLongPtrW(hwnd.0, GWL_EXSTYLE) } as u32 & WS_EX_TOOLWINDOW.0,
+            0
+        );
+        drop(hwnd);
+        drop(icons);
+    }
+
+    #[cfg(windows)]
+    fn icon_width(handle: isize) -> i32 {
+        use windows::Win32::Graphics::Gdi::{BITMAP, DeleteObject, GetObjectW};
+        use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, HICON, ICONINFO};
+        let mut info = ICONINFO::default();
+        unsafe { GetIconInfo(HICON(handle as *mut _), &mut info) }.unwrap();
+        let mut bitmap = BITMAP::default();
+        let read = unsafe {
+            GetObjectW(
+                info.hbmColor,
+                std::mem::size_of::<BITMAP>() as i32,
+                Some(&mut bitmap as *mut _ as *mut _),
+            )
+        };
+        unsafe {
+            let _ = DeleteObject(info.hbmColor);
+            let _ = DeleteObject(info.hbmMask);
+        }
+        assert_ne!(read, 0);
+        bitmap.bmWidth
+    }
 
     #[test]
     fn the_pill_centres_horizontally_and_sits_above_the_taskbar() {

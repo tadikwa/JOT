@@ -44,7 +44,8 @@ pub fn apply(rules: &[Rule], text: &str) -> String {
     let mut ordered: Vec<&Rule> = rules.iter().filter(|rule| !rule.wrong.is_empty()).collect();
     ordered.sort_by_key(|rule| std::cmp::Reverse(rule.wrong.chars().count()));
 
-    let mut result = text.to_string();
+    // Match only the original text: generated replacements cannot trigger another rule.
+    let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
     for rule in ordered {
         let Ok(regex) = RegexBuilder::new(&regex::escape(&rule.wrong))
             .case_insensitive(true)
@@ -52,12 +53,12 @@ pub fn apply(rules: &[Rule], text: &str) -> String {
         else {
             continue;
         };
-        // The `regex` crate has no lookbehind, and `\b` silently never matches
-        // when the wrong form starts or ends with punctuation ("e.g.", "c++").
-        // So the boundary is checked against the neighbouring characters here.
-        let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
-        for found in regex.find_iter(&result) {
-            if !is_standalone(&result, found.start(), found.end()) {
+        for found in regex.find_iter(text) {
+            if !is_standalone(text, found.start(), found.end())
+                || edits
+                    .iter()
+                    .any(|(range, _)| found.start() < range.end && range.start < found.end())
+            {
                 continue;
             }
             edits.push((
@@ -65,10 +66,13 @@ pub fn apply(rules: &[Rule], text: &str) -> String {
                 propagate_case(found.as_str(), &rule.right, &rule.wrong),
             ));
         }
-        for (range, replacement) in edits.into_iter().rev() {
-            result.replace_range(range, &replacement);
-        }
     }
+    edits.sort_by_key(|(range, _)| range.start);
+    let mut result = text.to_string();
+    for (range, replacement) in edits.into_iter().rev() {
+        result.replace_range(range, &replacement);
+    }
+
     result
 }
 
@@ -80,7 +84,12 @@ fn is_standalone(text: &str, start: usize, end: usize) -> bool {
 }
 
 fn is_word_char(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+    static WORD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"\A[\p{L}\p{M}\p{N}\p{Pc}\u{200c}\u{200d}]\z")
+            .expect("constant Unicode word regex")
+    });
+    let mut buffer = [0; 4];
+    WORD.is_match(c.encode_utf8(&mut buffer))
 }
 
 /// "KUBERNETES"→"GRPC" stays caps; "Kubernetes"→"GRPC"… follows the rule's
@@ -112,6 +121,25 @@ pub fn propagate_case(original: &str, replacement: &str, wrong: &str) -> String 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replacements_do_not_cascade_or_rewrite_canonical_terms() {
+        assert_eq!(
+            apply(
+                &[Rule::new("alpha", "beta"), Rule::new("beta", "gamma")],
+                "alpha beta"
+            ),
+            "beta gamma"
+        );
+    }
+
+    #[test]
+    fn combining_marks_are_word_boundaries_only_with_their_base() {
+        assert_eq!(
+            apply(&[Rule::new("cafe", "coffee")], "cafe\u{301} cafe"),
+            "cafe\u{301} coffee"
+        );
+    }
 
     #[test]
     fn empty_rules_pass_text_through() {

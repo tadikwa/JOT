@@ -521,3 +521,131 @@ fn period_start_keeps_today_and_includes_the_requested_calendar_span() {
     // A local-calendar week may cross a daylight-saving boundary.
     assert!((today - week - Duration::days(6)).abs() <= Duration::hours(2));
 }
+
+#[test]
+fn dictionary_source_ids_are_small_and_follow_corrections_and_deletion() {
+    let f = Fixture::new();
+    let (first, _) = f.add(101, SessionStatus::Inserted, Some("J’utilise Proxmocks."));
+    let (_second, folder) = f.add(102, SessionStatus::Inserted, Some("Autre dictée."));
+    let id = first.id.to_string();
+    assert!(f.store.correction_session_ids().unwrap().is_empty());
+    f.store
+        .edit(&id, "J’utilise Proxmocks.", "J’utilise Proxmox.")
+        .unwrap();
+    assert_eq!(f.store.correction_session_ids().unwrap(), vec![id.clone()]);
+    std::fs::remove_dir_all(folder).unwrap();
+    f.store.reindex();
+    assert_eq!(f.store.correction_session_ids().unwrap(), vec![id.clone()]);
+    f.store.delete_many(&[id]).unwrap();
+    assert!(f.store.correction_session_ids().unwrap().is_empty());
+}
+
+#[test]
+fn removing_a_correction_journal_removes_it_from_dictionary_sources() {
+    let f = Fixture::new();
+    let (meta, folder) = f.add(103, SessionStatus::Inserted, Some("J’utilise Proxmocks."));
+    let id = meta.id.to_string();
+    f.store
+        .edit(&id, "J’utilise Proxmocks.", "J’utilise Proxmox.")
+        .unwrap();
+    assert_eq!(f.store.correction_session_ids().unwrap(), vec![id]);
+    std::fs::remove_file(folder.join("corrections.json")).unwrap();
+    assert!(f.store.correction_session_ids().unwrap().is_empty());
+    assert!(folder.join("meta.json").is_file());
+}
+
+#[test]
+fn dictionary_learning_keeps_history_authoritative_and_only_accepted_rules_reach_pipeline() {
+    use jot_core::dictionary::{DictionaryStore, SuggestionStatus};
+    use jot_core::replacement;
+    let f = Fixture::new();
+    let (meta, folder) = f.add(
+        110,
+        SessionStatus::Inserted,
+        Some("J’ai installé Proxmocks."),
+    );
+    let id = meta.id.to_string();
+    let meta_bytes = std::fs::read(folder.join("meta.json")).unwrap();
+    f.store
+        .edit(&id, "J’ai installé Proxmocks.", "J’ai installé Proxmox.")
+        .unwrap();
+    let journal_bytes = std::fs::read(folder.join("corrections.json")).unwrap();
+    let dictionary_path = f.temp.path().join("dictionary.json");
+    let dictionary = DictionaryStore::open(dictionary_path.clone());
+    assert_eq!(
+        dictionary
+            .learn_from_corrections(&f.store.corrections(&id).unwrap())
+            .unwrap(),
+        1
+    );
+    assert!(dictionary.replacement_rules().is_empty());
+    assert!(dictionary.sanitized_vocabulary(2048).is_empty());
+    let suggestion = dictionary.suggestions()[0].clone();
+    dictionary.reject_suggestion(suggestion.id).unwrap();
+    let reopened = DictionaryStore::open(dictionary_path.clone());
+    assert_eq!(
+        reopened
+            .learn_from_corrections(&f.store.corrections(&id).unwrap())
+            .unwrap(),
+        0
+    );
+    assert_eq!(reopened.suggestions()[0].status, SuggestionStatus::Rejected);
+
+    let (second, _) = f.add(111, SessionStatus::Inserted, Some("Voici Klod Code."));
+    let second_id = second.id.to_string();
+    f.store
+        .edit(&second_id, "Voici Klod Code.", "Voici Claude Code.")
+        .unwrap();
+    assert_eq!(
+        reopened
+            .learn_from_corrections(&f.store.corrections(&second_id).unwrap())
+            .unwrap(),
+        1
+    );
+    let accepted = reopened
+        .suggestions()
+        .into_iter()
+        .find(|s| s.status == SuggestionStatus::Pending)
+        .unwrap();
+    reopened.accept_suggestion(accepted.id).unwrap();
+    assert_eq!(
+        replacement::apply(&reopened.replacement_rules(), "Klod Code et Klod Codebase."),
+        "Claude Code et Klod Codebase."
+    );
+    assert_eq!(reopened.sanitized_vocabulary(2048), vec!["Claude Code"]);
+    assert_eq!(std::fs::read(folder.join("meta.json")).unwrap(), meta_bytes);
+    f.store.reindex();
+    assert_eq!(
+        std::fs::read(folder.join("corrections.json")).unwrap(),
+        journal_bytes
+    );
+    assert_eq!(
+        reopened
+            .learn_from_corrections(&f.store.corrections(&id).unwrap())
+            .unwrap(),
+        0
+    );
+    f.store.delete_many(&[id, second_id]).unwrap();
+    reopened
+        .purge_orphan_suggestions(
+            &f.store
+                .correction_session_ids()
+                .unwrap()
+                .into_iter()
+                .collect(),
+        )
+        .unwrap();
+    let final_store = DictionaryStore::open(dictionary_path);
+    assert_eq!(
+        final_store.entries().len(),
+        1,
+        "accepted rules belong to the user after source deletion"
+    );
+    assert_eq!(final_store.entries()[0].term, "Claude Code");
+    assert!(
+        final_store
+            .suggestions()
+            .iter()
+            .any(|s| s.status == SuggestionStatus::Rejected)
+    );
+}

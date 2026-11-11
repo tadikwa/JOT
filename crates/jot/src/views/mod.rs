@@ -80,7 +80,11 @@ fn open_tool_window<V: 'static + Render>(
             is_minimizable: true,
             ..Default::default()
         },
-        |window, cx| build(window, cx),
+        |window, cx| {
+            let view = build(window, cx);
+            crate::window_shell::install_window_icons(&view, window, cx);
+            view
+        },
     );
 
     match opened {
@@ -219,9 +223,10 @@ impl WorkspaceView {
                 });
             }
             Route::Dictionary => {
-                self.dictionary.get_or_insert_with(|| {
+                let dictionary = self.dictionary.get_or_insert_with(|| {
                     cx.new(|cx| dictionary::DictionaryView::new(self.services.clone(), cx))
                 });
+                dictionary.update(cx, dictionary::DictionaryView::refresh);
             }
             Route::Settings => {
                 self.settings.get_or_insert_with(|| {

@@ -133,7 +133,7 @@ fn main() -> Result<()> {
     }
 
     sound::start();
-    let hotkey_events = hotkey_hook::install(settings.hotkey_key);
+    let hotkey_events = hotkey_hook::install(settings.hotkey_binding());
     let tray_commands = tray::install();
 
     runtime.spawn(run_hotkey_grammar(
@@ -502,7 +502,7 @@ async fn run_hotkey_grammar(
                 Err(RecvError::Closed) => break,
             },
             change = changes.recv() => match change {
-                Ok("hotkeyKey") | Err(RecvError::Lagged(_)) => None,
+                Ok("hotkeyKey" | "customHotkey" | "dictationActivationMode" | "doubleTapLock") | Err(RecvError::Lagged(_)) => None,
                 Ok(_) => continue,
                 Err(RecvError::Closed) => break,
             },
@@ -536,6 +536,7 @@ async fn run_hotkey_grammar(
                 }
             } else {
                 processor.activation_mode = preferences.dictation_activation_mode;
+                processor.chord_binding = preferences.custom_hotkey.is_some();
                 processor.double_tap_lock_enabled = preferences.double_tap_lock;
                 let effects = processor.handle(event, at);
                 if let Some(window) = effects.arm_timer {
@@ -558,7 +559,7 @@ async fn run_hotkey_grammar(
         hotkey_hook::set_space_lock_enabled(processor.can_space_lock());
         // A shortcut changed mid-gesture must not steal its release or stop.
         if !processor.is_key_down() && !processor.is_session_active() {
-            hotkey_hook::set_hotkey(preferences.hotkey_key);
+            hotkey_hook::set_hotkey(preferences.hotkey_binding());
         }
     }
 }

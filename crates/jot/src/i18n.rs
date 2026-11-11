@@ -1,5 +1,5 @@
 //! UI message IDs and language selection. Interface language does not affect dictation.
-use jot_core::hotkey::HotkeyKey;
+use jot_core::hotkey::{HotkeyBinding, HotkeyChord, HotkeyKey};
 use jot_core::settings::UiLanguage;
 use std::fmt::Display;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -138,6 +138,35 @@ pub fn hotkey(key: HotkeyKey) -> &'static str {
         HotkeyKey::RightWin => Msg::RightWin,
         HotkeyKey::CapsLock => Msg::CapsLock,
     })
+}
+
+pub fn hotkey_binding(binding: HotkeyBinding) -> String {
+    let HotkeyBinding::Chord(chord) = binding else {
+        let HotkeyBinding::Bare(key) = binding else {
+            unreachable!()
+        };
+        return hotkey(key).to_string();
+    };
+    let mut parts = Vec::new();
+    if chord.modifiers & HotkeyChord::CTRL != 0 {
+        parts.push("Ctrl".to_string());
+    }
+    if chord.modifiers & HotkeyChord::ALT != 0 {
+        parts.push("Alt".to_string());
+    }
+    if chord.modifiers & HotkeyChord::SHIFT != 0 {
+        parts.push(tr(Msg::ShiftModifier).to_string());
+    }
+    if chord.modifiers & HotkeyChord::WIN != 0 {
+        parts.push("Windows".to_string());
+    }
+    parts.push(match chord.vk {
+        0x20 => tr(Msg::SpaceKey).to_string(),
+        0x30..=0x39 | 0x41..=0x5A => char::from_u32(chord.vk).unwrap().to_string(),
+        0x70..=0x87 => format!("F{}", chord.vk - 0x6f),
+        _ => format!("VK {:02X}", chord.vk),
+    });
+    parts.join(" + ")
 }
 
 #[cfg(test)]

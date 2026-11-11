@@ -471,17 +471,26 @@ impl HistoryView {
         let expected = detail.current.to_string();
         let id = detail.record.id.clone();
         let store = self.services.history.clone();
+        let dictionary = self.services.dictionary.clone();
         self.busy = true;
-        let task = cx
-            .background_executor()
-            .spawn(async move { store.edit(&id, &expected, &text).map(|_| id) });
+        let task = cx.background_executor().spawn(async move {
+            store.edit(&id, &expected, &text)?;
+            let learned = store
+                .corrections(&id)
+                .and_then(|corrections| dictionary.learn_from_corrections(&corrections));
+            anyhow::Ok((id, learned))
+        });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
-                    Ok(id) => {
-                        this.message = Some((ui("Changes saved.", "Modifications enregistrées.").into(), StatusTone::Good));
+                    Ok((id, learned)) => {
+                        this.message = Some(match learned {
+                            Ok(count) if count > 0 => (format!("{} {count}. {}", ui("Changes saved. New dictionary suggestions:", "Modifications enregistrées. Nouvelles suggestions de dictionnaire :"), ui("Review them in Dictionary.", "Validez-les dans le Dictionnaire.")), StatusTone::Good),
+                            Ok(_) => (ui("Changes saved. No new lexical suggestion.", "Modifications enregistrées. Aucune nouvelle suggestion lexicale.").into(), StatusTone::Good),
+                            Err(_) => (ui("Correction saved. Dictionary suggestions could not be saved; retry the local analysis from Dictionary.", "Correction enregistrée. Les suggestions n’ont pas pu être sauvegardées ; relancez l’analyse locale depuis le Dictionnaire.").into(), StatusTone::Bad),
+                        });
                         this.editing = false;
                         this.version = Version::Current;
                         this.detail_scroll.reset();
@@ -507,19 +516,32 @@ impl HistoryView {
             return;
         };
         let store = self.services.history.clone();
+        let dictionary = self.services.dictionary.clone();
         self.busy = true;
-        let task = cx
-            .background_executor()
-            .spawn(async move { (store.delete_many(&ids), ids) });
+        let task = cx.background_executor().spawn(async move {
+            let result = store.delete_many(&ids);
+            let purged = if result.is_ok() {
+                store
+                    .correction_session_ids()
+                    .and_then(|ids| dictionary.purge_orphan_suggestions(&ids.into_iter().collect()))
+            } else {
+                Ok(0)
+            };
+            (result, ids, purged)
+        });
         cx.spawn(async move |this, cx| {
-            let (result, ids) = task.await;
+            let (result, ids, purged) = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
                     Ok(count) => {
                         this.selected.retain(|id| !ids.contains(id));
                         if this.detail_id.as_ref().is_some_and(|id| ids.contains(id)) { this.open_now(None, cx); }
-                        this.message = Some((format!("{} {count}", ui("Deleted dictations:", "Dictées supprimées :")), StatusTone::Good));
+                        this.message = Some(if purged.is_ok() {
+                            (format!("{} {count}", ui("Deleted dictations:", "Dictées supprimées :")), StatusTone::Good)
+                        } else {
+                            (ui("Dictations deleted. Orphan suggestions could not be purged; refresh Dictionary to retry.", "Dictées supprimées. La purge des suggestions orphelines a échoué ; actualisez le Dictionnaire pour réessayer.").into(), StatusTone::Bad)
+                        });
                     }
                     Err(error) => {
                         tracing::warn!(%error, "history deletion failed");

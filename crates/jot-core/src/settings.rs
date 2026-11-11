@@ -16,7 +16,7 @@
 //! preview models get renamed.
 
 use crate::file_layout;
-use crate::hotkey::{DictationActivationMode, HotkeyKey};
+use crate::hotkey::{DictationActivationMode, HotkeyBinding, HotkeyChord, HotkeyKey};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -136,6 +136,8 @@ pub struct Settings {
     pub show_idle_indicator: bool,
     pub sounds_enabled: bool,
     pub hotkey_key: HotkeyKey,
+    /// None preserves legacy bare-key settings without changing their meaning.
+    pub custom_hotkey: Option<HotkeyChord>,
     pub dictation_activation_mode: DictationActivationMode,
     /// The microphone to record from, by name. `None` follows the Windows
     /// default, including when the user changes it mid-recording.
@@ -175,6 +177,7 @@ impl Default for Settings {
             show_idle_indicator: true,
             sounds_enabled: true,
             hotkey_key: HotkeyKey::default(),
+            custom_hotkey: None,
             dictation_activation_mode: DictationActivationMode::default(),
             preferred_input_device: None,
             smart_transcription: true,
@@ -217,6 +220,11 @@ mod gate_trip_stamps {
 }
 
 impl Settings {
+    pub fn hotkey_binding(&self) -> HotkeyBinding {
+        self.custom_hotkey
+            .map(HotkeyBinding::Chord)
+            .unwrap_or(HotkeyBinding::Bare(self.hotkey_key))
+    }
     pub const DEFAULT_TYPING_WPM: u16 = 40;
     pub const TYPING_WPM_RANGE: std::ops::RangeInclusive<u16> = 1..=300;
 
@@ -332,6 +340,35 @@ impl SettingsStore {
         }
     }
 
+    /// Commit a binding only after its JSON has reached disk; UI can report failure.
+    pub fn set_hotkey_binding(&self, binding: HotkeyBinding) -> anyhow::Result<()> {
+        use std::io::Write;
+        if let HotkeyBinding::Chord(chord) = binding {
+            chord.validate().map_err(anyhow::Error::msg)?;
+        }
+        let mut data = self.data.write();
+        let mut next = data.clone();
+        match binding {
+            HotkeyBinding::Bare(key) => {
+                next.hotkey_key = key;
+                next.custom_hotkey = None;
+            }
+            HotkeyBinding::Chord(chord) => next.custom_hotkey = Some(chord),
+        }
+        let parent = self
+            .path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        std::fs::create_dir_all(parent)?;
+        let mut temp = tempfile::NamedTempFile::new_in(parent)?;
+        temp.write_all(&serde_json::to_vec_pretty(&next)?)?;
+        temp.as_file().sync_all()?;
+        temp.persist(&self.path).map_err(|error| error.error)?;
+        *data = next;
+        drop(data);
+        let _ = self.changes.send("customHotkey");
+        Ok(())
+    }
     fn persist(&self, settings: &Settings) {
         if let Some(parent) = self.path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -564,5 +601,80 @@ mod tests {
         );
         settings.transcribe_model_override = Some("custom-model".into());
         assert_eq!(settings.gemini_config().transcribe_model, "custom-model");
+    }
+}
+
+#[cfg(test)]
+mod custom_hotkey_migration_tests {
+    use super::*;
+    #[test]
+    fn custom_hotkey_survives_settings_round_trip() {
+        let value =
+            serde_json::json!({"hotkeyKey":"capsLock", "customHotkey":{"modifiers":6,"vk":68}});
+        let settings: Settings = serde_json::from_value(value).unwrap();
+        let encoded = serde_json::to_value(settings).unwrap();
+        assert_eq!(
+            encoded["customHotkey"],
+            serde_json::json!({"modifiers":6,"vk":68})
+        );
+    }
+}
+
+#[cfg(test)]
+mod hotkey_persistence_tests {
+    use super::*;
+    #[test]
+    fn legacy_key_and_other_settings_survive_chord_save_and_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        std::fs::write(&path, r#"{"hotkeyKey":"capsLock","dictationActivationMode":"toggle","audioRetentionDays":30}"#).unwrap();
+        let store = SettingsStore::open(path.clone());
+        assert_eq!(
+            store.get().hotkey_binding(),
+            HotkeyBinding::Bare(HotkeyKey::CapsLock)
+        );
+        let chord = HotkeyBinding::Chord(HotkeyChord {
+            modifiers: 3,
+            vk: 0x20,
+        });
+        store.set_hotkey_binding(chord).unwrap();
+        let reopened = SettingsStore::open(path.clone());
+        assert_eq!(reopened.get().hotkey_binding(), chord);
+        assert_eq!(reopened.get().hotkey_key, HotkeyKey::CapsLock);
+        assert_eq!(
+            reopened.get().dictation_activation_mode,
+            DictationActivationMode::Toggle
+        );
+        assert_eq!(reopened.get().audio_retention_days, 30);
+        reopened
+            .set_hotkey_binding(HotkeyBinding::Bare(HotkeyKey::RightControl))
+            .unwrap();
+        let reset = SettingsStore::open(path).get();
+        assert_eq!(reset.custom_hotkey, None);
+        assert_eq!(reset.hotkey_key, HotkeyKey::RightControl);
+        assert_eq!(
+            reset.dictation_activation_mode,
+            DictationActivationMode::Toggle
+        );
+    }
+    #[test]
+    fn binding_persistence_failure_keeps_previous_settings() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let store = SettingsStore::open(path.clone());
+        std::fs::create_dir(&path).unwrap();
+        assert!(
+            store
+                .set_hotkey_binding(HotkeyBinding::Chord(HotkeyChord {
+                    modifiers: 6,
+                    vk: 0x44
+                }))
+                .is_err()
+        );
+        assert_eq!(
+            store.get().hotkey_binding(),
+            HotkeyBinding::Bare(HotkeyKey::RightControl)
+        );
+        assert!(path.is_dir());
     }
 }

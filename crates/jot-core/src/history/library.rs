@@ -243,6 +243,26 @@ impl HistoryStore {
             .collect::<rusqlite::Result<_>>()?)
     }
 
+    /// Small source inventory; scans load only one correction journal at a time.
+    pub fn correction_session_ids(&self) -> Result<Vec<String>> {
+        let connection = self.connection.lock();
+        let mut statement = connection.prepare(
+            "SELECT id,folder FROM dictation WHERE user_transcript IS NOT NULL ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut ids = Vec::new();
+        for row in rows {
+            let (id, folder) = row?;
+            let folder = Path::new(&folder);
+            if folder.join("meta.json").is_file() && folder.join("corrections.json").is_file() {
+                ids.push(id);
+            }
+        }
+        Ok(ids)
+    }
+
     pub fn corrections(&self, id: &str) -> Result<Vec<Correction>> {
         let record = self.record(id).context("dictation no longer exists")?;
         read_corrections(&record.folder, id)
