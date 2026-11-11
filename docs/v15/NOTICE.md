@@ -17,6 +17,11 @@ Jot est une application de dictée pour Windows. Vous appuyez sur un raccourci, 
 - **Reformulation locale** : Désactivée, Rapide ou Qualité. Elle supprime les hésitations et corrige la ponctuation sans changer le sens.
 - **Installateur par utilisateur**, qui ne demande pas de droits administrateur, en plus du mode portable.
 - **Avis de nouvelle version**, publiés sur la page GitHub Releases du fork.
+- **Premier lancement** : choix entre Gemini, 100 % local (aucune clé demandée) ou les deux, avec la taille, les licences et l'empreinte SHA-256 des modèles avant tout téléchargement. Les utilisateurs existants ne revoient pas cet assistant.
+- **Mémoire** : les modèles locaux se chargent à l'appui sur la touche de dictée et se libèrent après 5 minutes sans dictée (réglable de « Immédiatement » à « Garder chargés »), avec un bouton « Libérer la mémoire maintenant ».
+- **Listes** : une suite d'étapes dictée devient une liste numérotée, des éléments indépendants une liste à puces. La prose reste de la prose.
+- **Vocabulaire** : les termes du dictionnaire guident aussi la transcription locale (« Ansible », « Jot »…). Après une correction dans l'historique, Jot propose « Mémoriser « X » dans mon vocabulaire », comme terme seulement, sans règle de remplacement.
+- **Éditeur de l'historique** : sélection à la souris (glisser, double-clic pour un mot, triple-clic pour un paragraphe, Maj+clic) et Ctrl+X.
 
 ## Installer
 
@@ -98,8 +103,8 @@ Chaque téléchargement fonctionne ainsi :
 
 Fonctionnement du moteur :
 
-- **Démarrage et arrêt** : le moteur démarre à la première dictée et s'arrête après 10 minutes d'inactivité. Il s'arrête aussi immédiatement si vous repassez en mode Gemini.
-- **Accélération** : avec une carte graphique dédiée compatible, la transcription passe par le GPU. Sinon, elle utilise le processeur, plus lentement. La ligne « Exécution sur… » des réglages indique lequel est utilisé.
+- **Chargement et libération** : rien n'est chargé au démarrage de Jot. Les modèles se chargent à l'appui sur la touche de dictée, pendant que vous parlez, et se libèrent après le délai choisi (5 minutes par défaut), compté depuis la fin de la dernière dictée. Ils ne sont jamais libérés pendant un enregistrement ou son traitement. Ils sont aussi libérés quand vous repassez en mode Gemini (après la dictée en cours) et quand vous quittez Jot.
+- **Accélération** : avec une carte graphique dédiée compatible, la transcription passe par le GPU. Sinon, elle utilise le processeur, plus lentement. La ligne « Modèles : … » des réglages indique s'ils sont chargés, et sur quel matériel.
 - **Résultat brut** : l'historique conserve aussi la transcription brute et indique l'étape qui a produit le texte final (transcription ou reformulation).
 
 **Confidentialité en mode local** :
@@ -107,7 +112,7 @@ Fonctionnement du moteur :
 - L'audio et le texte ne quittent pas l'ordinateur.
 - Le moteur écoute uniquement sur `127.0.0.1` et fonctionne hors ligne.
 - Jot ne bascule jamais vers Gemini sans vous le demander. Si le mode local échoue, la dictée échoue avec un message, sans envoi en ligne.
-- Le dictionnaire est utilisé comme vocabulaire de référence.
+- Le dictionnaire est utilisé comme vocabulaire de référence, pour la transcription et pour la reformulation.
 - Les instructions dictées (« ignore les consignes… ») sont traitées comme du texte à transcrire, jamais comme des ordres.
 
 ## Avis de nouvelle version
