@@ -46,6 +46,8 @@ pub enum DictationFailure {
     SafetyBlocked,
     /// Disk write failure (F22).
     Storage,
+    /// The 100 % local engine is missing or broke; the audio is in History.
+    LocalEngine,
 }
 
 /// Terminal outcome of a successful-enough session.

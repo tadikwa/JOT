@@ -177,8 +177,11 @@ Jot les vérifie après chaque téléchargement.
 
 ## 9. Confidentialité **[Mesure + Avis]**
 
-- llama.cpp `llama-server` est lancé par Jot sur `127.0.0.1` (port choisi au hasard), avec `--no-webui`. Jot ne
-  contacte que cette adresse pendant une dictée locale.
+- llama.cpp `llama-server` est lancé par Jot sur `127.0.0.1` (port choisi au hasard), avec `--no-webui --offline`
+  et `--device` explicite (GPU dédié ayant le plus de mémoire libre, sinon `none` = processeur ; l'iGPU AMD est
+  ignoré). Jot ne contacte que cette adresse pendant une dictée locale.
+- Mesuré le 11/11/2026 (test `real_engine_end_to_end`) : pendant les 7 dictées de test, les seules connexions des
+  processus `llama-server` relevées toutes les 200 ms étaient des écoutes et connexions `127.0.0.1`.
 - Les serveurs ne font aucune requête sortante tant qu'on ne leur passe pas `-hf`/`--hf-repo`, que Jot n'utilise
   jamais : Jot fournit des chemins de fichiers locaux.
 - Les seules connexions sortantes du mode local sont les téléchargements de runtime et de modèles, lancés par

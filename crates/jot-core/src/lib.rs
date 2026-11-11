@@ -27,6 +27,7 @@ pub mod history;
 pub mod hotkey;
 pub mod insertion;
 pub mod levels;
+pub mod local;
 pub mod meta;
 pub mod prompt;
 pub mod recovery;

@@ -256,6 +256,8 @@ impl RetryQueue {
                 self.store.save_retry(&meta, &folder);
                 ProcessResult::Failed
             }
+            // Not this row's fault either: the engine comes back once installed.
+            Err(error @ TranscriptionError::LocalEngine(_)) => ProcessResult::Blocked(error),
             // Permanent: mark it failed so the queue never spins on it.
             Err(TranscriptionError::BadRequest(message)) => {
                 meta.status = SessionStatus::Failed;

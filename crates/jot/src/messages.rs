@@ -82,6 +82,13 @@ messages! {
     SmartHint => "Removes filler words and follows spoken corrections. Turn it off for a verbatim transcript.", "Supprime les hésitations et tient compte des corrections à l’oral. Désactivez cette option pour une transcription mot à mot.";
     Tone => "Adapt the tone to the active app", "Adapter le ton à l’application active";
     ToneHint => "Sends the transcript to a second model for rewriting. This adds a network request.", "Envoie le texte transcrit à un second modèle pour le reformuler. Cette étape ajoute une requête réseau.";
+    Engine => "Transcription engine", "Moteur de transcription";
+    EngineGemini => "Gemini (online)", "Gemini (en ligne)";
+    EngineLocal => "100% local", "100 % local";
+    Reformulation => "Local editing", "Reformulation locale";
+    ReformOff => "Off (raw transcript)", "Désactivée (texte brut)";
+    ReformFast => "Fast — Qwen3.5 4B", "Rapide — Qwen3.5 4B";
+    ReformQuality => "Quality — Qwen3.5 9B", "Qualité — Qwen3.5 9B";
     Noise => "Adapt to ambient noise (experimental)", "S’adapter au bruit ambiant (expérimental)";
     NoiseHint => "Uses the ambient noise level to help distinguish speech from background noise.", "Tient compte du bruit ambiant pour mieux distinguer la voix du bruit de fond.";
     VoicePrivacy => "Jot sends audio directly to the configured Gemini API with your key. Jot has no intermediary server, account or analytics.", "Jot envoie l’audio directement à l’API Gemini configurée avec votre clé. Jot fonctionne sans serveur intermédiaire, sans compte Jot et sans outil d’analyse d’usage.";
@@ -168,6 +175,7 @@ messages! {
     HistoryEmpty => "Gemini returned no text", "Gemini n’a renvoyé aucun texte";
     HistoryNoise => "Too much noise to make out any speech", "Le bruit ambiant a couvert la voix";
     HistoryDisk => "Could not save the recording. Check available disk space.", "Impossible d’enregistrer l’audio. Vérifiez l’espace disque disponible.";
+    HistoryLocal => "The local engine was unavailable. Install it in Settings, then retry.", "Le moteur local était indisponible. Installez-le dans les paramètres, puis réessayez.";
     HistoryMic => "The microphone stopped during recording", "Le microphone s’est arrêté pendant l’enregistrement";
     HistoryNoAudio => "The recording is unavailable for transcription", "L’enregistrement est indisponible pour la transcription";
     Term => "Term, spelled correctly", "Terme à reconnaître";
@@ -224,6 +232,7 @@ messages! {
     HudValidation => "Couldn't make out the words — saved to History", "Parole indistincte. Enregistrement dans l’historique.";
     HudSafety => "Gemini declined to transcribe this — saved to History", "Transcription refusée par Gemini. Consultez l’historique.";
     HudStorage => "Couldn't write to disk — check free space", "Écriture impossible. Vérifiez l’espace disque.";
+    HudLocal => "Local engine unavailable — see Settings. The recording is in History.", "Moteur local indisponible : voir Paramètres. L’enregistrement est dans l’historique.";
     HudCoach => "Hold to talk · tap Space while holding for hands-free", "Maintenez pour parler · Espace pour passer en mains libres";
     HudSecure => "Can't dictate here — a password field has focus", "La dictée est bloquée dans les champs de mot de passe.";
     HudTimeLimit => "One minute left — 10-minute limit", "Il reste une minute de dictée.";

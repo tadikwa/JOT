@@ -42,6 +42,11 @@ pub fn handle() -> Handle {
         .expect("no async runtime installed — call runtime::install at startup")
 }
 
+/// Like `handle`, but `None` instead of a panic when there is no runtime.
+pub fn try_handle() -> Option<Handle> {
+    HANDLE.get().cloned().or_else(|| Handle::try_current().ok())
+}
+
 pub fn spawn<F>(future: F) -> JoinHandle<F::Output>
 where
     F: Future + Send + 'static,

@@ -47,6 +47,9 @@ pub enum TranscriptionError {
     Timeout,
     EmptyTranscript,
     SafetyBlocked,
+    /// The 100 % local engine is missing, failed to start or broke. Never
+    /// answered by falling back to the cloud.
+    LocalEngine(String),
 }
 
 impl std::fmt::Display for TranscriptionError {
@@ -64,6 +67,7 @@ impl std::fmt::Display for TranscriptionError {
             TranscriptionError::Timeout => write!(f, "timed out"),
             TranscriptionError::EmptyTranscript => write!(f, "empty transcript"),
             TranscriptionError::SafetyBlocked => write!(f, "blocked by safety filters"),
+            TranscriptionError::LocalEngine(detail) => write!(f, "local engine: {detail}"),
         }
     }
 }

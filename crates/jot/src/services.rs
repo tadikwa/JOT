@@ -21,9 +21,10 @@ use jot_core::dictionary::DictionaryStore;
 use jot_core::gemini::GeminiClient;
 use jot_core::history::{HistoryStore, RetentionPolicy};
 use jot_core::insertion::InsertionCoordinator;
+use jot_core::local::{LocalEngine, LocalTranscriptionService};
 use jot_core::recovery::{RecoveryScanner, RetryQueue};
 use jot_core::settings::SettingsStore;
-use jot_core::transcription::{GeminiTranscriptionService, TranscriptionServicing};
+use jot_core::transcription::{EngineRouter, GeminiTranscriptionService, TranscriptionServicing};
 use jot_core::{credentials, file_layout, win32};
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -35,6 +36,7 @@ pub struct Services {
     pub history: Arc<HistoryStore>,
     pub client: Arc<GeminiClient>,
     pub transcription: Arc<dyn TranscriptionServicing>,
+    pub local_engine: Arc<LocalEngine>,
     pub coordinator: Arc<DictationCoordinator>,
     pub retry_queue: Arc<RetryQueue>,
 }
@@ -48,9 +50,20 @@ impl Services {
         // The key is read fresh on every request: changing it in Settings must
         // take effect on the next dictation, not the next launch.
         let client = Arc::new(GeminiClient::new(Box::new(credentials::api_key)));
-        let transcription: Arc<dyn TranscriptionServicing> = Arc::new(
-            GeminiTranscriptionService::new(client.clone(), settings.clone(), dictionary.clone()),
-        );
+        let local_engine = LocalEngine::new();
+        let transcription: Arc<dyn TranscriptionServicing> = Arc::new(EngineRouter {
+            gemini: Arc::new(GeminiTranscriptionService::new(
+                client.clone(),
+                settings.clone(),
+                dictionary.clone(),
+            )),
+            local: Arc::new(LocalTranscriptionService::new(
+                local_engine.clone(),
+                settings.clone(),
+                dictionary.clone(),
+            )),
+            settings: settings.clone(),
+        });
 
         let coordinator = DictationCoordinator::new(CoordinatorDeps {
             audio_factory: {
@@ -98,6 +111,7 @@ impl Services {
             history,
             client,
             transcription,
+            local_engine,
             coordinator,
             retry_queue,
         })

@@ -108,6 +108,8 @@ struct Detail {
     cleaned: Option<SharedString>,
     corrections: Vec<(Correction, SharedString, SharedString)>,
     retryable: bool,
+    /// Which engine and stages produced the text; None for dictations older than 1.5.
+    engine: Option<String>,
 }
 impl Detail {
     fn new(record: DictationRecord, corrections: Vec<Correction>, retryable: bool) -> Self {
@@ -124,6 +126,9 @@ impl Detail {
                     (c, before, after)
                 })
                 .collect(),
+            engine: jot_core::meta::SessionMeta::read(&record.folder)
+                .and_then(|meta| meta.model_id)
+                .map(|id| engine_label(&id)),
             record,
             retryable,
         }
@@ -922,6 +927,14 @@ impl HistoryView {
                     ))
                     .into_any_element(),
             );
+            if let Some(engine) = &detail.engine {
+                children.push(
+                    div()
+                        .text_color(theme.on_surface_variant)
+                        .child(engine.clone())
+                        .into_any_element(),
+                );
+            }
             if let Some(code) = record.error_code.as_deref() {
                 children.push(
                     widgets::status_line(
@@ -1623,6 +1636,52 @@ fn status_label(status: SessionStatus) -> &'static str {
     }
 }
 
+/// Names the engine and the stage whose text was kept, from `meta.model_id`.
+fn engine_label(model_id: &str) -> String {
+    let Some(local) = model_id.strip_prefix("local/") else {
+        return format!(
+            "{} · {model_id}",
+            ui("Engine: Gemini (online)", "Moteur : Gemini (en ligne)")
+        );
+    };
+    let (asr, rest) = local.split_once('+').unwrap_or((local, ""));
+    let asr = if asr == "qwen3-asr-1.7b" {
+        "Qwen3-ASR 1.7B"
+    } else {
+        asr
+    };
+    let head = format!(
+        "{} · {asr}",
+        ui("Engine: 100% local", "Moteur : 100 % local")
+    );
+    if rest.is_empty() {
+        return format!("{head} · {}", ui("raw transcript", "transcription brute"));
+    }
+    let (model, outcome) = rest.split_once(':').unwrap_or((rest, ""));
+    let model = match model {
+        "qwen3.5-4b" => "Qwen3.5 4B",
+        "qwen3.5-9b" => "Qwen3.5 9B",
+        other => other,
+    };
+    match outcome {
+        "" => format!("{head} → {model}"),
+        "rejected" => format!(
+            "{head} · {model} {}",
+            ui(
+                "rejected by the safety check — raw transcript kept",
+                "refusé par le contrôle : transcription brute conservée"
+            )
+        ),
+        _ => format!(
+            "{head} · {model} {}",
+            ui(
+                "unavailable — raw transcript kept",
+                "indisponible : transcription brute conservée"
+            )
+        ),
+    }
+}
+
 /// Display copy for stored error codes. Raw API diagnostics stay in the record.
 fn error_summary(code: Option<&str>, status: SessionStatus) -> String {
     match code {
@@ -1638,6 +1697,7 @@ fn error_summary(code: Option<&str>, status: SessionStatus) -> String {
         Some("empty") => tr(Msg::HistoryEmpty),
         Some("tooNoisy") => tr(Msg::HistoryNoise),
         Some("disk_write") => tr(Msg::HistoryDisk),
+        Some("local") => tr(Msg::HistoryLocal),
         Some("engine_died") => tr(Msg::HistoryMic),
         Some("audio_purged") | Some("no_audio_file") => tr(Msg::HistoryNoAudio),
         _ => status_label(status),
@@ -1724,6 +1784,24 @@ fn search_highlights(text: &str, query: &str) -> Vec<std::ops::Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn engine_label_names_the_stage_whose_text_was_kept() {
+        assert!(
+            engine_label("gemini-3.5-transcribe/smart").contains("gemini-3.5-transcribe/smart")
+        );
+        let raw = engine_label("local/qwen3-asr-1.7b");
+        assert!(
+            raw.contains("Qwen3-ASR 1.7B") && !raw.contains("→"),
+            "{raw}"
+        );
+        assert!(engine_label("local/qwen3-asr-1.7b+qwen3.5-4b").ends_with("→ Qwen3.5 4B"));
+        let rejected = engine_label("local/qwen3-asr-1.7b+qwen3.5-9b:rejected");
+        assert!(
+            rejected.contains("Qwen3.5 9B") && !rejected.contains("→"),
+            "{rejected}"
+        );
+    }
 
     #[test]
     fn every_status_has_copy_and_none_of_it_lies_about_the_clipboard() {
@@ -1860,6 +1938,7 @@ mod tests {
             transcription,
             coordinator,
             retry_queue,
+            local_engine: jot_core::local::LocalEngine::new(),
         }
     }
 

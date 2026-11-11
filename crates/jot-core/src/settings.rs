@@ -115,6 +115,29 @@ pub enum UiTheme {
     Automatic,
 }
 
+/// Where a dictation is transcribed. Read per dictation; there is never a
+/// fallback from one to the other.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TranscriptionEngine {
+    #[default]
+    Gemini,
+    /// An unknown future value lands here: failing locally never sends audio.
+    #[serde(other)]
+    Local,
+}
+
+/// The optional second local model that tidies the transcript.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LocalReformulation {
+    #[default]
+    Fast,
+    Quality,
+    #[serde(other)]
+    Off,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -158,6 +181,8 @@ pub struct Settings {
     pub experimental_noise_handling: bool,
     /// Days to keep audio files (transcripts are kept until deleted). 0 = forever.
     pub audio_retention_days: i64,
+    pub transcription_engine: TranscriptionEngine,
+    pub local_reformulation: LocalReformulation,
     /// Auto-degrade bookkeeping: three gate trips in 24h ⇒ tone pass off.
     #[serde(with = "gate_trip_stamps")]
     pub gate_trips: Vec<OffsetDateTime>,
@@ -185,6 +210,8 @@ impl Default for Settings {
             legacy_transcribe_endpoint: false,
             experimental_noise_handling: false,
             audio_retention_days: 7,
+            transcription_engine: TranscriptionEngine::Gemini,
+            local_reformulation: LocalReformulation::Fast,
             gate_trips: Vec::new(),
         }
     }
@@ -458,6 +485,26 @@ mod tests {
             assert_eq!(reopened.audio_retention_days, 30);
             assert!(!reopened.sounds_enabled);
         }
+    }
+
+    #[test]
+    fn a_1_4_settings_file_stays_on_gemini_and_unknown_engines_stay_local() {
+        let legacy: Settings = serde_json::from_str(r#"{"audioRetentionDays":30}"#).unwrap();
+        assert_eq!(legacy.transcription_engine, TranscriptionEngine::Gemini);
+        assert_eq!(legacy.local_reformulation, LocalReformulation::Fast);
+        let future: Settings = serde_json::from_str(
+            r#"{"transcriptionEngine":"futureEngine","localReformulation":"futureModel"}"#,
+        )
+        .unwrap();
+        // Never sends audio to the cloud on a value this build does not know.
+        assert_eq!(future.transcription_engine, TranscriptionEngine::Local);
+        assert_eq!(future.local_reformulation, LocalReformulation::Off);
+        let local: Settings = serde_json::from_str(
+            r#"{"transcriptionEngine":"local","localReformulation":"quality"}"#,
+        )
+        .unwrap();
+        assert_eq!(local.transcription_engine, TranscriptionEngine::Local);
+        assert_eq!(local.local_reformulation, LocalReformulation::Quality);
     }
 
     #[test]

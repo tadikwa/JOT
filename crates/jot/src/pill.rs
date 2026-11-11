@@ -516,6 +516,7 @@ pub fn failure_message(failure: jot_core::state_machine::DictationFailure) -> Ms
         F::Validation => Msg::HudValidation,
         F::SafetyBlocked => Msg::HudSafety,
         F::Storage => Msg::HudStorage,
+        F::LocalEngine => Msg::HudLocal,
     }
 }
 
@@ -608,6 +609,7 @@ mod tests {
             DictationFailure::Timeout,
             DictationFailure::Validation,
             DictationFailure::SafetyBlocked,
+            DictationFailure::LocalEngine,
         ] {
             let copy = failure_message(failure).text(crate::i18n::Locale::En);
             assert!(!copy.is_empty());

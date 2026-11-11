@@ -25,7 +25,44 @@ use jot_core::audio;
 use jot_core::credentials;
 use jot_core::gemini::KeyCheck;
 use jot_core::hotkey::{DictationActivationMode, HotkeyBinding, HotkeyKey};
-use jot_core::settings::{Settings, UiLanguage, UiTheme};
+use jot_core::local::{self, Download, Pack};
+use jot_core::settings::{LocalReformulation, Settings, TranscriptionEngine, UiLanguage, UiTheme};
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+fn ui(en: &'static str, fr: &'static str) -> &'static str {
+    match crate::i18n::locale() {
+        crate::i18n::Locale::En => en,
+        crate::i18n::Locale::Fr => fr,
+    }
+}
+
+/// "2,56 Go" / "2.56 GB".
+fn size_label(bytes: u64) -> String {
+    let gb = format!("{:.2}", bytes as f64 / 1e9);
+    match crate::i18n::locale() {
+        crate::i18n::Locale::En => format!("{gb} GB"),
+        crate::i18n::Locale::Fr => format!("{} Go", gb.replace('.', ",")),
+    }
+}
+
+fn pack_source(pack: Pack) -> &'static str {
+    match pack {
+        Pack::Transcription => ui(
+            "llama.cpp b12289 (MIT) from github.com/ggml-org, Qwen3-ASR 1.7B Q8_0 (Apache-2.0) from huggingface.co/ggml-org",
+            "llama.cpp b12289 (MIT) depuis github.com/ggml-org, Qwen3-ASR 1.7B Q8_0 (Apache-2.0) depuis huggingface.co/ggml-org",
+        ),
+        Pack::Fast => ui(
+            "Qwen3.5 4B Q4_K_M (Apache-2.0), community conversion from huggingface.co/unsloth",
+            "Qwen3.5 4B Q4_K_M (Apache-2.0), conversion communautaire depuis huggingface.co/unsloth",
+        ),
+        Pack::Quality => ui(
+            "Qwen3.5 9B Q4_K_M (Apache-2.0), community conversion from huggingface.co/unsloth",
+            "Qwen3.5 9B Q4_K_M (Apache-2.0), conversion communautaire depuis huggingface.co/unsloth",
+        ),
+    }
+}
 
 /// Audio retention options, in the order they read as a sentence.
 const RETENTION_CHOICES: [(i64, Msg); 4] = [
@@ -94,6 +131,12 @@ pub struct SettingsView {
     /// Mirrors the registry so the switch shows what the machine actually does,
     /// not what we last asked for.
     autostart_enabled: bool,
+    /// A model download the user confirmed, with its live progress.
+    download: Option<(Pack, Arc<Download>)>,
+    /// The pack whose size and source are on screen awaiting a yes.
+    confirming_download: Option<Pack>,
+    download_status: Option<(String, StatusTone)>,
+    download_poll: Option<gpui::Task<()>>,
     scroll: widgets::PageScroll,
 }
 
@@ -157,6 +200,10 @@ impl SettingsView {
             autostart_error: false,
             category: Category::Shortcuts,
             autostart_enabled: crate::autostart::is_enabled(),
+            download: None,
+            confirming_download: None,
+            download_status: None,
+            download_poll: None,
             scroll: widgets::PageScroll::new(),
         }
     }
@@ -674,11 +721,324 @@ impl SettingsView {
         .into_any_element()
     }
 
-    fn transcription(&self, theme: Theme, settings: &Settings) -> AnyElement {
+    fn start_download(&mut self, pack: Pack, cx: &mut Context<Self>) {
+        let progress = Arc::new(Download::default());
+        self.download = Some((pack, progress.clone()));
+        self.confirming_download = None;
+        self.download_status = None;
+        jot_core::runtime::spawn(local::install(pack, progress.clone()));
+        let executor = cx.background_executor().clone();
+        self.download_poll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                executor.timer(Duration::from_millis(300)).await;
+                let finished = progress.finished.load(Ordering::Acquire);
+                let alive = this
+                    .update(cx, |view, cx| {
+                        if finished {
+                            view.finish_download();
+                        }
+                        cx.notify();
+                    })
+                    .is_ok();
+                if finished || !alive {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    fn finish_download(&mut self) {
+        let Some((_, progress)) = self.download.take() else {
+            return;
+        };
+        let error = progress.error.lock().clone();
+        self.download_status = Some(match error {
+            None => (
+                ui(
+                    "Installed and verified (SHA-256).",
+                    "Installé et vérifié (SHA-256).",
+                )
+                .into(),
+                StatusTone::Good,
+            ),
+            Some(error) if error == local::CANCELLED => (
+                ui(
+                    "Download cancelled. The unfinished file was deleted; verified files are kept.",
+                    "Téléchargement annulé. Le fichier incomplet a été supprimé ; les fichiers déjà vérifiés sont conservés.",
+                )
+                .into(),
+                StatusTone::Neutral,
+            ),
+            Some(error) => (
+                format!(
+                    "{}{error}",
+                    ui("Download failed: ", "Échec du téléchargement : ")
+                ),
+                StatusTone::Bad,
+            ),
+        });
+        self.download_poll = None;
+    }
+
+    fn pack_row(
+        &self,
+        pack: Pack,
+        title: &'static str,
+        theme: Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let id = match pack {
+            Pack::Transcription => "transcription",
+            Pack::Fast => "fast",
+            Pack::Quality => "quality",
+        };
+        let control: AnyElement = match &self.download {
+            Some((active, progress)) if *active == pack => {
+                let progress = progress.clone();
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .items_center()
+                    .gap_2()
+                    .child(format!(
+                        "{} {:.0} % ({} / {})",
+                        ui("Downloading", "Téléchargement"),
+                        progress.fraction() * 100.0,
+                        size_label(progress.done.load(Ordering::Relaxed)),
+                        size_label(progress.total.load(Ordering::Relaxed)),
+                    ))
+                    .child(widgets::button(
+                        SharedString::from(format!("local-cancel-{id}")),
+                        ui("Cancel", "Annuler"),
+                        ButtonKind::Secondary,
+                        true,
+                        theme,
+                        move |_, _, _| progress.cancel.store(true, Ordering::Relaxed),
+                    ))
+                    .into_any_element()
+            }
+            _ if pack.installed() => widgets::status_line(
+                SharedString::from(format!("local-installed-{id}")),
+                ui("Installed", "Installé"),
+                StatusTone::Good,
+                theme,
+            )
+            .into_any_element(),
+            _ if self.confirming_download == Some(pack) => div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(format!(
+                    "{} {} — {}. {} {}",
+                    ui("Download", "Télécharger"),
+                    size_label(pack.missing_bytes()),
+                    pack_source(pack),
+                    ui(
+                        "Each file is checked against its SHA-256 before use and kept in",
+                        "Chaque fichier est vérifié par SHA-256 avant usage et conservé dans",
+                    ),
+                    local::local_root().display(),
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .child(widgets::button(
+                            SharedString::from(format!("local-confirm-{id}")),
+                            ui("Download now", "Télécharger maintenant"),
+                            ButtonKind::Primary,
+                            true,
+                            theme,
+                            cx.listener(move |this, _, _, cx| this.start_download(pack, cx)),
+                        ))
+                        .child(widgets::button(
+                            SharedString::from(format!("local-decline-{id}")),
+                            ui("Not now", "Pas maintenant"),
+                            ButtonKind::Secondary,
+                            true,
+                            theme,
+                            cx.listener(|this, _, _, cx| {
+                                this.confirming_download = None;
+                                cx.notify();
+                            }),
+                        )),
+                )
+                .into_any_element(),
+            _ => widgets::button(
+                SharedString::from(format!("local-download-{id}")),
+                format!(
+                    "{} ({})",
+                    ui("Download", "Télécharger"),
+                    size_label(pack.missing_bytes())
+                ),
+                ButtonKind::Secondary,
+                self.download.is_none(),
+                theme,
+                cx.listener(move |this, _, _, cx| {
+                    this.confirming_download = Some(pack);
+                    this.download_status = None;
+                    cx.notify();
+                }),
+            )
+            .into_any_element(),
+        };
+        widgets::field_row(title, pack_source(pack), theme, control).into_any_element()
+    }
+
+    fn local_rows(
+        &self,
+        theme: Theme,
+        settings: &Settings,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let mut rows = vec![self.pack_row(
+            Pack::Transcription,
+            ui("Local transcription", "Transcription locale"),
+            theme,
+            cx,
+        )];
+        rows.push(
+            widgets::field_row(
+                tr(Msg::Reformulation),
+                ui(
+                    "Removes hesitations and fixes punctuation with a second local model. Off: Qwen3-ASR's text is inserted as is.",
+                    "Supprime les hésitations et corrige la ponctuation avec un second modèle local. Désactivée : le texte de Qwen3-ASR est inséré tel quel.",
+                ),
+                theme,
+                choices(
+                    "local-reformulation",
+                    Msg::Reformulation,
+                    [
+                        (LocalReformulation::Off, Msg::ReformOff),
+                        (LocalReformulation::Fast, Msg::ReformFast),
+                        (LocalReformulation::Quality, Msg::ReformQuality),
+                    ],
+                    settings.local_reformulation,
+                    theme,
+                    {
+                        let store = self.services.settings.clone();
+                        move |value, cx| {
+                            store.update(Some("localReformulation"), |s| {
+                                s.local_reformulation = value
+                            });
+                            cx.refresh_windows();
+                        }
+                    },
+                ),
+            )
+            .into_any_element(),
+        );
+        if let Some(pack) = Pack::for_reformulation(settings.local_reformulation) {
+            let title = match pack {
+                Pack::Quality => ui(
+                    "Quality model (about 6 GB of video memory)",
+                    "Modèle qualité (environ 6 Go de mémoire vidéo)",
+                ),
+                _ => ui(
+                    "Fast model (about 3.5 GB of video memory)",
+                    "Modèle rapide (environ 3,5 Go de mémoire vidéo)",
+                ),
+            };
+            rows.push(self.pack_row(pack, title, theme, cx));
+        }
+        if let Some((message, tone)) = &self.download_status {
+            rows.push(
+                widgets::status_line("local-download-status", message.clone(), *tone, theme)
+                    .into_any_element(),
+            );
+        }
+        let status = self.services.local_engine.status();
+        let acceleration = match (status.running, status.gpu) {
+            (true, Some(gpu)) => format!(
+                "{}{gpu} (Vulkan)",
+                ui("Running on the GPU: ", "Exécution sur le GPU : ")
+            ),
+            (true, None) => ui(
+                "Running on the CPU: no compatible dedicated GPU or not enough video memory. Dictation works, more slowly.",
+                "Exécution sur le processeur : pas de GPU dédié compatible ou mémoire vidéo insuffisante. La dictée fonctionne, plus lentement.",
+            )
+            .into(),
+            (false, _) => ui(
+                "The engine starts with your next dictation and stops after 10 minutes without one.",
+                "Le moteur démarre à la prochaine dictée et s’arrête après 10 minutes sans dictée.",
+            )
+            .into(),
+        };
+        rows.push(
+            widgets::status_line(
+                "local-acceleration",
+                acceleration,
+                StatusTone::Neutral,
+                theme,
+            )
+            .into_any_element(),
+        );
+        rows.push(
+            widgets::status_line(
+                "local-privacy",
+                ui(
+                    "In local mode, audio and text never leave this computer. Jot only goes online to download models when you ask, and never falls back to Gemini.",
+                    "En mode local, l’audio et le texte ne quittent pas cet ordinateur. Jot ne se connecte que pour télécharger les modèles à votre demande et ne bascule jamais vers Gemini.",
+                ),
+                StatusTone::Neutral,
+                theme,
+            )
+            .into_any_element(),
+        );
+        rows
+    }
+
+    fn transcription(
+        &self,
+        theme: Theme,
+        settings: &Settings,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let engine = widgets::field_row(
+            tr(Msg::Engine),
+            ui(
+                "Gemini: the recording is sent to Google's Gemini API with your key. 100% local: everything runs on this computer after a one-time download.",
+                "Gemini : l’enregistrement est envoyé à l’API Gemini de Google avec votre clé. 100 % local : tout s’exécute sur cet ordinateur après un téléchargement unique.",
+            ),
+            theme,
+            choices(
+                "transcription-engine",
+                Msg::Engine,
+                [
+                    (TranscriptionEngine::Gemini, Msg::EngineGemini),
+                    (TranscriptionEngine::Local, Msg::EngineLocal),
+                ],
+                settings.transcription_engine,
+                theme,
+                {
+                    let store = self.services.settings.clone();
+                    let engine = self.services.local_engine.clone();
+                    move |value, cx| {
+                        store.update(Some("transcriptionEngine"), |s| {
+                            s.transcription_engine = value
+                        });
+                        if value == TranscriptionEngine::Gemini {
+                            // Give the video memory back as soon as local mode is left.
+                            let engine = engine.clone();
+                            jot_core::runtime::spawn(async move { engine.unload().await });
+                        }
+                        cx.refresh_windows();
+                    }
+                },
+            ),
+        )
+        .into_any_element();
+        if settings.transcription_engine == TranscriptionEngine::Local {
+            let mut rows = vec![engine];
+            rows.extend(self.local_rows(theme, settings, cx));
+            return widgets::section(tr(Msg::Transcription), theme, rows).into_any_element();
+        }
         widgets::section(
             tr(Msg::Transcription),
             theme,
             vec![
+                engine,
                 widgets::toggle(
                     "smart-transcription",
                     tr(Msg::Smart),
@@ -1222,7 +1582,7 @@ impl Render for SettingsView {
         let section = match self.category {
             Category::General => self.general(theme, cx),
             Category::Shortcuts => self.shortcuts(theme, &settings, cx),
-            Category::Transcription => self.transcription(theme, &settings),
+            Category::Transcription => self.transcription(theme, &settings, cx),
             Category::Audio => self.audio(theme, &settings),
             Category::Appearance => self.appearance(theme, &settings),
             Category::Privacy => self.privacy(theme, &settings, cx),

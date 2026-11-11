@@ -32,7 +32,7 @@ use crate::dictionary::DictionaryStore;
 use crate::gemini::{GeminiClient, TranscriptionError};
 use crate::prompt;
 use crate::replacement;
-use crate::settings::{FormattingPolicy, GeminiConfig, SettingsStore};
+use crate::settings::{FormattingPolicy, GeminiConfig, SettingsStore, TranscriptionEngine};
 use crate::validation;
 use crate::{timeout, validation::Verdict};
 use async_trait::async_trait;
@@ -414,9 +414,100 @@ impl TranscriptionServicing for GeminiTranscriptionService {
     }
 }
 
+/// Sends each dictation to the engine chosen in Settings at that moment.
+/// No fallback: a local failure stays a local failure, so audio never leaves
+/// the machine behind the user's back.
+pub struct EngineRouter {
+    pub gemini: Arc<dyn TranscriptionServicing>,
+    pub local: Arc<dyn TranscriptionServicing>,
+    pub settings: Arc<SettingsStore>,
+}
+
+impl EngineRouter {
+    fn current(&self) -> &Arc<dyn TranscriptionServicing> {
+        match self.settings.get().transcription_engine {
+            TranscriptionEngine::Gemini => &self.gemini,
+            TranscriptionEngine::Local => &self.local,
+        }
+    }
+}
+
+#[async_trait]
+impl TranscriptionServicing for EngineRouter {
+    async fn warm(&self) {
+        self.current().warm().await
+    }
+
+    async fn transcribe(
+        &self,
+        audio_path: &Path,
+        duration: Duration,
+        context: &DictationContext,
+    ) -> Result<TranscriptionResult, TranscriptionError> {
+        self.current()
+            .transcribe(audio_path, duration, context)
+            .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct Named(&'static str, Arc<std::sync::atomic::AtomicUsize>);
+
+    #[async_trait]
+    impl TranscriptionServicing for Named {
+        async fn transcribe(
+            &self,
+            _: &Path,
+            _: Duration,
+            _: &DictationContext,
+        ) -> Result<TranscriptionResult, TranscriptionError> {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.0 == "local" {
+                Err(TranscriptionError::LocalEngine("broken".into()))
+            } else {
+                Ok(TranscriptionResult {
+                    raw_transcript: "x".into(),
+                    cleaned_transcript: "x".into(),
+                    model_id: self.0.into(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_router_never_falls_back_to_gemini_when_local_fails() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = Arc::new(SettingsStore::open(temp.path().join("settings.json")));
+        let gemini_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let router = EngineRouter {
+            gemini: Arc::new(Named("gemini", gemini_calls.clone())),
+            local: Arc::new(Named("local", Arc::default())),
+            settings: settings.clone(),
+        };
+        let context = DictationContext::default();
+        let path = Path::new("unused.wav");
+        assert_eq!(
+            router
+                .transcribe(path, Duration::from_secs(1), &context)
+                .await
+                .unwrap()
+                .model_id,
+            "gemini"
+        );
+        settings.update(None, |s| {
+            s.transcription_engine = TranscriptionEngine::Local
+        });
+        assert_eq!(
+            router
+                .transcribe(path, Duration::from_secs(1), &context)
+                .await,
+            Err(TranscriptionError::LocalEngine("broken".into()))
+        );
+        assert_eq!(gemini_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn suppression_is_keyed_on_the_vocabulary_not_a_bare_flag() {

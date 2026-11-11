@@ -1081,6 +1081,9 @@ fn classify(error: &TranscriptionError) -> (DictationFailure, &'static str, Opti
         TranscriptionError::Timeout => (DictationFailure::Timeout, "timeout", None),
         TranscriptionError::EmptyTranscript => (DictationFailure::Validation, "empty", None),
         TranscriptionError::SafetyBlocked => (DictationFailure::SafetyBlocked, "safety", None),
+        TranscriptionError::LocalEngine(detail) => {
+            (DictationFailure::LocalEngine, "local", Some(detail.clone()))
+        }
     }
 }
 
