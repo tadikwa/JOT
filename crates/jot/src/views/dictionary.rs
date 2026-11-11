@@ -89,7 +89,7 @@ impl DictionaryView {
         let term = cx.new(|cx| TextField::new("dictionary-term", Msg::Term, cx));
         let misspelling =
             cx.new(|cx| TextField::new("dictionary-misspelling", Msg::Misspelling, cx));
-        let search = cx.new(|cx| TextField::new("dictionary-search", Msg::Search, cx));
+        let search = cx.new(|cx| TextField::new("dictionary-search", Msg::SearchDictionary, cx));
         let subscriptions = vec![
             cx.subscribe(&term, |this: &mut Self, _, _: &Submit, cx| this.save(cx)),
             cx.subscribe(&misspelling, |this: &mut Self, _, _: &Submit, cx| {

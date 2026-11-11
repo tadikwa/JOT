@@ -253,6 +253,9 @@ pub fn toggle(
         .on_click(move |event, window, cx| on_click(event, window, cx))
         .child(
             div()
+                // Let long descriptions wrap instead of pushing the switch out of the card.
+                .flex_1()
+                .min_w_0()
                 .flex()
                 .flex_col()
                 .gap(px(2.0))

@@ -649,3 +649,50 @@ fn dictionary_learning_keeps_history_authoritative_and_only_accepted_rules_reach
             .any(|s| s.status == SuggestionStatus::Rejected)
     );
 }
+
+#[test]
+fn deleting_a_dictation_purges_its_pending_suggestion_but_keeps_accepted_rules() {
+    use jot_core::dictionary::{DictionaryStore, SuggestionStatus};
+    let f = Fixture::new();
+    let (kept, _) = f.add(120, SessionStatus::Inserted, Some("Voici Klod Code."));
+    let (pending, _) = f.add(121, SessionStatus::Inserted, Some("J’ai Proxmocks."));
+    let (kept, pending) = (kept.id.to_string(), pending.id.to_string());
+    f.store
+        .edit(&kept, "Voici Klod Code.", "Voici Claude Code.")
+        .unwrap();
+    f.store
+        .edit(&pending, "J’ai Proxmocks.", "J’ai Proxmox.")
+        .unwrap();
+    let path = f.temp.path().join("dictionary.json");
+    let dictionary = DictionaryStore::open(path.clone());
+    for id in [&kept, &pending] {
+        dictionary
+            .learn_from_corrections(&f.store.corrections(id).unwrap())
+            .unwrap();
+    }
+    let accepted = dictionary
+        .suggestions()
+        .into_iter()
+        .find(|s| s.sources.iter().any(|source| source.dictation_id == kept))
+        .unwrap();
+    dictionary.accept_suggestion(accepted.id).unwrap();
+
+    // Same sequence as the History view's delete action, without opening Dictionary.
+    f.store.delete_many(&[kept, pending]).unwrap();
+    let live = f.store.correction_session_ids().unwrap();
+    assert_eq!(
+        dictionary
+            .purge_orphan_suggestions(&live.into_iter().collect())
+            .unwrap(),
+        1
+    );
+    let reopened = DictionaryStore::open(path);
+    assert!(
+        reopened
+            .suggestions()
+            .iter()
+            .all(|s| s.status != SuggestionStatus::Pending)
+    );
+    assert_eq!(reopened.entries().len(), 1);
+    assert_eq!(reopened.entries()[0].term, "Claude Code");
+}

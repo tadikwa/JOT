@@ -122,6 +122,7 @@ messages! {
     AdvancedSaved => "Saved. Applies to your next dictation.", "Réglages enregistrés. Ils s’appliquent à la prochaine dictée.";
     Unavailable => "{0} (unavailable)", "{0} (indisponible)";
     Search => "Search your dictations", "Rechercher dans les dictées";
+    SearchDictionary => "Search the dictionary", "Rechercher dans le dictionnaire";
     Retrying => "Retrying…", "Nouvelle tentative…";
     RetryRecovered => "Recovered. The transcript is now available.", "Dictée récupérée. Le texte est disponible.";
     RetryOffline => "Still offline. This dictation remains queued.", "Toujours hors ligne. La dictée reste en attente.";
