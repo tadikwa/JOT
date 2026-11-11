@@ -769,6 +769,8 @@ pub fn system_prompt(vocabulary: &[String], lists: bool) -> String {
         prompt.push_str(PROMPT_LIST_EXAMPLES);
     }
     prompt.push_str(PROMPT_TAIL);
+    // The raw strings pick up CRLF on a `core.autocrlf` checkout.
+    prompt.retain(|c| c != '\r');
     if !vocabulary.is_empty() {
         prompt.push_str("\n\nOrthographe de référence de certains termes : ");
         prompt.push_str(&vocabulary.join(", "));
