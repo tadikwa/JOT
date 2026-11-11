@@ -824,7 +824,7 @@ pub fn sanitize(raw: &str) -> String {
     TAG.replace_all(raw, " ").into_owned()
 }
 
-/// Prompts "v15j" (prose) and "v15m" (lists) of `docs/v15/RAPPORT-V15.md`,
+/// Prompts "v15j" (prose) and "v15n" (lists) of `docs/v15/RAPPORT-V15.md`,
 /// chosen on the `docs/v15/bench/*.json` corpora: the list rules are only sent
 /// when [`looks_enumerated`], because on long monologues they made the 4B write
 /// reports and drop hedges. Greedy decoding makes a 4B model sensitive to every
