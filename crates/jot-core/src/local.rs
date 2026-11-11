@@ -1276,7 +1276,7 @@ mod tests {
             "../../../docs/v15/bench/reformulation/variants/v15j.json"
         ));
         let lists = variant(include_str!(
-            "../../../docs/v15/bench/reformulation/variants/v15m.json"
+            "../../../docs/v15/bench/reformulation/variants/v15n.json"
         ));
         assert_eq!(system_prompt(&[], false), prose.0);
         assert_eq!(system_prompt(&[], true), lists.0);
