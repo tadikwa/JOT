@@ -164,6 +164,8 @@ pub struct TextField {
     reveal_caret: bool,
     edit_revision: u64,
     wrap_end: bool,
+    /// A single click is held: moving the mouse extends the selection.
+    dragging: bool,
 }
 
 impl gpui::EventEmitter<Submit> for TextField {}
@@ -199,6 +201,7 @@ impl TextField {
             reveal_caret: true,
             edit_revision: 0,
             wrap_end: false,
+            dragging: false,
         }
     }
 
@@ -394,6 +397,69 @@ impl TextField {
         }
     }
 
+    /// One click places the caret (Shift extends), two select a word, three a
+    /// paragraph, as in every Windows editor.
+    fn click_at(&mut self, caret: usize, clicks: usize, extend: bool) {
+        match clicks {
+            2 => self.selection = self.word_at(caret),
+            n if n >= 3 => self.selection = self.paragraph_at(caret),
+            _ => self.move_caret(caret, extend),
+        }
+        self.dragging = clicks <= 1;
+        self.coalescing = false;
+    }
+
+    fn drag_to(&mut self, at: Point<Pixels>, window: &Window, cx: &mut Context<Self>) {
+        if !self.dragging {
+            return;
+        }
+        if let Some(caret) = self.caret_from_click(at, window)
+            && caret != self.selection.end
+        {
+            self.selection = self.selection.start..caret;
+            // Past the top or bottom edge: the view follows the caret.
+            self.reveal_caret = true;
+            cx.notify();
+        }
+    }
+
+    /// The word under `index`, or the run of spaces or punctuation there.
+    fn word_at(&self, index: usize) -> Range<usize> {
+        let is_word = |c: char| c.is_alphanumeric() || c == '_';
+        let index = index.min(self.content.len());
+        let Some(here) = self.content[index..]
+            .chars()
+            .next()
+            .or_else(|| self.content[..index].chars().next_back())
+        else {
+            return index..index;
+        };
+        let kind = |c: char| (is_word(c), c.is_whitespace());
+        let target = kind(here);
+        let start = self.content[..index]
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| kind(*c) == target && *c != '\n')
+            .last()
+            .map_or(index, |(offset, _)| offset);
+        let end = self.content[index..]
+            .char_indices()
+            .take_while(|(_, c)| kind(*c) == target && *c != '\n')
+            .last()
+            .map_or(index, |(offset, c)| index + offset + c.len_utf8());
+        start..end
+    }
+
+    /// The line between two newlines around `index`, without them.
+    fn paragraph_at(&self, index: usize) -> Range<usize> {
+        let index = index.min(self.content.len());
+        let start = self.content[..index].rfind('\n').map_or(0, |at| at + 1);
+        let end = self.content[index..]
+            .find('\n')
+            .map_or(self.content.len(), |at| index + at);
+        start..end
+    }
+
     fn selection_range(&self) -> Range<usize> {
         self.selection.start.min(self.selection.end)..self.selection.start.max(self.selection.end)
     }
@@ -522,6 +588,12 @@ impl TextField {
                 "c" if self.selection.start != self.selection.end && !self.masked => {
                     let selected = self.content[self.selection_range()].to_string();
                     set_clipboard_text(selected, cx);
+                }
+                "x" if self.selection.start != self.selection.end && !self.masked => {
+                    let range = self.selection_range();
+                    set_clipboard_text(self.content[range.clone()].to_string(), cx);
+                    self.checkpoint(false);
+                    self.replace(range, "");
                 }
                 _ => return,
             }
@@ -706,8 +778,7 @@ impl TextField {
                     this.wrap_end = this.layout.as_ref().zip(this.last_bounds).is_some_and(|(layout, bounds)| {
                         layout.position(caret, false).y > event.position.y - bounds.origin.y - theme::spacing::S + this.scroll_offset
                     });
-                    this.move_caret(caret, event.modifiers.shift);
-                    this.coalescing = false;
+                    this.click_at(caret, event.click_count, event.modifiers.shift);
                     this.reveal_caret = true;
                 }
                 cx.notify();
@@ -768,6 +839,23 @@ impl TextField {
                     field.layout = Some(layout);
                 });
                 window.handle_input(&focus_handle, ElementInputHandler::new(bounds, entity.clone()), cx);
+                // Window-wide, so a drag keeps selecting outside the box.
+                window.on_mouse_event({
+                    let entity = entity.clone();
+                    move |event: &gpui::MouseMoveEvent, phase, window, cx| {
+                        if phase == gpui::DispatchPhase::Bubble && event.pressed_button == Some(gpui::MouseButton::Left) {
+                            entity.update(cx, |field, cx| field.drag_to(event.position, window, cx));
+                        }
+                    }
+                });
+                window.on_mouse_event({
+                    let entity = entity.clone();
+                    move |_: &gpui::MouseUpEvent, phase, _, cx| {
+                        if phase == gpui::DispatchPhase::Bubble {
+                            entity.update(cx, |field, _| field.dragging = false);
+                        }
+                    }
+                });
             }).size_full()).into_any_element()
     }
 
@@ -1009,8 +1097,9 @@ impl Render for TextField {
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
                     this.focus_handle.focus(window, cx);
                     if let Some(caret) = this.caret_from_click(event.position, window) {
-                        this.selection = caret..caret;
-                        this.coalescing = false;
+                        this.click_at(caret, event.click_count, event.modifiers.shift);
+                        // Dragging is only tracked in the multi-line editor.
+                        this.dragging = false;
                     }
                     cx.notify();
                 }),
@@ -1396,6 +1485,54 @@ mod tests {
             window,
             cx,
         );
+    }
+
+    #[gpui::test]
+    fn clicks_select_a_word_a_paragraph_or_extend_and_ctrl_x_cuts(cx: &mut TestAppContext) {
+        let field = field(cx);
+        let window = cx.add_window(|_, _| gpui::Empty);
+        cx.update_window(window.into(), |_, window, cx| {
+            field.update(cx, |field, cx| {
+                field.multiline = true;
+                field.set_content("1. Installe Proxmox ce soir.\n2. Lance l'été");
+                let proxmox = field.content.find("Proxmox").unwrap() + 3;
+                field.click_at(proxmox, 2, false);
+                assert_eq!(&field.content[field.selection_range()], "Proxmox");
+                field.click_at(3, 3, false);
+                assert_eq!(
+                    &field.content[field.selection_range()],
+                    "1. Installe Proxmox ce soir."
+                );
+                let ete = field.content.find("été").unwrap() + 2;
+                field.click_at(ete, 2, false);
+                assert_eq!(
+                    &field.content[field.selection_range()],
+                    "été",
+                    "accents stay in the word"
+                );
+                field.click_at(field.content.len(), 3, false);
+                assert_eq!(&field.content[field.selection_range()], "2. Lance l'été");
+
+                field.click_at(3, 1, false);
+                assert!(field.dragging);
+                field.click_at(19, 1, true);
+                assert_eq!(&field.content[field.selection_range()], "Installe Proxmox");
+                key(field, "ctrl-x", window, cx);
+                assert_eq!(field.content(), "1.  ce soir.\n2. Lance l'été");
+                assert_eq!(
+                    cx.read_from_clipboard()
+                        .and_then(|item| item.text())
+                        .as_deref(),
+                    Some("Installe Proxmox")
+                );
+                key(field, "ctrl-z", window, cx);
+                assert_eq!(
+                    field.content(),
+                    "1. Installe Proxmox ce soir.\n2. Lance l'été"
+                );
+            });
+        })
+        .unwrap();
     }
 
     #[gpui::test]
