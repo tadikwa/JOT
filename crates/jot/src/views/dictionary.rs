@@ -275,15 +275,23 @@ impl DictionaryView {
                 entry.misspelling.clone(),
                 format!(
                     "{} · {} · {}",
-                    if entry.provenance.is_some() {
-                        ui("Validated", "Validée")
-                    } else {
-                        ui("Manual", "Manuelle")
+                    // Three states a user must tell apart: a term only steers
+                    // the spelling, a correction rewrites, a suggestion waits.
+                    match (entry.misspelling.is_some(), entry.enabled) {
+                        (false, true) => ui("Vocabulary term", "Terme de vocabulaire"),
+                        (false, false) => {
+                            ui(
+                                "Vocabulary term (disabled)",
+                                "Terme de vocabulaire (désactivé)",
+                            )
+                        }
+                        (true, true) => ui("Active correction", "Correction active"),
+                        (true, false) => ui("Correction (disabled)", "Correction (désactivée)"),
                     },
-                    if entry.enabled {
-                        ui("Active", "Active")
+                    if entry.provenance.is_some() {
+                        ui("validated", "validée")
                     } else {
-                        ui("Disabled", "Désactivée")
+                        ui("manual", "manuelle")
                     },
                     entry.created_at.date()
                 ),
@@ -295,7 +303,10 @@ impl DictionaryView {
                 format!(
                     "{} · {} {}% · {} {}",
                     if suggestion.status == SuggestionStatus::Pending {
-                        ui("Pending validation", "À valider")
+                        ui(
+                            "Suggestion pending validation (not applied)",
+                            "Suggestion à valider (non appliquée)",
+                        )
                     } else {
                         ui("Rejected", "Refusée")
                     },

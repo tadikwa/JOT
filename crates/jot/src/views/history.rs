@@ -164,6 +164,8 @@ pub struct HistoryView {
     pending_open: Option<Option<String>>,
     pending_delete: Option<Vec<String>>,
     message: Option<(String, StatusTone)>,
+    /// Names typed in the last edit, offered as vocabulary terms (never as rules).
+    term_offers: Vec<String>,
     loading: bool,
     detail_loading: bool,
     busy: bool,
@@ -233,6 +235,7 @@ impl HistoryView {
             pending_open: None,
             pending_delete: None,
             message: None,
+            term_offers: Vec::new(),
             loading: false,
             detail_loading: false,
             busy: false,
@@ -480,17 +483,35 @@ impl HistoryView {
         self.busy = true;
         let task = cx.background_executor().spawn(async move {
             store.edit(&id, &expected, &text)?;
-            let learned = store
-                .corrections(&id)
-                .and_then(|corrections| dictionary.learn_from_corrections(&corrections));
-            anyhow::Ok((id, learned))
+            let corrections = store.corrections(&id);
+            let learned = corrections
+                .as_ref()
+                .map_err(|e| anyhow::anyhow!("{e}"))
+                .and_then(|corrections| dictionary.learn_from_corrections(corrections));
+            // Already known, or already proposed as a correction: not offered twice.
+            let known: Vec<String> = dictionary
+                .entries()
+                .into_iter()
+                .map(|e| e.term)
+                .chain(dictionary.suggestions().into_iter().map(|s| s.term))
+                .map(|t| t.to_lowercase())
+                .collect();
+            let offers: Vec<String> = corrections
+                .ok()
+                .and_then(|c| c.last().map(jot_core::dictionary::new_terms))
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|term| !known.contains(&term.to_lowercase()))
+                .collect();
+            anyhow::Ok((id, learned, offers))
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
             let _ = this.update(cx, |this, cx| {
                 this.busy = false;
                 match result {
-                    Ok((id, learned)) => {
+                    Ok((id, learned, offers)) => {
+                        this.term_offers = offers;
                         this.message = Some(match learned {
                             Ok(count) if count > 0 => (format!("{} {count}. {}", ui("Changes saved. New dictionary suggestions:", "Modifications enregistrées. Nouvelles suggestions de dictionnaire :"), ui("Review them in Dictionary.", "Validez-les dans le Dictionnaire.")), StatusTone::Good),
                             Ok(_) => (ui("Changes saved. No new lexical suggestion.", "Modifications enregistrées. Aucune nouvelle suggestion lexicale.").into(), StatusTone::Good),
@@ -510,6 +531,36 @@ impl HistoryView {
                 cx.notify();
             });
         }).detach();
+        cx.notify();
+    }
+
+    /// A vocabulary term only: no replacement rule, so the misheard words keep
+    /// their meaning everywhere else.
+    fn remember_term(&mut self, term: &str, cx: &mut Context<Self>) {
+        let added = self.services.dictionary.add(term, None);
+        self.term_offers.retain(|t| t != term);
+        let text = match (crate::i18n::locale(), added) {
+            (crate::i18n::Locale::En, true) => {
+                format!("“{term}” added to your vocabulary as a term (no replacement rule).")
+            }
+            (crate::i18n::Locale::Fr, true) => format!(
+                "« {term} » ajouté à votre vocabulaire comme terme (aucune règle de remplacement)."
+            ),
+            (crate::i18n::Locale::En, false) => {
+                format!("“{term}” could not be added: it may already be in the Dictionary.")
+            }
+            (crate::i18n::Locale::Fr, false) => format!(
+                "« {term} » n’a pas pu être ajouté : il est peut-être déjà dans le Dictionnaire."
+            ),
+        };
+        self.message = Some((
+            text,
+            if added {
+                StatusTone::Good
+            } else {
+                StatusTone::Bad
+            },
+        ));
         cx.notify();
     }
 
@@ -1453,6 +1504,28 @@ impl Render for HistoryView {
                 message.clone(),
                 *tone,
                 theme,
+            ));
+        }
+        if !self.term_offers.is_empty() {
+            page = page.child(div().flex().flex_wrap().gap(theme::spacing::XS).children(
+                self.term_offers.iter().enumerate().map(|(index, term)| {
+                    let term = term.clone();
+                    widgets::button(
+                        ("history-remember-term", index),
+                        match crate::i18n::locale() {
+                            crate::i18n::Locale::En => {
+                                format!("Remember “{term}” in my vocabulary")
+                            }
+                            crate::i18n::Locale::Fr => {
+                                format!("Mémoriser « {term} » dans mon vocabulaire")
+                            }
+                        },
+                        ButtonKind::Secondary,
+                        !self.busy,
+                        theme,
+                        cx.listener(move |this, _, _, cx| this.remember_term(&term, cx)),
+                    )
+                }),
             ));
         }
         if self.pending_open.is_some() {

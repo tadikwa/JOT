@@ -17,7 +17,9 @@
 //! post-model).
 
 mod learning;
-pub use learning::{DictionarySuggestion, LearningSource, SuggestionStatus, extract_suggestions};
+pub use learning::{
+    DictionarySuggestion, LearningSource, SuggestionStatus, extract_suggestions, new_terms,
+};
 
 use crate::file_layout;
 use crate::history::Correction;

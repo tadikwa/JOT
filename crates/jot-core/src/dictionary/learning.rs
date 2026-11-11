@@ -148,6 +148,35 @@ pub fn extract_suggestions(correction: &Correction) -> Vec<DictionarySuggestion>
     suggestions
 }
 
+/// Names the user typed in place of what the recognizer misheard ("les mieux"
+/// → "Lumio"). Too far from the heard words for [`extract_suggestions`], and a
+/// "les mieux → Lumio" rule would rewrite ordinary French: they are only
+/// offered as vocabulary terms, which the models get as a spelling reference.
+pub fn new_terms(correction: &Correction) -> Vec<String> {
+    let heard: std::collections::HashSet<String> = correction
+        .before
+        .unicode_words()
+        .map(str::to_lowercase)
+        .collect();
+    let mut terms: Vec<String> = Vec::new();
+    for word in correction.after.unicode_words() {
+        let mut chars = word.chars();
+        let name_like = word.chars().count() >= 3
+            && (chars.next().is_some_and(char::is_uppercase)
+                || chars.any(|c| c.is_uppercase() || c.is_numeric()));
+        if name_like
+            && !heard.contains(&word.to_lowercase())
+            && !terms
+                .iter()
+                .any(|t| t.to_lowercase() == word.to_lowercase())
+        {
+            terms.push(word.to_string());
+        }
+    }
+    // More than a few new names is a rewrite, not a misheard term.
+    if terms.len() > 3 { Vec::new() } else { terms }
+}
+
 fn spelling_confidence(wrong: &str, right: &str) -> Option<u8> {
     if wrong
         .chars()
@@ -261,6 +290,32 @@ mod tests {
             );
         }
     }
+    /// The reported case: a phonetic mishearing is no spelling evidence, so no
+    /// replacement rule is suggested, only the term.
+    #[test]
+    fn a_misheard_name_is_offered_as_a_term_never_as_a_rule() {
+        let lumio = correction(
+            "J’ai testé les mieux hier soir.",
+            "J’ai testé Lumio hier soir.",
+        );
+        assert!(extract_suggestions(&lumio).is_empty());
+        assert_eq!(new_terms(&lumio), ["Lumio"]);
+        let proxmox = correction("J’ai installé Proxmocks.", "J’ai installé Proxmox.");
+        assert_eq!(extract_suggestions(&proxmox).len(), 1);
+        assert_eq!(new_terms(&proxmox), ["Proxmox"]);
+        for (before, after) in [
+            ("le contrôle qualité", "le contrôle qualité est fait"),
+            ("Bonjour Claire", "bonjour claire"),
+            ("un deux trois", "Alpha Beta Gamma Delta"),
+        ] {
+            assert!(new_terms(&correction(before, after)).is_empty(), "{after}");
+        }
+        assert_eq!(
+            new_terms(&correction("appuie sur contrôle", "appuie sur Ctrl")),
+            ["Ctrl"]
+        );
+    }
+
     #[test]
     fn multiple_spelling_changes_and_unicode_are_separate() {
         let found = extract_suggestions(&correction(
