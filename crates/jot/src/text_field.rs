@@ -509,7 +509,7 @@ impl TextField {
                     if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                         self.checkpoint(false);
                         let range = self.selection_range();
-                        self.replace(range, &text);
+                        self.replace(range, &jot_core::win32::from_crlf(&text));
                     }
                 }
                 "a" => self.selection = 0..self.content.len(),
@@ -521,7 +521,7 @@ impl TextField {
                 // Never from a masked field: the API key does not leave here.
                 "c" if self.selection.start != self.selection.end && !self.masked => {
                     let selected = self.content[self.selection_range()].to_string();
-                    cx.write_to_clipboard(ClipboardItem::new_string(selected));
+                    set_clipboard_text(selected, cx);
                 }
                 _ => return,
             }
@@ -1091,7 +1091,9 @@ fn caret(theme: Theme) -> impl IntoElement {
 }
 
 pub fn set_clipboard_text(text: impl Into<String>, cx: &gpui::App) {
-    cx.write_to_clipboard(ClipboardItem::new_string(text.into()));
+    cx.write_to_clipboard(ClipboardItem::new_string(jot_core::win32::to_crlf(
+        &text.into(),
+    )));
 }
 
 #[cfg(test)]

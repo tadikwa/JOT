@@ -152,8 +152,19 @@ pub fn restore_clipboard(snapshot: ClipboardSnapshot) {
 /// Writes `text`, tagged so Windows clipboard history and cloud sync skip it,
 /// and returns the clipboard sequence number our write produced.
 pub fn write_clipboard(text: &str) -> Option<u32> {
-    let text = text.to_string();
+    let text = to_crlf(text);
     on_input_thread(move || platform::write_clipboard(&text))
+}
+
+/// Windows text formats end lines with CRLF: a bare LF pastes as nothing in
+/// classic edit controls, so a dictated list would collapse onto one line.
+pub fn to_crlf(text: &str) -> String {
+    from_crlf(text).replace('\n', "\r\n")
+}
+
+/// The reverse, for text read back from the clipboard into Jot's fields.
+pub fn from_crlf(text: &str) -> String {
+    text.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 pub fn clipboard_sequence_number() -> u32 {
@@ -533,6 +544,14 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clipboard_text_uses_windows_line_endings_both_ways() {
+        assert_eq!(to_crlf("1. a\n2. b"), "1. a\r\n2. b");
+        assert_eq!(to_crlf("a\r\nb"), "a\r\nb", "no doubled CR");
+        assert_eq!(from_crlf("a\r\nb\rc"), "a\nb\nc");
+        assert_eq!(to_crlf("une ligne"), "une ligne");
+    }
 
     #[test]
     fn the_input_thread_runs_work_and_returns_it() {

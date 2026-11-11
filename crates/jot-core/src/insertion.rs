@@ -85,8 +85,10 @@ impl TextInserting for InsertionCoordinator {
         }
 
         // Tier 1: type it. No clipboard involved, so nothing to restore and
-        // nothing for a clipboard manager to archive.
+        // nothing for a clipboard manager to archive. Never for several lines:
+        // a typed line break is an Enter, which sends a chat message.
         if text.chars().count() <= win32::MAX_TYPED_CHARS
+            && !text.contains('\n')
             && win32::focus_kind() == FocusKind::EditableText
             && win32::type_text(text)
         {
