@@ -138,6 +138,38 @@ pub enum LocalReformulation {
     Off,
 }
 
+/// When the local models give their memory back, counted from the end of the
+/// last dictation's processing. Never while one is recording or processing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LocalUnload {
+    Immediately,
+    OneMinute,
+    TenMinutes,
+    FifteenMinutes,
+    ThirtyMinutes,
+    KeepLoaded,
+    #[default]
+    #[serde(other)]
+    FiveMinutes,
+}
+
+impl LocalUnload {
+    /// None keeps the models loaded until Jot quits or leaves local mode.
+    pub fn delay(self) -> Option<std::time::Duration> {
+        let minutes = match self {
+            Self::Immediately => 0,
+            Self::OneMinute => 1,
+            Self::FiveMinutes => 5,
+            Self::TenMinutes => 10,
+            Self::FifteenMinutes => 15,
+            Self::ThirtyMinutes => 30,
+            Self::KeepLoaded => return None,
+        };
+        Some(std::time::Duration::from_secs(minutes * 60))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
@@ -183,6 +215,7 @@ pub struct Settings {
     pub audio_retention_days: i64,
     pub transcription_engine: TranscriptionEngine,
     pub local_reformulation: LocalReformulation,
+    pub local_unload: LocalUnload,
     /// Ask GitHub Releases at most once a day at startup whether a newer Jot
     /// exists. Only the app version leaves the PC; nothing is downloaded.
     pub check_updates: bool,
@@ -217,6 +250,7 @@ impl Default for Settings {
             audio_retention_days: 7,
             transcription_engine: TranscriptionEngine::Gemini,
             local_reformulation: LocalReformulation::Fast,
+            local_unload: LocalUnload::FiveMinutes,
             check_updates: true,
             include_prereleases: false,
             gate_trips: Vec::new(),
@@ -512,6 +546,22 @@ mod tests {
         .unwrap();
         assert_eq!(local.transcription_engine, TranscriptionEngine::Local);
         assert_eq!(local.local_reformulation, LocalReformulation::Quality);
+    }
+
+    #[test]
+    fn local_models_are_freed_after_five_minutes_unless_chosen_otherwise() {
+        let legacy: Settings = serde_json::from_str(r#"{"audioRetentionDays":30}"#).unwrap();
+        assert_eq!(legacy.local_unload, LocalUnload::FiveMinutes);
+        assert_eq!(
+            legacy.local_unload.delay(),
+            Some(std::time::Duration::from_secs(300))
+        );
+        let chosen: Settings = serde_json::from_str(r#"{"localUnload":"keepLoaded"}"#).unwrap();
+        assert_eq!(chosen.local_unload.delay(), None);
+        let now: Settings = serde_json::from_str(r#"{"localUnload":"immediately"}"#).unwrap();
+        assert_eq!(now.local_unload.delay(), Some(std::time::Duration::ZERO));
+        let future: Settings = serde_json::from_str(r#"{"localUnload":"twoHours"}"#).unwrap();
+        assert_eq!(future.local_unload, LocalUnload::FiveMinutes);
     }
 
     #[test]

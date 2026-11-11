@@ -99,6 +99,15 @@ messages! {
     ReformOff => "Off (raw transcript)", "Désactivée (texte brut)";
     ReformFast => "Fast — Qwen3.5 4B", "Rapide — Qwen3.5 4B";
     ReformQuality => "Quality — Qwen3.5 9B", "Qualité — Qwen3.5 9B";
+    LocalUnload => "Free the local models after a period of inactivity", "Libérer les modèles locaux après une période d’inactivité";
+    UnloadNow => "Right after each dictation", "Immédiatement après chaque dictée";
+    UnloadOne => "1 min", "1 min";
+    UnloadFive => "5 min", "5 min";
+    UnloadTen => "10 min", "10 min";
+    UnloadFifteen => "15 min", "15 min";
+    UnloadThirty => "30 min", "30 min";
+    UnloadNever => "Keep the models loaded", "Garder les modèles chargés";
+    FreeMemory => "Free the memory now", "Libérer la mémoire maintenant";
     Noise => "Adapt to ambient noise (experimental)", "S’adapter au bruit ambiant (expérimental)";
     NoiseHint => "Uses the ambient noise level to help distinguish speech from background noise.", "Tient compte du bruit ambiant pour mieux distinguer la voix du bruit de fond.";
     VoicePrivacy => "Jot sends audio directly to the configured Gemini API with your key. Jot has no intermediary server, account or analytics.", "Jot envoie l’audio directement à l’API Gemini configurée avec votre clé. Jot fonctionne sans serveur intermédiaire, sans compte Jot et sans outil d’analyse d’usage.";

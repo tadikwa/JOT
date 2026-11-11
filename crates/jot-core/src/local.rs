@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -354,8 +354,11 @@ impl Drop for Server {
 /// How long a cold start may take: the first Vulkan launch compiles shaders
 /// (24 s measured), and a CPU-only machine maps several GB.
 const START_BUDGET: Duration = Duration::from_secs(120);
-/// Servers are unloaded after this long without a dictation, freeing VRAM/RAM.
-const IDLE_UNLOAD: Duration = Duration::from_secs(10 * 60);
+/// How often the idle check runs: "immediately" frees within this delay.
+const REAPER_TICK: Duration = Duration::from_secs(5);
+
+type UnloadAfter = Box<dyn Fn() -> Option<Duration> + Send + Sync>;
+type Dictating = Box<dyn Fn() -> bool + Send + Sync>;
 
 /// What the UI shows about the running engine.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -363,15 +366,35 @@ pub struct EngineStatus {
     /// "NVIDIA GeForce …" or None when running on the CPU.
     pub gpu: Option<String>,
     pub running: bool,
+    /// A model is being loaded into memory.
+    pub loading: bool,
 }
 
 pub struct LocalEngine {
     http: reqwest::Client,
     asr: tokio::sync::Mutex<Option<Server>>,
     llm: tokio::sync::Mutex<Option<(Pack, Server)>>,
+    /// End of the last use; the idle delay counts from here.
     last_used: Mutex<Instant>,
+    /// Transcriptions and warm-ups in flight: the models are never freed under them.
+    busy: AtomicUsize,
+    /// "Free the memory now" while busy: freed as soon as the dictation ends.
+    release_requested: AtomicBool,
+    unload_after: Mutex<UnloadAfter>,
+    /// Recording, processing or inserting, as the coordinator sees it.
+    dictating: Mutex<Dictating>,
     status: Mutex<EngineStatus>,
     device: tokio::sync::OnceCell<Option<(String, String)>>,
+}
+
+/// Held while the engine is in use; dropping it restarts the idle delay.
+struct Busy<'a>(&'a LocalEngine);
+
+impl Drop for Busy<'_> {
+    fn drop(&mut self) {
+        *self.0.last_used.lock() = Instant::now();
+        self.0.busy.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 impl LocalEngine {
@@ -386,6 +409,10 @@ impl LocalEngine {
             asr: tokio::sync::Mutex::new(None),
             llm: tokio::sync::Mutex::new(None),
             last_used: Mutex::new(Instant::now()),
+            busy: AtomicUsize::new(0),
+            release_requested: AtomicBool::new(false),
+            unload_after: Mutex::new(Box::new(|| Some(Duration::from_secs(5 * 60)))),
+            dictating: Mutex::new(Box::new(|| false)),
             status: Mutex::new(EngineStatus::default()),
             device: tokio::sync::OnceCell::new(),
         });
@@ -397,24 +424,77 @@ impl LocalEngine {
         self.status.lock().clone()
     }
 
+    /// Where the idle delay and the dictation state come from (the settings and
+    /// the coordinator); until then, 5 minutes and never dictating.
+    pub fn set_policy(
+        &self,
+        unload_after: impl Fn() -> Option<Duration> + Send + Sync + 'static,
+        dictating: impl Fn() -> bool + Send + Sync + 'static,
+    ) {
+        *self.unload_after.lock() = Box::new(unload_after);
+        *self.dictating.lock() = Box::new(dictating);
+    }
+
+    fn busy(&self) -> Busy<'_> {
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        *self.last_used.lock() = Instant::now();
+        Busy(self)
+    }
+
+    /// Whether the models may be freed at `now`: never during a dictation, its
+    /// processing or a retry, and only once the chosen delay has passed since
+    /// the end of the last one (or right away after "free the memory now").
+    fn idle_at(&self, now: Instant) -> bool {
+        if self.busy.load(Ordering::SeqCst) > 0 || (self.dictating.lock())() {
+            return false;
+        }
+        if self.release_requested.load(Ordering::SeqCst) {
+            return true;
+        }
+        let delay = (self.unload_after.lock())();
+        delay.is_some_and(|delay| now.saturating_duration_since(*self.last_used.lock()) >= delay)
+    }
+
     fn spawn_reaper(engine: Weak<Self>) {
         let Some(handle) = crate::runtime::try_handle() else {
             return;
         };
         handle.spawn(async move {
             loop {
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::time::sleep(REAPER_TICK).await;
                 let Some(engine) = engine.upgrade() else {
                     return;
                 };
-                if engine.last_used.lock().elapsed() >= IDLE_UNLOAD {
-                    engine.unload().await;
+                if engine.idle_at(Instant::now()) {
+                    engine.release_if_idle().await;
                 }
             }
         });
     }
 
-    /// Stops both servers. Safe to call at any time; the next dictation restarts them.
+    /// "Free the memory now", leaving local mode: frees at once, or as soon as
+    /// the dictation in progress is finished — never under it.
+    pub async fn release(&self) {
+        self.release_requested.store(true, Ordering::SeqCst);
+        self.release_if_idle().await;
+    }
+
+    async fn release_if_idle(&self) {
+        let mut asr = self.asr.lock().await;
+        let mut llm = self.llm.lock().await;
+        // Checked again under the locks: a key press may have started a warm-up.
+        if !self.idle_at(Instant::now()) {
+            return;
+        }
+        self.release_requested.store(false, Ordering::SeqCst);
+        let freed = asr.take().is_some() | llm.take().is_some();
+        self.status.lock().running = false;
+        if freed {
+            tracing::info!("local models freed");
+        }
+    }
+
+    /// Stops both servers at once, busy or not (tests, quitting).
     pub async fn unload(&self) {
         let asr = self.asr.lock().await.take();
         let llm = self.llm.lock().await.take();
@@ -451,8 +531,21 @@ impl LocalEngine {
         context: u32,
     ) -> Result<Server, String> {
         let device = self.device().await;
+        self.status.lock().loading = true;
+        let result = self.start_on(role, &model_args, context, device).await;
+        self.status.lock().loading = false;
+        result
+    }
+
+    async fn start_on(
+        &self,
+        role: &str,
+        model_args: &[String],
+        context: u32,
+        device: Option<(String, String)>,
+    ) -> Result<Server, String> {
         match self
-            .spawn_and_wait(role, &model_args, context, device.as_ref())
+            .spawn_and_wait(role, model_args, context, device.as_ref())
             .await
         {
             Ok(server) => {
@@ -463,9 +556,7 @@ impl LocalEngine {
             // settings page says so.
             Err(error) if device.is_some() => {
                 tracing::warn!(%error, role, "GPU start failed — retrying on the CPU");
-                let server = self
-                    .spawn_and_wait(role, &model_args, context, None)
-                    .await?;
+                let server = self.spawn_and_wait(role, model_args, context, None).await?;
                 self.status.lock().gpu = None;
                 Ok(server)
             }
@@ -620,7 +711,7 @@ impl LocalEngine {
     }
 
     pub async fn warm(&self, reformulation: Option<Pack>) {
-        *self.last_used.lock() = Instant::now();
+        let _busy = self.busy();
         if Pack::Transcription.installed()
             && let Err(error) = self.asr_port().await
         {
@@ -905,6 +996,8 @@ impl TranscriptionServicing for LocalTranscriptionService {
             TranscriptionError::BadRequest(format!("unreadable recording: {error}"))
         })?;
         let reformulation = Pack::for_reformulation(self.settings.get().local_reformulation);
+        // From the first model to the second, and for retries too.
+        let _busy = self.engine.busy();
 
         let content = self.engine.transcribe(&audio, duration).await?;
         // Silence/hum hallucinations and empty output both land here; the
@@ -1033,6 +1126,60 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn models_are_freed_only_after_the_delay_and_never_during_a_dictation() {
+        let engine = LocalEngine::new();
+        let dictating = Arc::new(AtomicBool::new(false));
+        let delay = Arc::new(Mutex::new(Some(Duration::from_secs(300))));
+        engine.set_policy(
+            {
+                let delay = delay.clone();
+                move || *delay.lock()
+            },
+            {
+                let dictating = dictating.clone();
+                move || dictating.load(Ordering::SeqCst)
+            },
+        );
+        let start = Instant::now();
+        *engine.last_used.lock() = start;
+        assert!(!engine.idle_at(start + Duration::from_secs(299)));
+        assert!(engine.idle_at(start + Duration::from_secs(300)));
+
+        dictating.store(true, Ordering::SeqCst);
+        assert!(
+            !engine.idle_at(start + Duration::from_secs(3600)),
+            "capturing"
+        );
+        dictating.store(false, Ordering::SeqCst);
+
+        let busy = engine.busy();
+        assert!(
+            !engine.idle_at(Instant::now() + Duration::from_secs(3600)),
+            "processing"
+        );
+        drop(busy);
+        // The delay restarts at the end of the processing.
+        let ended = *engine.last_used.lock();
+        assert!(ended >= start);
+        assert!(!engine.idle_at(ended + Duration::from_secs(299)));
+
+        *delay.lock() = None;
+        assert!(
+            !engine.idle_at(ended + Duration::from_secs(86_400)),
+            "kept loaded"
+        );
+        *delay.lock() = Some(Duration::ZERO);
+        assert!(engine.idle_at(ended), "immediately after each dictation");
+
+        *delay.lock() = None;
+        engine.release_requested.store(true, Ordering::SeqCst);
+        assert!(engine.idle_at(ended), "free the memory now");
+        let busy = engine.busy();
+        assert!(!engine.idle_at(ended), "but never under a dictation");
+        drop(busy);
+    }
 
     #[test]
     fn asr_output_keeps_only_french_or_english_text() {

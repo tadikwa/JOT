@@ -24,6 +24,7 @@ use jot_core::insertion::InsertionCoordinator;
 use jot_core::local::{LocalEngine, LocalTranscriptionService};
 use jot_core::recovery::{RecoveryScanner, RetryQueue};
 use jot_core::settings::SettingsStore;
+use jot_core::state_machine::DictationState;
 use jot_core::transcription::{EngineRouter, GeminiTranscriptionService, TranscriptionServicing};
 use jot_core::{credentials, file_layout, win32};
 use std::sync::Arc;
@@ -88,6 +89,28 @@ impl Services {
             },
             secure_field_focused: Box::new(|| win32::focus_kind() == win32::FocusKind::Password),
         });
+
+        // Never free the local models under a recording or its processing.
+        local_engine.set_policy(
+            {
+                let settings = settings.clone();
+                move || settings.get().local_unload.delay()
+            },
+            {
+                let coordinator = Arc::downgrade(&coordinator);
+                move || {
+                    coordinator.upgrade().is_some_and(|c| {
+                        !matches!(
+                            c.state(),
+                            DictationState::Idle
+                                | DictationState::Done(_)
+                                | DictationState::Cancelled
+                                | DictationState::Failed(_)
+                        )
+                    })
+                }
+            },
+        );
 
         // The coordinator owns the folders; History mirrors them.
         {

@@ -26,7 +26,9 @@ use jot_core::credentials;
 use jot_core::gemini::KeyCheck;
 use jot_core::hotkey::{DictationActivationMode, HotkeyBinding, HotkeyKey};
 use jot_core::local::{self, Download, Pack};
-use jot_core::settings::{LocalReformulation, Settings, TranscriptionEngine, UiLanguage, UiTheme};
+use jot_core::settings::{
+    LocalReformulation, LocalUnload, Settings, TranscriptionEngine, UiLanguage, UiTheme,
+};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -1035,20 +1037,58 @@ impl SettingsView {
                     .into_any_element(),
             );
         }
+        rows.push(
+            widgets::field_row(
+                tr(Msg::LocalUnload),
+                ui(
+                    "Counted from the end of the last dictation. Never during a recording or its processing. The next dictation reloads them (a few seconds).",
+                    "Compté depuis la fin de la dernière dictée. Jamais pendant un enregistrement ou son traitement. La dictée suivante les recharge (quelques secondes).",
+                ),
+                theme,
+                choices(
+                    "local-unload",
+                    Msg::LocalUnload,
+                    [
+                        (LocalUnload::Immediately, Msg::UnloadNow),
+                        (LocalUnload::OneMinute, Msg::UnloadOne),
+                        (LocalUnload::FiveMinutes, Msg::UnloadFive),
+                        (LocalUnload::TenMinutes, Msg::UnloadTen),
+                        (LocalUnload::FifteenMinutes, Msg::UnloadFifteen),
+                        (LocalUnload::ThirtyMinutes, Msg::UnloadThirty),
+                        (LocalUnload::KeepLoaded, Msg::UnloadNever),
+                    ],
+                    settings.local_unload,
+                    theme,
+                    {
+                        let store = self.services.settings.clone();
+                        move |value, cx| {
+                            store.update(Some("localUnload"), |s| s.local_unload = value);
+                            cx.refresh_windows();
+                        }
+                    },
+                ),
+            )
+            .into_any_element(),
+        );
         let status = self.services.local_engine.status();
-        let acceleration = match (status.running, status.gpu) {
-            (true, Some(gpu)) => format!(
-                "{}{gpu} (Vulkan)",
-                ui("Running on the GPU: ", "Exécution sur le GPU : ")
-            ),
-            (true, None) => ui(
-                "Running on the CPU: no compatible dedicated GPU or not enough video memory. Dictation works, more slowly.",
-                "Exécution sur le processeur : pas de GPU dédié compatible ou mémoire vidéo insuffisante. La dictée fonctionne, plus lentement.",
+        let acceleration = match (status.running, status.loading, status.gpu) {
+            (_, true, _) => ui(
+                "Models: loading into memory…",
+                "Modèles : chargement en mémoire…",
             )
             .into(),
-            (false, _) => ui(
-                "The engine starts with your next dictation and stops after 10 minutes without one.",
-                "Le moteur démarre à la prochaine dictée et s’arrête après 10 minutes sans dictée.",
+            (true, _, Some(gpu)) => format!(
+                "{}{gpu} (Vulkan)",
+                ui("Models: ready, on the GPU: ", "Modèles : prêts, sur le GPU : ")
+            ),
+            (true, _, None) => ui(
+                "Models: ready, on the CPU (no compatible dedicated GPU or not enough video memory). Dictation works, more slowly.",
+                "Modèles : prêts, sur le processeur (pas de GPU dédié compatible ou mémoire vidéo insuffisante). La dictée fonctionne, plus lentement.",
+            )
+            .into(),
+            (false, _, _) => ui(
+                "Models: not loaded. They load when you press the dictation key, while you speak.",
+                "Modèles : non chargés. Ils se chargent à l’appui sur la touche de dictée, pendant que vous parlez.",
             )
             .into(),
         };
@@ -1061,6 +1101,24 @@ impl SettingsView {
             )
             .into_any_element(),
         );
+        if status.running {
+            let engine = self.services.local_engine.clone();
+            rows.push(
+                widgets::button(
+                    "local-free-memory",
+                    tr(Msg::FreeMemory),
+                    ButtonKind::Secondary,
+                    true,
+                    theme,
+                    move |_, window, _| {
+                        let engine = engine.clone();
+                        jot_core::runtime::spawn(async move { engine.release().await });
+                        window.refresh();
+                    },
+                )
+                .into_any_element(),
+            );
+        }
         rows.push(
             widgets::status_line(
                 "local-privacy",
@@ -1106,9 +1164,10 @@ impl SettingsView {
                             s.transcription_engine = value
                         });
                         if value == TranscriptionEngine::Gemini {
-                            // Give the video memory back as soon as local mode is left.
+                            // Give the video memory back as soon as local mode is
+                            // left (after the dictation in progress, if any).
                             let engine = engine.clone();
-                            jot_core::runtime::spawn(async move { engine.unload().await });
+                            jot_core::runtime::spawn(async move { engine.release().await });
                         }
                         cx.refresh_windows();
                     }
