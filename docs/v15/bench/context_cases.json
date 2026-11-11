@@ -1,0 +1,16 @@
+[
+  {"id": "ctx-jot", "say": "Ouvre Jot et lance une nouvelle dictée.", "terms": ["Jot"], "must_not": []},
+  {"id": "ctx-ctrl-entree", "say": "Appuie sur contrôle entrée pour enregistrer la correction.", "terms": ["Ctrl"], "must_not": []},
+  {"id": "ctx-ctrl-c-v", "say": "Fais contrôle C puis contrôle V dans le terminal.", "terms": ["Ctrl"], "must_not": []},
+  {"id": "ctx-gpu", "say": "Le modèle tourne sur le GPU avec huit gigaoctets de mémoire vidéo.", "terms": ["GPU"], "must_not": []},
+  {"id": "ctx-proxmox", "say": "J'ai installé Proxmox sur le petit serveur du garage.", "terms": ["Proxmox"], "must_not": []},
+  {"id": "ctx-ansible", "say": "Lance le playbook Ansible sur les trois machines.", "terms": ["Ansible"], "must_not": []},
+  {"id": "ctx-claude-code", "say": "Demande à Claude Code de corriger le test qui échoue.", "terms": ["Claude Code"], "must_not": []},
+  {"id": "ctx-mix", "say": "Avec Ansible, je déploie Jot sur la machine Proxmox qui a un GPU.", "terms": ["Ansible", "Jot", "Proxmox", "GPU"], "must_not": []},
+  {"id": "neg-controle-qualite", "say": "Le contrôle qualité a validé le lot de mardi.", "terms": ["contrôle qualité"], "must_not": ["Ctrl"]},
+  {"id": "neg-controle-technique", "say": "Ma voiture passe le contrôle technique jeudi.", "terms": ["contrôle technique"], "must_not": ["Ctrl"]},
+  {"id": "neg-sous-controle", "say": "La situation est sous contrôle, ne t'inquiète pas.", "terms": ["sous contrôle"], "must_not": ["Ctrl"]},
+  {"id": "neg-claude-voisine", "say": "Claude, ma voisine, viendra dîner samedi soir.", "terms": ["Claude"], "must_not": ["Claude Code"]},
+  {"id": "neg-giotto", "say": "Le peintre Giotto a décoré la chapelle de Padoue.", "terms": ["Giotto"], "must_not": ["Jot"]},
+  {"id": "neg-ansible-absent", "say": "Le jardin est accessible par la petite porte du fond.", "terms": ["accessible"], "must_not": ["Ansible"]}
+]

@@ -724,16 +724,14 @@ impl LocalEngine {
         }
     }
 
-    async fn transcribe(&self, wav: &[u8], duration: Duration) -> Result<String, Failure> {
+    async fn transcribe(
+        &self,
+        wav: &[u8],
+        duration: Duration,
+        vocabulary: &[String],
+    ) -> Result<String, Failure> {
         let port = self.asr_port().await.map_err(Failure::Engine)?;
-        let body = serde_json::json!({
-            "messages": [{"role": "user", "content": [{
-                "type": "input_audio",
-                "input_audio": {"data": base64::engine::general_purpose::STANDARD.encode(wav), "format": "wav"}
-            }]}],
-            "temperature": 0,
-            "max_tokens": (duration.as_secs_f64() * 12.0) as u64 + 64,
-        });
+        let body = asr_body(wav, duration, vocabulary);
         // CPU-only machines run ~0.3× real time; the cloud budget is not enough.
         let deadline = timeout::overall_deadline(duration) + duration;
         self.chat(port, body, deadline).await
@@ -761,6 +759,30 @@ impl LocalEngine {
         let deadline = Duration::from_secs_f64((10.0 + words as f64 * 0.25).min(90.0));
         self.chat(port, body, deadline).await
     }
+}
+
+/// Qwen3-ASR reads a system turn as context (the GGUF template passes it
+/// through): the user's terms bias the spelling of what was actually said.
+/// Measured on docs/v15/bench/context_cases.json: "Klebekan sebel" → "playbook
+/// ansible", "Yott" → "Jot", no change on "contrôle qualité" or "Giotto".
+fn asr_body(wav: &[u8], duration: Duration, vocabulary: &[String]) -> serde_json::Value {
+    let audio = serde_json::json!({"role": "user", "content": [{
+        "type": "input_audio",
+        "input_audio": {"data": base64::engine::general_purpose::STANDARD.encode(wav), "format": "wav"}
+    }]});
+    let messages = if vocabulary.is_empty() {
+        vec![audio]
+    } else {
+        vec![
+            serde_json::json!({"role": "system", "content": vocabulary.join(", ")}),
+            audio,
+        ]
+    };
+    serde_json::json!({
+        "messages": messages,
+        "temperature": 0,
+        "max_tokens": (duration.as_secs_f64() * 12.0) as u64 + 64,
+    })
 }
 
 #[derive(Debug)]
@@ -999,7 +1021,13 @@ impl TranscriptionServicing for LocalTranscriptionService {
         // From the first model to the second, and for retries too.
         let _busy = self.engine.busy();
 
-        let content = self.engine.transcribe(&audio, duration).await?;
+        let vocabulary = self
+            .dictionary
+            .sanitized_vocabulary(LOCAL_VOCABULARY_BUDGET);
+        let content = self
+            .engine
+            .transcribe(&audio, duration, &vocabulary)
+            .await?;
         // Silence/hum hallucinations and empty output both land here; the
         // coordinator tells silence from a dropped transcript by energy.
         let raw = parse_asr(&content).ok_or(TranscriptionError::EmptyTranscript)?;
@@ -1024,9 +1052,6 @@ impl TranscriptionServicing for LocalTranscriptionService {
             });
         }
 
-        let vocabulary = self
-            .dictionary
-            .sanitized_vocabulary(LOCAL_VOCABULARY_BUDGET);
         let cleaned = match self.engine.reformulate(pack, &raw, &vocabulary).await {
             Ok(response) => {
                 let cleaned = tidy_single_item_list(&validation::strip_artifacts(&response));
@@ -1126,6 +1151,19 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asr_gets_the_vocabulary_as_context_only_when_there_is_one() {
+        let bare = asr_body(b"RIFF", Duration::from_secs(2), &[]);
+        assert_eq!(bare["messages"].as_array().unwrap().len(), 1);
+        assert_eq!(bare["messages"][0]["role"], "user");
+        let terms = ["Jot".to_string(), "Claude Code".to_string()];
+        let biased = asr_body(b"RIFF", Duration::from_secs(2), &terms);
+        assert_eq!(biased["messages"][0]["role"], "system");
+        assert_eq!(biased["messages"][0]["content"], "Jot, Claude Code");
+        assert_eq!(biased["messages"][1]["content"][0]["type"], "input_audio");
+        assert_eq!(biased["max_tokens"], bare["max_tokens"]);
+    }
 
     #[test]
     fn models_are_freed_only_after_the_delay_and_never_during_a_dictation() {
@@ -1499,13 +1537,17 @@ mod tests {
         runtime.block_on(async {
             let engine = LocalEngine::new();
             engine.warm(Some(pack)).await;
+            // JOT_REFORM_VOCAB="Jot;Ctrl": the Dictionary terms, as production sends them.
+            let vocabulary: Vec<String> = std::env::var("JOT_REFORM_VOCAB")
+                .map(|v| v.split(';').map(str::to_string).collect())
+                .unwrap_or_default();
             for file in std::env::var("JOT_REFORM_CASES").expect("cases").split(';') {
                 let cases: Vec<serde_json::Value> =
                     serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
                 for case in cases {
                     let raw = case["input"].as_str().unwrap();
                     let started = Instant::now();
-                    let reply = engine.reformulate(pack, raw, &[]).await;
+                    let reply = engine.reformulate(pack, raw, &vocabulary).await;
                     let latency = started.elapsed().as_secs_f64();
                     let (llm, verdict) = match reply {
                         Ok(text) => {
