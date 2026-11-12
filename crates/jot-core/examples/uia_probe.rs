@@ -86,6 +86,12 @@ mod win {
             );
             return;
         }
+        // `readloop <seconds>`: what UIA answers for the focused field every
+        // 20 ms, printed on change only — lengths and states, never the text.
+        if args[0] == "readloop" {
+            read_loop(args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20));
+            return;
+        }
         let (title, scenario) = (args[0].as_str(), args.get(1).map_or("fix", String::as_str));
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -123,7 +129,10 @@ mod win {
         }
         // Caret at the document end, on a fresh line, like a user about to dictate.
         chord(VK_CONTROL, VK_END);
-        key(VK_RETURN);
+        // JOT_PROBE_NO_NEWLINE: a chat composer, where Return sends the message.
+        if std::env::var_os("JOT_PROBE_NO_NEWLINE").is_none() {
+            key(VK_RETURN);
+        }
         if scenario == "dictate" {
             dictate(hwnd, pid, args.get(2).map(String::as_str));
             return;
@@ -659,6 +668,63 @@ mod win {
             "dictate: inserted after {:.1} s: {landed:?}",
             started.elapsed().as_secs_f64()
         );
+    }
+
+    fn read_loop(seconds: u64) {
+        use windows::Win32::UI::Accessibility::IUIAutomationElement;
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let uia: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).unwrap();
+            let started = Instant::now();
+            let mut last = String::new();
+            let mut polls = 0u32;
+            let mut held: Option<IUIAutomationElement> = None;
+            while started.elapsed() < Duration::from_secs(seconds) {
+                polls += 1;
+                let polled = Instant::now();
+                let state = (|| -> String {
+                    let Ok(focus) = uia.GetFocusedElement() else {
+                        return "no focus".into();
+                    };
+                    let kind = focus.CurrentControlType().map_or(-1, |t| t.0);
+                    // The watcher's own read, at its tick reach: the failing step,
+                    // or the lengths read — never the text.
+                    let describe =
+                        |element: &IUIAutomationElement| match app_learning::Uia::read_steps(
+                            element, 200, 200,
+                        ) {
+                            Err(why) => format!("{why:?}"),
+                            Ok(read) => format!(
+                                "ok ({} + {} chars)",
+                                read.before.chars().count(),
+                                read.after.chars().count(),
+                            ),
+                        };
+                    // The watcher keeps the element it anchored on: read that one too.
+                    let held = &*held.get_or_insert_with(|| focus.clone());
+                    let same = uia.CompareElements(&focus, held).is_ok_and(|b| b.as_bool());
+                    format!(
+                        "type {kind}: fresh {} | held {} (same {same})",
+                        describe(&focus),
+                        describe(held)
+                    )
+                })();
+                let took = polled.elapsed().as_millis();
+                if took > 50 {
+                    println!(
+                        "{:>6} ms  slow poll: {took} ms",
+                        started.elapsed().as_millis()
+                    );
+                }
+                if state != last {
+                    println!("{:>6} ms  {state}", started.elapsed().as_millis());
+                    last = state;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            println!("readloop: {polls} polls");
+        }
     }
 
     /// Replaces the last JOT_PROBE_OLD on the current line by JOT_PROBE_NEW

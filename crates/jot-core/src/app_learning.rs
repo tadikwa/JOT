@@ -231,7 +231,22 @@ struct Observation<E> {
     seen: Option<String>,
     edited: Option<String>,
     deadline: std::time::Instant,
+    /// Consecutive ticks the field was [`Unread::Changing`].
+    changing: u32,
 }
+
+/// Why a field could not be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unread {
+    /// The app replaced the text under the caret while it was read: the same
+    /// field, mid-edit. Read again on the next tick.
+    Changing,
+    Unreadable,
+}
+
+/// Consecutive [`Unread::Changing`] ticks tolerated (1.5 s): an edit settles
+/// within one; a field that stays so is not readable.
+const CHANGING_TICKS: u32 = 3;
 
 /// The field access the watcher needs; real UIA on Windows, a fake in tests.
 trait Field {
@@ -240,14 +255,19 @@ trait Field {
     /// of `pid` (when known).
     fn focused(&self, pid: Option<u32>) -> Option<Self::Element>;
     fn same(&self, a: &Self::Element, b: &Self::Element) -> bool;
-    fn read(&self, element: &Self::Element, back: usize, forward: usize) -> Option<CaretText>;
+    fn read(
+        &self,
+        element: &Self::Element,
+        back: usize,
+        forward: usize,
+    ) -> Result<CaretText, Unread>;
 }
 
 /// Tries to anchor once. None: not (yet) provably inserted here.
 fn try_anchor<F: Field>(field: &F, watch: &Watch) -> Option<(F::Element, Anchor)> {
     let element = field.focused(watch.target_pid)?;
     let length = watch.inserted.chars().count();
-    let text = field.read(&element, length + CONTEXT, CONTEXT)?;
+    let text = field.read(&element, length + CONTEXT, CONTEXT).ok()?;
     let anchor = anchor(
         &watch.inserted,
         &text.before,
@@ -274,9 +294,17 @@ fn tick<F: Field>(
         return Err("focus moved to another element");
     }
     let reach = observation.anchor.inserted.chars().count() * 2 + 2 * CONTEXT + 64;
-    let Some(text) = field.read(&observation.element, reach, reach) else {
-        return Err("field unreadable");
+    // Focus was just checked to be this field, so a stale range means the
+    // field is mid-edit: skip the tick (nothing counts as seen) a few times.
+    let text = match field.read(&observation.element, reach, reach) {
+        Ok(text) => text,
+        Err(Unread::Changing) if observation.changing < CHANGING_TICKS => {
+            observation.changing += 1;
+            return Ok(());
+        }
+        Err(_) => return Err("field unreadable"),
     };
+    observation.changing = 0;
     let window = format!("{}{}", text.before, text.after);
     // The contexts are gone (edited, caret moved far away): stop, keeping only
     // the last stable reading.
@@ -360,6 +388,7 @@ fn run_with<F: Field>(field: &F, rx: std::sync::mpsc::Receiver<Command>) {
                         seen: None,
                         edited: None,
                         deadline: started + OBSERVATION,
+                        changing: 0,
                     });
                 }
                 None if started.elapsed() < anchor_wait(&watch.inserted) => {
@@ -379,7 +408,7 @@ fn run_with<F: Field>(field: &F, rx: std::sync::mpsc::Receiver<Command>) {
 
 #[cfg(target_os = "windows")]
 mod platform {
-    use super::{CaretText, Command, Field};
+    use super::{CaretText, Command, Field, Unread};
     use windows::Win32::System::Com::{
         CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
     };
@@ -387,14 +416,28 @@ mod platform {
         CUIAutomation, IUIAutomation, IUIAutomation2, IUIAutomationElement,
         IUIAutomationTextPattern, IUIAutomationTextPattern2, IUIAutomationTextRange,
         TextPatternRangeEndpoint_End, TextPatternRangeEndpoint_Start, TextUnit_Character,
-        UIA_TextPattern2Id, UIA_TextPatternId,
+        UIA_E_ELEMENTNOTAVAILABLE, UIA_TextPattern2Id, UIA_TextPatternId,
     };
-    use windows::core::Interface;
+    use windows::core::{HRESULT, Interface};
 
     pub struct Uia(IUIAutomation);
 
     /// A selection longer than this is not a word being fixed.
     const MAX_SELECTION: i32 = 4096;
+
+    /// Logs the failing UIA call and its HRESULT (never the text). A range that
+    /// is no longer available was made stale by the page editing the field
+    /// under it (ChatGPT's composer replaces the text node on a key press).
+    fn failed(step: &'static str) -> impl Fn(windows::core::Error) -> Unread {
+        move |error| {
+            tracing::info!(step, code = ?error.code(), "correction watch: read failed");
+            if error.code() == HRESULT(UIA_E_ELEMENTNOTAVAILABLE as i32) {
+                Unread::Changing
+            } else {
+                Unread::Unreadable
+            }
+        }
+    }
 
     pub fn run(rx: std::sync::mpsc::Receiver<Command>) {
         unsafe {
@@ -427,7 +470,7 @@ mod platform {
         /// range: Chromium moves ranges out of the field into the page.
         fn caret(
             element: &IUIAutomationElement,
-        ) -> Option<(IUIAutomationTextRange, IUIAutomationTextRange)> {
+        ) -> Result<(IUIAutomationTextRange, IUIAutomationTextRange), Unread> {
             unsafe {
                 if let Ok(pattern) =
                     element.GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id)
@@ -436,17 +479,22 @@ mod platform {
                     if let (Ok(range), Ok(document)) =
                         (pattern.GetCaretRange(&mut active), pattern.DocumentRange())
                     {
-                        return Some((range, document));
+                        return Ok((range, document));
                     }
                 }
                 let pattern = element
                     .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
-                    .ok()?;
-                let selection = pattern.GetSelection().ok()?;
-                if selection.Length().ok()? != 1 {
-                    return None;
+                    .map_err(failed("text pattern"))?;
+                let selection = pattern.GetSelection().map_err(failed("selection"))?;
+                let count = selection.Length().map_err(failed("selection"))?;
+                if count != 1 {
+                    tracing::info!(count, "correction watch: read failed: selection count");
+                    return Err(Unread::Unreadable);
                 }
-                Some((selection.GetElement(0).ok()?, pattern.DocumentRange().ok()?))
+                Ok((
+                    selection.GetElement(0).map_err(failed("selection"))?,
+                    pattern.DocumentRange().map_err(failed("document range"))?,
+                ))
             }
         }
     }
@@ -485,41 +533,52 @@ mod platform {
             element: &IUIAutomationElement,
             back: usize,
             forward: usize,
-        ) -> Option<CaretText> {
+        ) -> Result<CaretText, Unread> {
+            Self::read_steps(element, back, forward)
+        }
+    }
+
+    impl Uia {
+        /// [`Field::read`], also for the probe (no `self` needed).
+        pub fn read_steps(
+            element: &IUIAutomationElement,
+            back: usize,
+            forward: usize,
+        ) -> Result<CaretText, Unread> {
             let (caret, document) = Self::caret(element)?;
             unsafe {
                 // [start - back, caret start] and [caret start, caret end + forward]:
                 // together they cover a selection, so a word being retyped is seen.
-                let before = caret.Clone().ok()?;
+                let before = caret.Clone().map_err(failed("clone before"))?;
                 before
                     .MoveEndpointByRange(
                         TextPatternRangeEndpoint_End,
                         &caret,
                         TextPatternRangeEndpoint_Start,
                     )
-                    .ok()?;
+                    .map_err(failed("collapse before"))?;
                 let moved_back = before
                     .MoveEndpointByUnit(
                         TextPatternRangeEndpoint_Start,
                         TextUnit_Character,
                         -(back as i32),
                     )
-                    .ok()?;
-                let after = caret.Clone().ok()?;
+                    .map_err(failed("move back"))?;
+                let after = caret.Clone().map_err(failed("clone after"))?;
                 after
                     .MoveEndpointByRange(
                         TextPatternRangeEndpoint_Start,
                         &caret,
                         TextPatternRangeEndpoint_Start,
                     )
-                    .ok()?;
+                    .map_err(failed("collapse after"))?;
                 let moved_forward = after
                     .MoveEndpointByUnit(
                         TextPatternRangeEndpoint_End,
                         TextUnit_Character,
                         forward as i32,
                     )
-                    .ok()?;
+                    .map_err(failed("move forward"))?;
                 // Never past the field: page text around a web composer changes on
                 // its own (and is not ours to read).
                 let past_start = before
@@ -528,7 +587,7 @@ mod platform {
                         &document,
                         TextPatternRangeEndpoint_Start,
                     )
-                    .ok()?
+                    .map_err(failed("compare start"))?
                     < 0;
                 if past_start {
                     before
@@ -537,7 +596,7 @@ mod platform {
                             &document,
                             TextPatternRangeEndpoint_Start,
                         )
-                        .ok()?;
+                        .map_err(failed("clamp start"))?;
                 }
                 let past_end = after
                     .CompareEndpoints(
@@ -545,7 +604,7 @@ mod platform {
                         &document,
                         TextPatternRangeEndpoint_End,
                     )
-                    .ok()?
+                    .map_err(failed("compare end"))?
                     > 0;
                 if past_end {
                     after
@@ -554,17 +613,23 @@ mod platform {
                             &document,
                             TextPatternRangeEndpoint_End,
                         )
-                        .ok()?;
+                        .map_err(failed("clamp end"))?;
                 }
                 // Bounded reads: twice the units covers CRLF and surrogate pairs;
                 // the selection itself counts in `after`.
-                let selected = caret.GetText(MAX_SELECTION).ok()?.len() as i32;
-                let before_text = before.GetText(back as i32 * 2 + 8).ok()?.to_string();
+                let selected = caret
+                    .GetText(MAX_SELECTION)
+                    .map_err(failed("text selection"))?
+                    .len() as i32;
+                let before_text = before
+                    .GetText(back as i32 * 2 + 8)
+                    .map_err(failed("text before"))?
+                    .to_string();
                 let after_text = after
                     .GetText(forward as i32 * 2 + 8 + selected)
-                    .ok()?
+                    .map_err(failed("text after"))?
                     .to_string();
-                Some(CaretText {
+                Ok(CaretText {
                     before: before_text,
                     after: after_text,
                     at_start: past_start || moved_back.unsigned_abs() < back as u32,
@@ -583,7 +648,7 @@ pub use platform::Uia;
 pub fn probe_focused(pid: Option<u32>, back: usize, forward: usize) -> Option<CaretText> {
     let uia = Uia::new()?;
     let element = uia.focused(pid)?;
-    uia.read(&element, back, forward)
+    uia.read(&element, back, forward).ok()
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -686,30 +751,48 @@ mod tests {
         );
     }
 
-    /// A scripted field: the "document", the caret, the focused element id.
+    /// A scripted field: the "document", the caret, the focused element id,
+    /// and how many reads to come find it mid-edit.
+    #[derive(Default)]
+    struct FakeState {
+        text: String,
+        caret: usize,
+        focus: Option<u32>,
+        changing_reads: u32,
+    }
+
     #[derive(Clone, Default)]
-    struct Fake(Arc<Mutex<(String, usize, Option<u32>)>>);
+    struct Fake(Arc<Mutex<FakeState>>);
 
     impl Fake {
         fn set(&self, text: &str, caret: usize, focus: Option<u32>) {
-            *self.0.lock() = (text.into(), caret, focus);
+            let mut state = self.0.lock();
+            (state.text, state.caret, state.focus) = (text.into(), caret, focus);
+        }
+        fn changing_for(&self, reads: u32) {
+            self.0.lock().changing_reads = reads;
         }
     }
 
     impl Field for Fake {
         type Element = u32;
         fn focused(&self, _pid: Option<u32>) -> Option<u32> {
-            self.0.lock().2
+            self.0.lock().focus
         }
         fn same(&self, a: &u32, b: &u32) -> bool {
             a == b
         }
-        fn read(&self, _element: &u32, back: usize, forward: usize) -> Option<CaretText> {
-            let (text, caret, _) = self.0.lock().clone();
+        fn read(&self, _element: &u32, back: usize, forward: usize) -> Result<CaretText, Unread> {
+            let mut state = self.0.lock();
+            if state.changing_reads > 0 {
+                state.changing_reads -= 1;
+                return Err(Unread::Changing);
+            }
+            let (text, caret) = (state.text.clone(), state.caret);
             let chars: Vec<char> = text.chars().collect();
             let start = caret.saturating_sub(back);
             let end = (caret + forward).min(chars.len());
-            Some(CaretText {
+            Ok(CaretText {
                 before: chars[start..caret].iter().collect(),
                 after: chars[caret..end].iter().collect(),
                 at_start: start == 0,
@@ -784,6 +867,28 @@ mod tests {
         });
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].after, FIXED);
+    }
+
+    /// ChatGPT's composer replaces the text node on a key press: a read that
+    /// lands then finds a stale range. The watch goes on; one that never
+    /// settles ends it.
+    #[test]
+    fn a_field_mid_edit_is_read_again_not_given_up() {
+        let found = run_case(INSERTED, |fake, _| {
+            fake.changing_for(2);
+            fake.set(FIXED, 18, Some(1));
+            note_key_down();
+            wait(2400);
+        });
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].after, FIXED);
+        let never = run_case(INSERTED, |fake, _| {
+            fake.changing_for(u32::MAX);
+            fake.set(FIXED, 18, Some(1));
+            note_key_down();
+            wait(2400);
+        });
+        assert!(never.is_empty(), "nothing was ever read after the edit");
     }
 
     #[test]
