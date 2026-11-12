@@ -15,7 +15,7 @@
 //! The object graph, assembled once and shared by every surface.
 
 use anyhow::Result;
-use jot_core::audio::{AudioCapturing, WasapiCapture};
+use jot_core::audio::{AudioCapturing, FileCapture, WasapiCapture};
 use jot_core::coordinator::{CoordinatorDeps, DictationCoordinator};
 use jot_core::dictionary::DictionaryStore;
 use jot_core::gemini::GeminiClient;
@@ -72,6 +72,13 @@ impl Services {
                 // Read per session: switching microphone in Settings applies to
                 // the next dictation, never to one already recording.
                 Box::new(move || {
+                    // Portable test profiles may replay a prepared WAV instead.
+                    if let Some(source) =
+                        jot_core::test_profile::root().and(std::env::var_os("JOT_TEST_AUDIO"))
+                    {
+                        return Box::new(FileCapture::new(source.into()))
+                            as Box<dyn AudioCapturing>;
+                    }
                     Box::new(WasapiCapture::for_device(
                         settings.get().preferred_input_device,
                     )) as Box<dyn AudioCapturing>

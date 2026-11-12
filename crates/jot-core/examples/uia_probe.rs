@@ -38,9 +38,9 @@ mod win {
         UIA_TextPattern2Id, UIA_TextPatternId,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP,
-        KEYEVENTF_UNICODE, SendInput, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_END, VK_HOME, VK_LEFT,
-        VK_RETURN,
+        INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+        KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_END,
+        VK_HOME, VK_LEFT, VK_RCONTROL, VK_RETURN,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowTextW,
@@ -63,6 +63,27 @@ mod win {
 
     pub fn main() {
         let args: Vec<String> = std::env::args().skip(1).collect();
+        // `accept <dictionary.json>`: what the Dictionary's "Accepter" does,
+        // for a run without screen control (the app must not be running).
+        if args[0] == "accept" {
+            use jot_core::dictionary::{DictionaryStore, SuggestionStatus};
+            let store = DictionaryStore::open(args[1].clone().into());
+            for s in store.suggestions() {
+                if s.status == SuggestionStatus::Pending {
+                    store.accept_suggestion(s.id).unwrap();
+                    println!(
+                        "accepted {} → {} (term only {})",
+                        s.wrong, s.term, s.term_only
+                    );
+                }
+            }
+            println!(
+                "rules {:?}, vocabulary {:?}",
+                store.replacement_rules(),
+                store.vocabulary()
+            );
+            return;
+        }
         let (title, scenario) = (args[0].as_str(), args.get(1).map_or("fix", String::as_str));
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -85,9 +106,22 @@ mod win {
             println!("no UIA text field focused in the target — no key sent (clean refusal)");
             return;
         }
+        // Real-app drive (the jot binary under test does insertion and watch).
+        if scenario == "replace" {
+            replace_last(pid);
+            return;
+        }
+        if scenario == "peek" {
+            println!("last line: {:?}", last_line(pid));
+            return;
+        }
         // Caret at the document end, on a fresh line, like a user about to dictate.
         chord(VK_CONTROL, VK_END);
         key(VK_RETURN);
+        if scenario == "dictate" {
+            dictate(hwnd, pid, args.get(2).map(String::as_str));
+            return;
+        }
         app_learning::note_key_down();
         std::thread::sleep(Duration::from_millis(300));
         describe();
@@ -116,6 +150,13 @@ mod win {
         };
         println!("insertion: {outcome:?} ({} chars)", text.chars().count());
 
+        // JOT_PROBE_SETTLE_MS: no UIA read at all for that long (diagnostic).
+        if let Some(ms) = std::env::var("JOT_PROBE_SETTLE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            std::thread::sleep(Duration::from_millis(ms));
+        }
         // The receipt: how long until the text provably sits before the caret.
         let receipt = loop {
             let read = app_learning::probe_focused(Some(pid), text.chars().count() + 48, 48);
@@ -288,6 +329,76 @@ mod win {
             let _ = EnumWindows(Some(each), LPARAM(&mut search as *mut Search as isize));
         }
         search.1
+    }
+
+    fn last_line(pid: u32) -> String {
+        app_learning::probe_focused(Some(pid), 300, 0)
+            .map(|r| {
+                let text = app_learning::normalize(&r.before);
+                text.rsplit('\n').next().unwrap_or_default().to_string()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Right Ctrl tap (the test profile's toggle hotkey), Right Ctrl tap, then
+    /// waits for the app under test to insert. The app must replay a prepared
+    /// WAV (JOT_TEST_AUDIO): a live microphone picks up the room.
+    fn dictate(hwnd: HWND, pid: u32, field: Option<&str>) {
+        let tap = || {
+            send(&[input(VK_RCONTROL, 0, KEYEVENTF_EXTENDEDKEY)]);
+            send(&[input(
+                VK_RCONTROL,
+                0,
+                KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP,
+            )]);
+        };
+        tap();
+        std::thread::sleep(Duration::from_millis(1500));
+        if !foreground(hwnd) || !focus_text(hwnd, pid, field) {
+            println!("dictate: target lost the foreground — stopping without it");
+        }
+        tap();
+        let started = Instant::now();
+        let landed = loop {
+            let line = last_line(pid);
+            if !line.trim().is_empty() {
+                break Some(line);
+            }
+            if started.elapsed() > Duration::from_secs(90) {
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(250));
+        };
+        println!(
+            "dictate: inserted after {:.1} s: {landed:?}",
+            started.elapsed().as_secs_f64()
+        );
+    }
+
+    /// Replaces the last JOT_PROBE_OLD on the current line by JOT_PROBE_NEW
+    /// with arrow keys, Backspace and typing, as a user would.
+    fn replace_last(pid: u32) {
+        let old = std::env::var("JOT_PROBE_OLD").expect("JOT_PROBE_OLD");
+        let new = std::env::var("JOT_PROBE_NEW").expect("JOT_PROBE_NEW");
+        chord(VK_CONTROL, VK_END);
+        let line = last_line(pid);
+        let Some(at) = line.rfind(&old) else {
+            println!("replace: {old:?} not on the last line {line:?}");
+            return;
+        };
+        let after = line[at + old.len()..].chars().count();
+        for _ in 0..after {
+            key(VK_LEFT);
+        }
+        for _ in 0..old.chars().count() {
+            key(VK_BACK);
+        }
+        for c in new.chars() {
+            type_char(c);
+        }
+        chord(VK_CONTROL, VK_END);
+        std::thread::sleep(Duration::from_millis(300));
+        println!("replace: line now {:?}", last_line(pid));
     }
 
     /// From the correction to the next dictation, through the same store calls

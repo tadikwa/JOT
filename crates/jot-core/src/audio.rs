@@ -146,6 +146,50 @@ pub trait AudioCapturing: Send {
     fn stop(&mut self) -> AudioCaptureResult;
 }
 
+/// Test profiles only: "records" a prepared 16 kHz mono WAV instead of the
+/// microphone, so an end-to-end run never captures the room around the PC.
+pub struct FileCapture {
+    source: PathBuf,
+    callbacks: Arc<Mutex<CaptureCallbacks>>,
+    frames: u64,
+}
+
+impl FileCapture {
+    pub fn new(source: PathBuf) -> Self {
+        Self {
+            source,
+            callbacks: Arc::default(),
+            frames: 0,
+        }
+    }
+}
+
+impl AudioCapturing for FileCapture {
+    fn callbacks(&self) -> Arc<Mutex<CaptureCallbacks>> {
+        self.callbacks.clone()
+    }
+
+    fn start(&mut self, path: &Path) -> Result<(), CaptureError> {
+        std::fs::copy(&self.source, path).map_err(|e| CaptureError::Io(e.to_string()))?;
+        let reader = hound::WavReader::open(path).map_err(|e| CaptureError::Io(e.to_string()))?;
+        if reader.spec().sample_rate != SAMPLE_RATE || reader.spec().channels != 1 {
+            return Err(CaptureError::Config(
+                "test audio must be 16 kHz mono".into(),
+            ));
+        }
+        self.frames = u64::from(reader.duration());
+        Ok(())
+    }
+
+    fn stop(&mut self) -> AudioCaptureResult {
+        AudioCaptureResult {
+            frames_written: self.frames,
+            duration_seconds: self.frames as f64 / f64::from(SAMPLE_RATE),
+            ..Default::default()
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Resampling
 // ---------------------------------------------------------------------------
@@ -829,5 +873,33 @@ mod tests {
         assert_eq!(capture.start(&path), Err(CaptureError::NoInputDevice));
         assert!(!path.exists());
         assert!(!capture.started);
+    }
+}
+
+#[cfg(test)]
+mod file_capture_tests {
+    use super::*;
+
+    #[test]
+    fn replays_a_prepared_wav_and_refuses_other_formats() {
+        let temp = tempfile::tempdir().unwrap();
+        let write = |name: &str, rate: u32| {
+            let path = temp.path().join(name);
+            let spec = hound::WavSpec {
+                channels: 1,
+                sample_rate: rate,
+                bits_per_sample: 16,
+                sample_format: hound::SampleFormat::Int,
+            };
+            let mut wav = hound::WavWriter::create(&path, spec).unwrap();
+            (0..8000).for_each(|_| wav.write_sample(0i16).unwrap());
+            wav.finalize().unwrap();
+            path
+        };
+        let mut capture = FileCapture::new(write("ok.wav", SAMPLE_RATE));
+        capture.start(&temp.path().join("session.wav")).unwrap();
+        assert_eq!(capture.stop().duration_seconds, 0.5);
+        let mut wrong = FileCapture::new(write("48k.wav", 48_000));
+        assert!(wrong.start(&temp.path().join("other.wav")).is_err());
     }
 }
