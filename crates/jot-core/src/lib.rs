@@ -17,6 +17,7 @@
 //! failure mode is exercisable without launching the app.
 
 pub mod activity;
+pub mod app_learning;
 pub mod audio;
 pub mod coordinator;
 pub mod credentials;

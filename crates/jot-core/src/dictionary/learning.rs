@@ -11,6 +11,26 @@ pub struct LearningSource {
     pub dictation_id: String,
     #[serde(with = "time::serde::rfc3339")]
     pub corrected_at: OffsetDateTime,
+    /// Absent in files written before 1.6: those all came from History.
+    #[serde(default, skip_serializing_if = "LearningOrigin::is_history")]
+    pub origin: LearningOrigin,
+}
+
+/// Where the correction was made.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum LearningOrigin {
+    /// Edited in Jot's History.
+    #[default]
+    History,
+    /// Fixed in the application right after Jot inserted the dictation.
+    Application,
+}
+
+impl LearningOrigin {
+    fn is_history(&self) -> bool {
+        *self == Self::History
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -30,6 +50,9 @@ pub struct DictionarySuggestion {
     pub sources: Vec<LearningSource>,
     pub status: SuggestionStatus,
     pub confidence: u8,
+    /// Offer `term` as vocabulary only, never as a `wrong → term` rule.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub term_only: bool,
 }
 
 /// Token alignment is deliberately bounded; a rewrite is not vocabulary evidence.
@@ -140,9 +163,11 @@ pub fn extract_suggestions(correction: &Correction) -> Vec<DictionarySuggestion>
             sources: vec![LearningSource {
                 dictation_id: correction.dictation_id.clone(),
                 corrected_at: correction.corrected_at,
+                origin: LearningOrigin::History,
             }],
             status: SuggestionStatus::Pending,
             confidence,
+            term_only: false,
         });
     }
     suggestions
@@ -175,6 +200,102 @@ pub fn new_terms(correction: &Correction) -> Vec<String> {
     }
     // More than a few new names is a rewrite, not a misheard term.
     if terms.len() > 3 { Vec::new() } else { terms }
+}
+
+/// Words whose replacement changes what a sentence means (negation,
+/// quantity, condition): never part of a rule learned outside History.
+const MEANING_WORDS: &[&str] = &[
+    "ne", "n", "pas", "non", "nom", "jamais", "rien", "aucun", "aucune", "sans", "et", "est", "ou",
+    "où", "si", "un", "une", "le", "la", "les", "des", "plus", "moins", "oui", "not", "no",
+    "never", "and", "or", "if", "a", "an", "the",
+];
+
+/// Suggestions from a correction made in another application. Stricter than
+/// History: the edit was seen, not reviewed, so a rule is offered only for a
+/// lexical fix that cannot change meaning; anything else at most as a term.
+pub fn app_suggestions(correction: &Correction) -> Vec<DictionarySuggestion> {
+    let risky = |text: &str| {
+        text.chars().any(|c| c.is_numeric())
+            || text
+                .unicode_words()
+                .any(|w| MEANING_WORDS.contains(&w.to_lowercase().as_str()))
+    };
+    let name_like = |text: &str| text.chars().any(|c| c.is_uppercase() || c.is_numeric());
+    let mut found: Vec<_> = extract_suggestions(correction)
+        .into_iter()
+        .filter(|s| !risky(&s.wrong) && !risky(&s.term))
+        // "cafe → café" is fine in History; seen in passing, a short common
+        // word is too likely to be a rewrite.
+        .filter(|s| name_like(&s.term) || s.term.chars().count() >= 5)
+        .collect();
+    if found.is_empty()
+        && let Some((before, after)) = changed_words(correction)
+        && !risky(&before)
+    {
+        // "unburn → Unbound": no spelling evidence, but a typed-in name.
+        let region = Correction {
+            before,
+            after,
+            ..correction.clone()
+        };
+        for term in new_terms(&region) {
+            if term.chars().any(|c| c.is_numeric()) {
+                continue;
+            }
+            found.push(DictionarySuggestion {
+                id: Uuid::new_v4(),
+                wrong: region.before.clone(),
+                term,
+                sources: Vec::new(),
+                status: SuggestionStatus::Pending,
+                confidence: 0,
+                term_only: true,
+            });
+        }
+    }
+    for suggestion in &mut found {
+        suggestion.sources = vec![LearningSource {
+            dictation_id: correction.dictation_id.clone(),
+            corrected_at: correction.corrected_at,
+            origin: LearningOrigin::Application,
+        }];
+    }
+    found
+}
+
+/// The one replaced run of words, both sides non-empty and short: additions
+/// at the end, deletions and rewrites return None.
+fn changed_words(correction: &Correction) -> Option<(String, String)> {
+    let before: Vec<&str> = correction.before.unicode_words().collect();
+    let after: Vec<&str> = correction.after.unicode_words().collect();
+    let same = |a: &str, b: &str| a.to_lowercase() == b.to_lowercase();
+    let prefix = before
+        .iter()
+        .zip(&after)
+        .take_while(|(a, b)| same(a, b))
+        .count();
+    let suffix = before[prefix..]
+        .iter()
+        .rev()
+        .zip(after[prefix..].iter().rev())
+        .take_while(|(a, b)| same(a, b))
+        .count();
+    let wrong = &before[prefix..before.len() - suffix];
+    let right = &after[prefix..after.len() - suffix];
+    (!wrong.is_empty() && !right.is_empty() && wrong.len() <= 3 && right.len() <= 3)
+        .then(|| (wrong.join(" "), right.join(" ")))
+}
+
+/// "LOostream": two capitals then lower case, the trace of a slipped Shift.
+/// Shown as a warning, never fixed: "OAuth" looks the same.
+pub fn suspicious_case(term: &str) -> bool {
+    term.unicode_words().any(|word| {
+        let chars: Vec<char> = word.chars().collect();
+        chars.len() >= 4
+            && chars[0].is_uppercase()
+            && chars[1].is_uppercase()
+            && chars[2..].iter().all(|c| c.is_lowercase())
+    })
 }
 
 fn spelling_confidence(wrong: &str, right: &str) -> Option<u8> {
@@ -327,5 +448,68 @@ mod tests {
             extract_suggestions(&correction("Le résume est ici.", "Le résumé est ici.")).len() <= 1
         );
         assert!(extract_suggestions(&correction("🐈 hello", "🐈 HELLO")).is_empty());
+    }
+
+    #[test]
+    fn app_corrections_are_stricter_than_history() {
+        let pairs = |before: &str, after: &str| -> Vec<(String, String, bool)> {
+            app_suggestions(&correction(before, after))
+                .into_iter()
+                .map(|s| (s.wrong, s.term, s.term_only))
+                .collect()
+        };
+        let rule = |w: &str, t: &str| vec![(w.to_string(), t.to_string(), false)];
+        assert_eq!(
+            pairs("Je vais ouvrir Loustream.", "Je vais ouvrir Loostream."),
+            rule("Loustream", "Loostream")
+        );
+        assert_eq!(
+            pairs("Le projet jott avance.", "Le projet Jot avance."),
+            rule("jott", "Jot")
+        );
+        // Proposed as typed, flagged, never repaired.
+        assert_eq!(
+            pairs("ouvrir Loustream", "ouvrir LOostream"),
+            rule("Loustream", "LOostream")
+        );
+        assert!(suspicious_case("LOostream") && !suspicious_case("Loostream"));
+        assert!(!suspicious_case("PowerShell") && !suspicious_case("gRPC"));
+        assert!(!suspicious_case("API"));
+        // No spelling evidence: the name only.
+        assert_eq!(
+            pairs("Le service unburn répond.", "Le service Unbound répond."),
+            vec![("unburn".into(), "Unbound".into(), true)]
+        );
+        // Accents in a multi-line text.
+        assert_eq!(
+            pairs(
+                "Le réseau\nKubernetès et PowerShell",
+                "Le réseau\nKubernetes et PowerShell"
+            ),
+            rule("Kubernetès", "Kubernetes")
+        );
+        for (before, after) in [
+            ("Il est là.", "Il et là."),
+            ("un serveur", "Unbound serveur"),
+            ("Mon non est Paul.", "Mon nom est Paul."),
+            ("Le service ne répond pas.", "Le service répond."),
+            ("Il faut 20 serveurs.", "Il faut 30 serveurs."),
+            ("Prix vingt euros.", "Prix trente euros."),
+            ("Ping 10.0.0.1 ok.", "Ping 10.0.0.2 ok."),
+            ("si le service tombe", "quand le service tombe"),
+            ("Je vais au cafe.", "Je vais au café."),
+            (
+                "Je vais ouvrir Loustream.",
+                "Je vais ouvrir Loustream. Puis Jira et Confluence.",
+            ),
+            (
+                "Je vais ouvrir Loustream.",
+                "Finalement on annule tout demain matin.",
+            ),
+            ("Je vais ouvrir Loustream.", "Je vais ouvrir Loustream !"),
+            ("Je vais ouvrir Loustream.", ""),
+        ] {
+            assert!(pairs(before, after).is_empty(), "{before} -> {after}");
+        }
     }
 }

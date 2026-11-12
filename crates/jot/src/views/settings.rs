@@ -390,15 +390,18 @@ impl SettingsView {
         // The live session's folder is spared: deleting everything must not
         // destroy the dictation in flight.
         let active = self.services.coordinator.active_session_folder();
+        // The watched dictation is about to go: what it saw goes with it.
+        jot_core::app_learning::stop(false);
         self.services.history.delete_all(true, active.as_deref());
         let purge = self
             .services
             .history
             .correction_session_ids()
             .and_then(|ids| {
-                self.services
-                    .dictionary
-                    .purge_orphan_suggestions(&ids.into_iter().collect())
+                self.services.dictionary.purge_orphan_suggestions(
+                    &ids.into_iter().collect(),
+                    &self.services.history.all_ids().into_iter().collect(),
+                )
             });
         self.deletion_status = purge.err().map(|_| Msg::PurgeSuggestionsFailed);
         // A user wiping their words expects them gone from the paste-last
@@ -1460,6 +1463,32 @@ impl SettingsView {
                             jot_core::runtime::spawn_blocking(move || {
                                 jot_core::diagnostic::sweep(&now)
                             });
+                            cx.refresh_windows();
+                        }
+                    },
+                )
+                .into_any_element(),
+                widgets::toggle(
+                    "learn-from-app-corrections",
+                    ui(
+                        "Learn from my corrections after a dictation",
+                        "Apprendre de mes corrections après une dictée",
+                    ),
+                    ui(
+                        "Off by default. For 30 seconds after Jot inserts a dictation, Jot reads only the text field that received it, near the cursor, through Windows accessibility. If you correct a word there, Jot proposes it in the Dictionary; nothing applies before you accept it. Never password fields, no screenshots, no keystrokes or window titles stored: only the word pair and the date. Some apps do not allow this; nothing is observed there. Turning it off stops at once and keeps the entries you accepted.",
+                        "Désactivé par défaut. Pendant 30 secondes après l’insertion d’une dictée, Jot lit uniquement le champ qui l’a reçue, autour du curseur, via l’accessibilité Windows. Si vous y corrigez un mot, Jot le propose dans le Dictionnaire ; rien ne s’applique avant votre accord. Jamais les champs de mot de passe, aucune capture d’écran, ni frappes ni titres de fenêtre enregistrés : seulement la paire de mots et la date. Certaines applications ne le permettent pas ; rien n’y est observé. Désactiver arrête immédiatement et conserve les entrées acceptées.",
+                    ),
+                    settings.learn_from_app_corrections,
+                    theme,
+                    {
+                        let store = self.services.settings.clone();
+                        move |_, _, cx| {
+                            store.update(Some("learnFromAppCorrections"), |s| {
+                                s.learn_from_app_corrections = !s.learn_from_app_corrections
+                            });
+                            if !store.get().learn_from_app_corrections {
+                                jot_core::app_learning::stop(false);
+                            }
                             cx.refresh_windows();
                         }
                     },

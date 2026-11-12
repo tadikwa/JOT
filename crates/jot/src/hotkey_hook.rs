@@ -645,6 +645,11 @@ mod platform {
         }
         let message = wparam.0 as u32;
         let is_down = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
+        if is_down {
+            // A count only, never the key: tells a user's fix from an app's
+            // own autocorrect while a correction watch runs.
+            jot_core::app_learning::note_key_down();
+        }
         if !is_down && message != WM_KEYUP && message != WM_SYSKEYUP {
             return unsafe { CallNextHookEx(None, code, wparam, lparam) };
         }

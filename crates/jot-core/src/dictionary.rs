@@ -18,8 +18,12 @@
 
 mod learning;
 pub use learning::{
-    DictionarySuggestion, LearningSource, SuggestionStatus, extract_suggestions, new_terms,
+    DictionarySuggestion, LearningOrigin, LearningSource, SuggestionStatus, app_suggestions,
+    extract_suggestions, new_terms, suspicious_case,
 };
+
+/// Pending suggestions learned in another application expire after this.
+pub const APP_SUGGESTION_RETENTION_DAYS: i64 = 30;
 
 use crate::file_layout;
 use crate::history::Correction;
@@ -263,7 +267,17 @@ impl DictionaryStore {
     }
 
     pub fn learn_from_corrections(&self, corrections: &[Correction]) -> Result<usize> {
-        let candidates: Vec<_> = corrections.iter().flat_map(extract_suggestions).collect();
+        self.merge(corrections.iter().flat_map(extract_suggestions).collect())
+    }
+
+    /// A correction seen in another application right after an insertion.
+    pub fn learn_from_app_correction(&self, correction: &Correction) -> Result<usize> {
+        self.merge(app_suggestions(correction))
+    }
+
+    /// The same pair seen again (from History or an application) is one
+    /// suggestion with one more source. Reviewed pairs stay reviewed.
+    fn merge(&self, candidates: Vec<DictionarySuggestion>) -> Result<usize> {
         if candidates.is_empty() {
             return Ok(0);
         }
@@ -283,8 +297,7 @@ impl DictionaryStore {
                     }
                     continue;
                 }
-                let entry = DictionaryEntry::new(&candidate.term, Some(candidate.wrong.clone()));
-                if validate_entry(&file.entries, &entry, None).is_err() {
+                if validate_entry(&file.entries, &suggested_entry(&candidate), None).is_err() {
                     continue;
                 }
                 file.suggestions.push(candidate);
@@ -295,6 +308,21 @@ impl DictionaryStore {
     }
 
     pub fn accept_suggestion(&self, id: Uuid) -> Result<()> {
+        self.review(id, None)
+    }
+
+    /// "Modifier": the user's own term and misspelling (None or empty: term
+    /// only) instead of the suggested ones.
+    pub fn accept_suggestion_edited(
+        &self,
+        id: Uuid,
+        term: &str,
+        misspelling: Option<&str>,
+    ) -> Result<()> {
+        self.review(id, Some((term, misspelling)))
+    }
+
+    fn review(&self, id: Uuid, edited: Option<(&str, Option<&str>)>) -> Result<()> {
         self.mutate(|file| {
             let index = file
                 .suggestions
@@ -306,7 +334,12 @@ impl DictionaryStore {
                 suggestion.status == SuggestionStatus::Pending,
                 "suggestion already reviewed"
             );
-            let mut entry = DictionaryEntry::new(&suggestion.term, Some(suggestion.wrong.clone()));
+            let mut entry = match edited {
+                Some((term, misspelling)) => {
+                    DictionaryEntry::new(term.trim(), misspelling.map(|m| m.trim().to_string()))
+                }
+                None => suggested_entry(suggestion),
+            };
             entry.provenance = suggestion.sources.first().cloned();
             validate_entry(&file.entries, &entry, None)?;
             file.entries.push(entry);
@@ -331,15 +364,38 @@ impl DictionaryStore {
         })
     }
 
-    /// Accepted entries are voluntary knowledge, independent of later session deletion.
-    pub fn purge_orphan_suggestions(&self, live_sources: &HashSet<String>) -> Result<usize> {
+    /// Accepted entries are voluntary knowledge, independent of later session
+    /// deletion. A pending suggestion keeps a History source while that
+    /// dictation still has a correction (`corrected`), an application source
+    /// while the dictation itself exists (`dictations`) and is younger than
+    /// [`APP_SUGGESTION_RETENTION_DAYS`]; with no source left it goes.
+    pub fn purge_orphan_suggestions(
+        &self,
+        corrected: &HashSet<String>,
+        dictations: &HashSet<String>,
+    ) -> Result<usize> {
+        let expiry =
+            OffsetDateTime::now_utc() - time::Duration::days(APP_SUGGESTION_RETENTION_DAYS);
+        self.purge(|source| match source.origin {
+            LearningOrigin::History => corrected.contains(&source.dictation_id),
+            LearningOrigin::Application => {
+                dictations.contains(&source.dictation_id) && source.corrected_at > expiry
+            }
+        })
+    }
+
+    /// "Delete suggestions from applications": pending ones only; accepted
+    /// entries and refusals stay.
+    pub fn purge_app_suggestions(&self) -> Result<usize> {
+        self.purge(|source| source.origin != LearningOrigin::Application)
+    }
+
+    fn purge(&self, keep: impl Fn(&LearningSource) -> bool) -> Result<usize> {
         self.mutate(|file| {
             let before = file.suggestions.len();
             for suggestion in &mut file.suggestions {
                 if suggestion.status == SuggestionStatus::Pending {
-                    suggestion
-                        .sources
-                        .retain(|source| live_sources.contains(&source.dictation_id));
+                    suggestion.sources.retain(&keep);
                 }
             }
             file.suggestions
@@ -507,6 +563,12 @@ impl DictionaryStore {
 }
 
 // Uppercase first also unifies final sigma and long-s before conservative deduplication.
+/// The entry that accepting `suggestion` as is would create.
+fn suggested_entry(suggestion: &DictionarySuggestion) -> DictionaryEntry {
+    let misspelling = (!suggestion.term_only).then(|| suggestion.wrong.clone());
+    DictionaryEntry::new(&suggestion.term, misspelling)
+}
+
 fn case_key(text: &str) -> String {
     text.to_uppercase().to_lowercase()
 }
@@ -668,7 +730,9 @@ mod tests {
             .unwrap();
         reopened.set_enabled(id, true).unwrap();
         assert_eq!(reopened.vocabulary(), ["Proxmox VE"]);
-        reopened.purge_orphan_suggestions(&HashSet::new()).unwrap();
+        reopened
+            .purge_orphan_suggestions(&HashSet::new(), &HashSet::new())
+            .unwrap();
         assert_eq!(reopened.entries().len(), 1);
         reopened.remove_checked(id).unwrap();
         assert_eq!(reopened.learn_from_corrections(&[source]).unwrap(), 0);
@@ -691,14 +755,16 @@ mod tests {
         assert_eq!(store.suggestions()[0].sources.len(), 2);
         assert_eq!(
             store
-                .purge_orphan_suggestions(&HashSet::from(["b".into()]))
+                .purge_orphan_suggestions(&HashSet::from(["b".into()]), &HashSet::new())
                 .unwrap(),
             0
         );
         assert_eq!(store.suggestions()[0].sources[0].dictation_id, "b");
         let id = store.suggestions()[0].id;
         store.reject_suggestion(id).unwrap();
-        store.purge_orphan_suggestions(&HashSet::new()).unwrap();
+        store
+            .purge_orphan_suggestions(&HashSet::new(), &HashSet::new())
+            .unwrap();
         let reopened = DictionaryStore::open(temp.path().join("dictionary.json"));
         assert_eq!(reopened.learn_from_corrections(&[a, b]).unwrap(), 0);
         assert_eq!(reopened.suggestions()[0].status, SuggestionStatus::Rejected);
@@ -706,10 +772,129 @@ mod tests {
             .learn_from_corrections(&[correction("c", "Un cafe", "Un café")])
             .unwrap();
         assert_eq!(
-            reopened.purge_orphan_suggestions(&HashSet::new()).unwrap(),
+            reopened
+                .purge_orphan_suggestions(&HashSet::new(), &HashSet::new())
+                .unwrap(),
             1
         );
         assert_eq!(reopened.suggestions().len(), 1);
+    }
+
+    fn app_fix(id: &str, before: &str, after: &str) -> Correction {
+        Correction {
+            corrected_at: OffsetDateTime::now_utc(),
+            ..correction(id, before, after)
+        }
+    }
+
+    #[test]
+    fn app_corrections_need_review_then_change_the_next_dictation() {
+        let (temp, store) = store();
+        let fix = app_fix(
+            "d1",
+            "Je vais ouvrir Loustream.",
+            "Je vais ouvrir Loostream.",
+        );
+        assert_eq!(store.learn_from_app_correction(&fix).unwrap(), 1);
+        // Seen again in another dictation: one suggestion, two sources.
+        let again = app_fix("d2", "Loustream démarre.", "Loostream démarre.");
+        assert_eq!(store.learn_from_app_correction(&again).unwrap(), 0);
+        let suggestion = store.suggestions()[0].clone();
+        assert_eq!(suggestion.sources.len(), 2);
+        assert_eq!(suggestion.sources[0].origin, LearningOrigin::Application);
+        // Nothing active before review.
+        assert!(store.replacement_rules().is_empty() && store.vocabulary().is_empty());
+        store.accept_suggestion(suggestion.id).unwrap();
+        assert_eq!(
+            crate::replacement::apply(&store.replacement_rules(), "Ouvre Loustream."),
+            "Ouvre Loostream."
+        );
+        let entry = &store.entries()[0];
+        assert_eq!(
+            entry.provenance.as_ref().unwrap().origin,
+            LearningOrigin::Application
+        );
+
+        // A term-only suggestion becomes vocabulary, never a rule.
+        let unbound = app_fix(
+            "d3",
+            "Le service unburn répond.",
+            "Le service Unbound répond.",
+        );
+        store.learn_from_app_correction(&unbound).unwrap();
+        let term = store
+            .suggestions()
+            .into_iter()
+            .find(|s| s.term_only)
+            .unwrap();
+        store.accept_suggestion(term.id).unwrap();
+        assert!(store.vocabulary().contains(&"Unbound".to_string()));
+        assert_eq!(store.replacement_rules().len(), 1);
+
+        // "Modifier": the user's own spelling wins.
+        let jot = app_fix("d4", "Le projet jott avance.", "Le projet JOt avance.");
+        store.learn_from_app_correction(&jot).unwrap();
+        let edited = store
+            .suggestions()
+            .into_iter()
+            .find(|s| s.wrong == "jott")
+            .unwrap();
+        store
+            .accept_suggestion_edited(edited.id, "Jot", Some("jott"))
+            .unwrap();
+        assert_eq!(
+            crate::replacement::apply(&store.replacement_rules(), "jott"),
+            "Jot"
+        );
+
+        // Files written before 1.6 carry no origin: History.
+        let encoded = std::fs::read_to_string(temp.path().join("dictionary.json")).unwrap();
+        assert!(encoded.contains("\"origin\": \"application\""));
+        assert!(encoded.contains("\"termOnly\": true"));
+        assert!(
+            !encoded.contains("Je vais ouvrir"),
+            "no surrounding text stored"
+        );
+        let legacy: LearningSource =
+            serde_json::from_str(r#"{"dictationId":"x","correctedAt":"2026-01-01T00:00:00Z"}"#)
+                .unwrap();
+        assert_eq!(legacy.origin, LearningOrigin::History);
+    }
+
+    #[test]
+    fn pending_app_suggestions_follow_their_dictation() {
+        let (_temp, store) = store();
+        store
+            .learn_from_app_correction(&app_fix("live", "ouvrir Loustream", "ouvrir Loostream"))
+            .unwrap();
+        store
+            .learn_from_app_correction(&app_fix("gone", "lancer Proxmocks", "lancer Proxmox"))
+            .unwrap();
+        let mut old = app_fix("old", "voir Kubernètes", "voir Kubernetes");
+        old.corrected_at -= time::Duration::days(APP_SUGGESTION_RETENTION_DAYS + 1);
+        store.learn_from_app_correction(&old).unwrap();
+        // History corrections never vouch for an application source.
+        let dictations = HashSet::from(["live".to_string(), "old".to_string()]);
+        assert_eq!(
+            store
+                .purge_orphan_suggestions(&HashSet::new(), &dictations)
+                .unwrap(),
+            2,
+            "deleted dictation and expired suggestion"
+        );
+        assert_eq!(store.suggestions()[0].term, "Loostream");
+        let id = store.suggestions()[0].id;
+        store
+            .learn_from_corrections(&[correction("h", "Proxmocks", "Proxmox")])
+            .unwrap();
+        store.reject_suggestion(id).unwrap();
+        // Purging application suggestions keeps History ones and refusals.
+        assert_eq!(store.purge_app_suggestions().unwrap(), 0);
+        assert_eq!(store.suggestions().len(), 2);
+        store
+            .learn_from_app_correction(&app_fix("live", "voir Kubernètes", "voir Kubernetes"))
+            .unwrap();
+        assert_eq!(store.purge_app_suggestions().unwrap(), 1);
     }
 
     #[test]

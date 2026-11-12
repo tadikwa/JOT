@@ -633,6 +633,7 @@ fn dictionary_learning_keeps_history_authoritative_and_only_accepted_rules_reach
                 .unwrap()
                 .into_iter()
                 .collect(),
+            &f.store.all_ids().into_iter().collect(),
         )
         .unwrap();
     let final_store = DictionaryStore::open(dictionary_path);
@@ -682,7 +683,10 @@ fn deleting_a_dictation_purges_its_pending_suggestion_but_keeps_accepted_rules()
     let live = f.store.correction_session_ids().unwrap();
     assert_eq!(
         dictionary
-            .purge_orphan_suggestions(&live.into_iter().collect())
+            .purge_orphan_suggestions(
+                &live.into_iter().collect(),
+                &f.store.all_ids().into_iter().collect(),
+            )
             .unwrap(),
         1
     );

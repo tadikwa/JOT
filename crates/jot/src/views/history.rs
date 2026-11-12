@@ -595,12 +595,17 @@ impl HistoryView {
         let store = self.services.history.clone();
         let dictionary = self.services.dictionary.clone();
         self.busy = true;
+        // A deleted dictation is never learned from, even mid-watch.
+        jot_core::app_learning::stop(false);
         let task = cx.background_executor().spawn(async move {
             let result = store.delete_many(&ids);
             let purged = if result.is_ok() {
-                store
-                    .correction_session_ids()
-                    .and_then(|ids| dictionary.purge_orphan_suggestions(&ids.into_iter().collect()))
+                store.correction_session_ids().and_then(|ids| {
+                    dictionary.purge_orphan_suggestions(
+                        &ids.into_iter().collect(),
+                        &store.all_ids().into_iter().collect(),
+                    )
+                })
             } else {
                 Ok(0)
             };
@@ -2087,6 +2092,7 @@ mod tests {
             now: Box::new(OffsetDateTime::now_utc),
             noise_handling_enabled: Box::new(|| false),
             secure_field_focused: Box::new(|| false),
+            after_insert: Box::new(|_, _, _| {}),
         });
         let retry_queue = Arc::new(RetryQueue::new(history.clone(), transcription.clone()));
         Services {

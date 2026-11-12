@@ -219,6 +219,10 @@ pub struct Settings {
     pub keep_rejected_reformulations: bool,
     /// Days before those diagnostics are deleted (the dictation itself stays).
     pub rejected_reformulation_retention_days: i64,
+    /// Off by default: for 30 s after an insertion, watch only the field that
+    /// received it and offer what the user corrected there as dictionary
+    /// suggestions (never active before review). See `app_learning`.
+    pub learn_from_app_corrections: bool,
     /// Ask GitHub Releases at most once a day at startup whether a newer Jot
     /// exists. Only the app version leaves the PC; nothing is downloaded.
     pub check_updates: bool,
@@ -255,6 +259,7 @@ impl Default for Settings {
             local_unload: LocalUnload::FiveMinutes,
             keep_rejected_reformulations: false,
             rejected_reformulation_retention_days: 7,
+            learn_from_app_corrections: false,
             check_updates: true,
             include_prereleases: false,
             gate_trips: Vec::new(),

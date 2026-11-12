@@ -27,7 +27,9 @@ use crate::views::widgets::{self, ButtonKind, PageScroll, StatusTone};
 use gpui::{
     Context, Entity, Focusable, Role, SharedString, Window, div, prelude::*, px, uniform_list,
 };
-use jot_core::dictionary::{DictionaryEntry, DictionarySuggestion, SuggestionStatus};
+use jot_core::dictionary::{
+    DictionaryEntry, DictionarySuggestion, LearningOrigin, SuggestionStatus, suspicious_case,
+};
 use uuid::Uuid;
 
 fn ui(en: &'static str, fr: &'static str) -> &'static str {
@@ -78,6 +80,8 @@ pub struct DictionaryView {
     suggestions: Vec<DictionarySuggestion>,
     filter: Filter,
     editing: Option<Uuid>,
+    /// "Modifier" on a suggestion: saving accepts it with the edited fields.
+    reviewing: Option<Uuid>,
     status: Option<(String, StatusTone)>,
     busy: bool,
     scroll: PageScroll,
@@ -121,6 +125,7 @@ impl DictionaryView {
             suggestions,
             filter: Filter::All,
             editing: None,
+            reviewing: None,
             status: None,
             busy: false,
             scroll: PageScroll::new(),
@@ -151,8 +156,10 @@ impl DictionaryView {
         let history = self.services.history.clone();
         let dictionary = self.services.dictionary.clone();
         let task = cx.background_executor().spawn(async move {
-            dictionary
-                .purge_orphan_suggestions(&history.correction_session_ids()?.into_iter().collect())
+            dictionary.purge_orphan_suggestions(
+                &history.correction_session_ids()?.into_iter().collect(),
+                &history.all_ids().into_iter().collect(),
+            )
         });
         cx.spawn(async move |this, cx| {
             let result = task.await;
@@ -174,6 +181,7 @@ impl DictionaryView {
 
     fn clear_editor(&mut self, cx: &mut Context<Self>) {
         self.editing = None;
+        self.reviewing = None;
         self.term.update(cx, |field, cx| {
             field.take_content();
             cx.notify();
@@ -188,9 +196,13 @@ impl DictionaryView {
         let term = self.term.read(cx).content().trim().to_owned();
         let wrong = self.misspelling.read(cx).content().trim().to_owned();
         let wrong = (!wrong.is_empty()).then_some(wrong.as_str());
-        let result = match self.editing {
-            Some(id) => self.services.dictionary.update_entry(id, &term, wrong),
-            None => self.services.dictionary.add_checked(&term, wrong),
+        let result = match (self.reviewing, self.editing) {
+            (Some(id), _) => self
+                .services
+                .dictionary
+                .accept_suggestion_edited(id, &term, wrong),
+            (None, Some(id)) => self.services.dictionary.update_entry(id, &term, wrong),
+            (None, None) => self.services.dictionary.add_checked(&term, wrong),
         };
         if result.is_err() {
             self.failure(cx);
@@ -226,6 +238,7 @@ impl DictionaryView {
             }
             dictionary.purge_orphan_suggestions(
                 &history.correction_session_ids()?.into_iter().collect(),
+                &history.all_ids().into_iter().collect(),
             )?;
             anyhow::Ok(added)
         });
@@ -288,10 +301,13 @@ impl DictionaryView {
                         (true, true) => ui("Active correction", "Correction active"),
                         (true, false) => ui("Correction (disabled)", "Correction (désactivée)"),
                     },
-                    if entry.provenance.is_some() {
-                        ui("validated", "validée")
-                    } else {
-                        ui("manual", "manuelle")
+                    match entry.provenance.as_ref().map(|p| p.origin) {
+                        Some(LearningOrigin::Application) => ui(
+                            "validated, corrected after a dictation in an application",
+                            "validée, corrigée après dictée dans une application",
+                        ),
+                        Some(LearningOrigin::History) => ui("validated", "validée"),
+                        None => ui("manual", "manuelle"),
                     },
                     entry.created_at.date()
                 ),
@@ -301,7 +317,7 @@ impl DictionaryView {
                 suggestion.term.clone(),
                 Some(suggestion.wrong.clone()),
                 format!(
-                    "{} · {} {}% · {} {}",
+                    "{}{} · {} {}% · {} {}{}{}",
                     if suggestion.status == SuggestionStatus::Pending {
                         ui(
                             "Suggestion pending validation (not applied)",
@@ -310,10 +326,39 @@ impl DictionaryView {
                     } else {
                         ui("Rejected", "Refusée")
                     },
+                    if suggestion.term_only {
+                        ui(
+                            " · vocabulary term only, no rule",
+                            " · terme de vocabulaire seul, sans règle",
+                        )
+                    } else {
+                        ""
+                    },
                     ui("lexical score", "score lexical"),
                     suggestion.confidence,
                     suggestion.sources.len(),
-                    ui("source(s)", "source(s)")
+                    ui("source(s)", "source(s)"),
+                    suggestion
+                        .sources
+                        .iter()
+                        .rfind(|s| s.origin == LearningOrigin::Application)
+                        .map(|s| format!(
+                            " · {} {}",
+                            ui(
+                                "corrected after a dictation in an application on",
+                                "corrigé après dictée dans une application le",
+                            ),
+                            s.corrected_at.date()
+                        ))
+                        .unwrap_or_default(),
+                    if suspicious_case(&suggestion.term) {
+                        ui(
+                            " · ⚠ unusual capitals: check before accepting",
+                            " · ⚠ majuscules inhabituelles : vérifiez avant d’accepter",
+                        )
+                    } else {
+                        ""
+                    },
                 ),
             ),
         };
@@ -420,6 +465,36 @@ impl DictionaryView {
                         }),
                     ))
                     .child(widgets::button(
+                        SharedString::from(format!("edit-suggestion-{id}")),
+                        ui("Edit", "Modifier"),
+                        ButtonKind::Secondary,
+                        true,
+                        theme,
+                        {
+                            let suggestion = suggestion.clone();
+                            cx.listener(move |this, _, window, cx| {
+                                this.editing = None;
+                                this.reviewing = Some(suggestion.id);
+                                this.term.update(cx, |field, cx| {
+                                    field.set_content(suggestion.term.clone());
+                                    cx.notify();
+                                });
+                                let wrong = if suggestion.term_only {
+                                    String::new()
+                                } else {
+                                    suggestion.wrong.clone()
+                                };
+                                this.misspelling.update(cx, |field, cx| {
+                                    field.set_content(wrong);
+                                    cx.notify();
+                                });
+                                this.scroll.reset();
+                                window.focus(&this.term.read(cx).focus_handle(cx), cx);
+                                cx.notify();
+                            })
+                        },
+                    ))
+                    .child(widgets::button(
                         SharedString::from(format!("reject-suggestion-{id}")),
                         ui("Reject", "Refuser"),
                         ButtonKind::Secondary,
@@ -509,7 +584,9 @@ impl Render for DictionaryView {
             )
             .child(widgets::button(
                 "save-term",
-                if self.editing.is_some() {
+                if self.reviewing.is_some() {
+                    ui("Accept as edited", "Accepter ainsi")
+                } else if self.editing.is_some() {
                     ui("Save changes", "Enregistrer")
                 } else {
                     tr(Msg::Add)
@@ -519,7 +596,7 @@ impl Render for DictionaryView {
                 theme,
                 cx.listener(|this, _, _, cx| this.save(cx)),
             ));
-        if self.editing.is_some() {
+        if self.editing.is_some() || self.reviewing.is_some() {
             editor = editor.child(widgets::button(
                 "cancel-term",
                 tr(Msg::Cancel),
@@ -645,11 +722,44 @@ impl Render for DictionaryView {
                 !self.busy,
                 theme,
                 cx.listener(|this, _, _, cx| this.refresh(cx)),
+            ))
+            .child(widgets::button(
+                "purge-app-suggestions",
+                ui(
+                    "Delete suggestions from applications",
+                    "Supprimer les suggestions des applications",
+                ),
+                ButtonKind::Destructive,
+                self.suggestions.iter().any(|s| {
+                    s.status == SuggestionStatus::Pending
+                        && s.sources
+                            .iter()
+                            .any(|s| s.origin == LearningOrigin::Application)
+                }),
+                theme,
+                cx.listener(|this, _, _, cx| {
+                    match this.services.dictionary.purge_app_suggestions() {
+                        Ok(count) => {
+                            this.status = Some((
+                                format!(
+                                    "{} {count}",
+                                    ui(
+                                        "Suggestions from applications deleted:",
+                                        "Suggestions des applications supprimées :"
+                                    )
+                                ),
+                                StatusTone::Good,
+                            ))
+                        }
+                        Err(_) => this.failure(cx),
+                    }
+                    this.reload(cx);
+                }),
             ));
         let mut children = vec![widgets::heading(Msg::Dictionary).into_any_element(),
             div().text_color(theme.on_surface_variant).text_size(theme::type_scale::LABEL).child(ui(
-                "Suggestions come only from corrections saved in Jot. Local lexical analysis; no extra API call. Review the meaning before accepting: the score measures spelling similarity, not certainty. Accepted rules survive deletion of their source dictation.",
-                "Suggestions issues uniquement des corrections enregistrées dans Jot. Analyse lexicale locale, sans appel API supplémentaire. Vérifiez le sens avant d’accepter : le score mesure la proximité orthographique, pas une certitude. Les règles acceptées survivent à la suppression de leur dictée source.")).into_any_element(),
+                "Suggestions come from corrections saved in Jot and, if enabled in Settings → Privacy, from fixes made in an application right after a dictation. Local lexical analysis; no extra API call. Review the meaning before accepting: the score measures spelling similarity, not certainty. Accepted rules survive deletion of their source dictation.",
+                "Suggestions issues des corrections enregistrées dans Jot et, si activé dans Réglages → Confidentialité, des corrections faites dans une application juste après une dictée. Analyse lexicale locale, sans appel API supplémentaire. Vérifiez le sens avant d’accepter : le score mesure la proximité orthographique, pas une certitude. Les règles acceptées survivent à la suppression de leur dictée source.")).into_any_element(),
             self.search.clone().into_any_element(), filters.into_any_element(), editor.into_any_element(), data_actions.into_any_element()];
         if self.busy {
             children.push(

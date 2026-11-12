@@ -109,6 +109,7 @@ pub struct Session {
 
 type SessionUpdateFn = Box<dyn Fn(&SessionMeta, &Path) + Send + Sync>;
 type SessionDiscardFn = Box<dyn Fn(Uuid) + Send + Sync>;
+type AfterInsertFn = Box<dyn Fn(Uuid, &str, &DictationContext) + Send + Sync>;
 
 #[derive(Default)]
 pub struct CoordinatorCallbacks {
@@ -135,6 +136,10 @@ pub struct CoordinatorDeps {
     /// happens to have a password box focused — a coin flip for a contributor,
     /// not a bug in their change.
     pub secure_field_focused: Box<dyn Fn() -> bool + Send + Sync>,
+    /// Called after the paste shortcut was posted (session id, inserted
+    /// text, context). Posting is no proof of landing: the opt-in correction
+    /// watch starting here confirms the text before the caret itself.
+    pub after_insert: AfterInsertFn,
 }
 
 struct Inner {
@@ -325,6 +330,9 @@ impl DictationCoordinator {
             return false;
         }
 
+        // A new dictation ends the previous correction watch (kept: the user
+        // already fixed what they wanted before dictating again).
+        crate::app_learning::stop(true);
         let id = Uuid::new_v4();
         let started_at = (self.deps.now)();
         let folder = match file_layout::make_session_folder(id, started_at) {
@@ -803,6 +811,9 @@ impl DictationCoordinator {
             .insert(&outcome.cleaned_transcript, &context)
             .await;
         let pipeline_seconds = started.elapsed().as_secs_f64();
+        if insertion == InsertionOutcome::Inserted {
+            (self.deps.after_insert)(session_id, &outcome.cleaned_transcript, &context);
+        }
 
         let (status, event) = match insertion {
             InsertionOutcome::Inserted => (SessionStatus::Inserted, DictationEvent::Inserted),
@@ -1134,6 +1145,7 @@ mod tests {
         calls: Arc<AtomicUsize>,
         discarded: Arc<AtomicUsize>,
         warmups: Arc<AtomicUsize>,
+        watched: Arc<AtomicUsize>,
     }
 
     fn harness(
@@ -1149,6 +1161,7 @@ mod tests {
         let calls = Arc::new(AtomicUsize::new(0));
         let discarded = Arc::new(AtomicUsize::new(0));
         let warmups = Arc::new(AtomicUsize::new(0));
+        let watched = Arc::new(AtomicUsize::new(0));
         let result = capture.result.clone();
         let start_error = capture.start_error.clone();
         let levels = capture.levels.clone();
@@ -1174,6 +1187,12 @@ mod tests {
             now: Box::new(OffsetDateTime::now_utc),
             noise_handling_enabled: Box::new(|| false),
             secure_field_focused: Box::new(move || secure),
+            after_insert: {
+                let watched = watched.clone();
+                Box::new(move |_, _, _| {
+                    watched.fetch_add(1, Ordering::SeqCst);
+                })
+            },
         });
         {
             let discarded = discarded.clone();
@@ -1188,6 +1207,7 @@ mod tests {
             calls,
             discarded,
             warmups,
+            watched,
         }
     }
 
@@ -1721,7 +1741,20 @@ mod tests {
 
             assert_eq!(harness.coordinator.state(), DictationState::Done(expected));
             assert_eq!(SessionMeta::read(&folder).unwrap().status, status);
+            // Text that did not go into the app is never watched for corrections.
+            assert_eq!(harness.watched.load(Ordering::SeqCst), 0);
         }
+        let harness = harness(
+            FakeCapture::default(),
+            None,
+            InsertionOutcome::Inserted,
+            false,
+        );
+        harness.coordinator.handle(HotkeyIntent::Begin);
+        settle().await;
+        harness.coordinator.handle(HotkeyIntent::Finalize);
+        settle().await;
+        assert_eq!(harness.watched.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

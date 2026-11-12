@@ -88,6 +88,31 @@ impl Services {
                 Box::new(move || settings.get().experimental_noise_handling)
             },
             secure_field_focused: Box::new(|| win32::focus_kind() == win32::FocusKind::Password),
+            after_insert: {
+                let settings = settings.clone();
+                let dictionary = dictionary.clone();
+                Box::new(move |session, text, context| {
+                    if !settings.get().learn_from_app_corrections {
+                        return;
+                    }
+                    let (settings, dictionary) = (settings.clone(), dictionary.clone());
+                    jot_core::app_learning::watch(jot_core::app_learning::Watch {
+                        dictation_id: session,
+                        inserted: text.to_string(),
+                        target_pid: context.target_pid,
+                        sink: Box::new(move |correction| {
+                            // Turned off while the watch was finishing.
+                            if !settings.get().learn_from_app_corrections {
+                                return;
+                            }
+                            match dictionary.learn_from_app_correction(&correction) {
+                                Ok(added) => tracing::info!(added, "correction watch: suggestions"),
+                                Err(_) => tracing::warn!("correction watch: dictionary not saved"),
+                            }
+                        }),
+                    });
+                })
+            },
         });
 
         // Never free the local models under a recording or its processing.
