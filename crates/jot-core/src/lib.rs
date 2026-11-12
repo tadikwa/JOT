@@ -21,6 +21,7 @@ pub mod audio;
 pub mod coordinator;
 pub mod credentials;
 pub mod dictionary;
+pub mod fidelity;
 pub mod file_layout;
 pub mod gemini;
 pub mod history;

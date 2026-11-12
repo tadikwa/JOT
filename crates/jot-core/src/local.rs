@@ -970,7 +970,7 @@ pub fn reformulation_verdict(raw: &str, cleaned: &str) -> Result<(), String> {
     if raw.contains('?') && !cleaned.contains('?') {
         return Err("question lost".into());
     }
-    Ok(())
+    crate::fidelity::check(raw, cleaned).map_err(str::to_string)
 }
 
 /// Vocabulary sent to the local model: short, the prompt is re-read per call.
