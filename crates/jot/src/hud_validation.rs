@@ -311,12 +311,11 @@ pub fn run(directory: PathBuf) -> Result<()> {
     )?;
     let error = Arc::new(parking_lot::Mutex::new(None));
     let app_error = error.clone();
-    let show_idle = !std::env::args().any(|arg| arg == "--initially-hidden");
     crate::i18n::select(jot_core::settings::UiLanguage::Automatic);
     application().run(move |cx: &mut App| {
         theme::load_fonts(cx);
         cx.set_quit_mode(gpui::QuitMode::Explicit);
-        let hud = match open_hud(cx, show_idle) {
+        let hud = match open_hud(cx) {
             Ok(h) => h,
             Err(e) => { *app_error.lock() = Some(e.to_string()); cx.quit(); return; }
         };
@@ -330,9 +329,8 @@ pub fn run(directory: PathBuf) -> Result<()> {
                     hud.update(cx, |_, window, _| window_shell::place_on_active_display(window, pill::HUD_BOTTOM_MARGIN))?;
                 for cycle in 0..2 {
                     for (name, state) in [
-                        ("initial", if show_idle { PillState::IdleDot } else { PillState::Hidden }),
+                        ("initial", PillState::Hidden),
                         ("control", PillState::Hidden),
-("idle", PillState::IdleDot),
                         ("hidden", PillState::Hidden),
                         ("warming", PillState::Listening { locked: false }),
                         ("recording", PillState::Listening { locked: false }),

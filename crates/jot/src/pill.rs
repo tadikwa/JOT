@@ -33,7 +33,6 @@ use std::time::{Duration, Instant};
 pub enum PillState {
     #[default]
     Hidden,
-    IdleDot,
     Listening {
         locked: bool,
     },
@@ -127,19 +126,10 @@ impl PillView {
         changed
     }
 
-    /// Projects coordinator state onto the pill, given the resting-dot setting.
-    pub fn project(
-        state: DictationState,
-        silence: SilenceReason,
-        show_idle_indicator: bool,
-    ) -> PillState {
-        let resting = if show_idle_indicator {
-            PillState::IdleDot
-        } else {
-            PillState::Hidden
-        };
+    /// Projects coordinator state onto the pill. Nothing is drawn at rest.
+    pub fn project(state: DictationState, silence: SilenceReason) -> PillState {
         match state {
-            DictationState::Idle => resting,
+            DictationState::Idle => PillState::Hidden,
             // Warming already shows as listening: the key press must be
             // acknowledged before the microphone is open, or a fast talker gets
             // no feedback for the first hundred milliseconds.
@@ -148,7 +138,7 @@ impl PillView {
             DictationState::Finalizing
             | DictationState::Transcribing
             | DictationState::Inserting => PillState::Processing,
-            DictationState::Cancelled => resting,
+            DictationState::Cancelled => PillState::Hidden,
             DictationState::Done(outcome) => match outcome {
                 DictationOutcome::Inserted => PillState::Success { words: 0 },
                 DictationOutcome::AwaitingChip => PillState::Notice(Msg::HudCopied.into()),
@@ -319,13 +309,6 @@ impl Render for PillView {
 
         let body: gpui::AnyElement = match self.state.clone() {
             PillState::Hidden => div().into_any_element(),
-
-            PillState::IdleDot => div()
-                .w(px(56.0))
-                .h(px(5.0))
-                .rounded(px(2.5))
-                .bg(with_alpha(theme.on_surface, 0.28))
-                .into_any_element(),
 
             PillState::Listening { locked } => {
                 let width = if locked {
@@ -544,24 +527,20 @@ mod tests {
     fn warming_already_reads_as_listening() {
         // The key press must be acknowledged before the microphone is open.
         assert_eq!(
-            PillView::project(DictationState::Warming, SilenceReason::NoSpeech, true),
+            PillView::project(DictationState::Warming, SilenceReason::NoSpeech),
             PillState::Listening { locked: false }
         );
     }
 
     #[test]
-    fn the_resting_state_follows_the_idle_indicator_setting() {
+    fn nothing_is_drawn_at_rest() {
         assert_eq!(
-            PillView::project(DictationState::Idle, SilenceReason::NoSpeech, true),
-            PillState::IdleDot
-        );
-        assert_eq!(
-            PillView::project(DictationState::Idle, SilenceReason::NoSpeech, false),
+            PillView::project(DictationState::Idle, SilenceReason::NoSpeech),
             PillState::Hidden
         );
         // A cancel returns to rest rather than shouting about it.
         assert_eq!(
-            PillView::project(DictationState::Cancelled, SilenceReason::NoSpeech, false),
+            PillView::project(DictationState::Cancelled, SilenceReason::NoSpeech),
             PillState::Hidden
         );
     }
@@ -571,12 +550,10 @@ mod tests {
         let quiet = PillView::project(
             DictationState::Done(DictationOutcome::Silent),
             SilenceReason::NoSpeech,
-            true,
         );
         let noisy = PillView::project(
             DictationState::Done(DictationOutcome::Silent),
             SilenceReason::TooNoisy,
-            true,
         );
         assert_ne!(quiet, noisy);
         assert!(matches!(quiet, PillState::Notice(_)));
@@ -587,7 +564,6 @@ mod tests {
         let held = PillView::project(
             DictationState::Done(DictationOutcome::HeldForSecureField),
             SilenceReason::NoSpeech,
-            true,
         );
         let PillState::Notice(message) = held else {
             panic!("expected a notice");

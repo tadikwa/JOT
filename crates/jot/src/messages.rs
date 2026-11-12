@@ -92,8 +92,6 @@ messages! {
     Microphone => "Microphone", "Microphone";
     MicrophoneHint => "When you choose a microphone, Jot keeps using that device.", "Si vous choisissez un microphone, Jot continue d’utiliser cet appareil.";
     DefaultDevice => "System default", "Par défaut (Windows)";
-    IdleIndicator => "Show the idle indicator", "Afficher l’indicateur au repos";
-    IdleIndicatorHint => "Shows a small bar at the bottom of the screen when Jot is idle.", "Affiche une petite barre en bas de l’écran quand Jot est au repos.";
     Autostart => "Start with Windows", "Lancer au démarrage de Windows";
     AutostartHint => "Keep dictation available as soon as you sign in.", "Rend la dictée disponible dès l’ouverture de votre session.";
     AutostartError => "Windows could not change the startup setting.", "Impossible de modifier le démarrage automatique dans Windows.";

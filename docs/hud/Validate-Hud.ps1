@@ -1,7 +1,6 @@
 param(
     [Parameter(Mandatory=$true)][string]$Executable,
-    [Parameter(Mandatory=$true)][string]$ReportDirectory,
-    [switch]$InitiallyHidden
+    [Parameter(Mandatory=$true)][string]$ReportDirectory
 )
 $ErrorActionPreference='Stop'
 $exe=(Resolve-Path -LiteralPath $Executable).Path
@@ -14,7 +13,6 @@ $start=[System.Diagnostics.ProcessStartInfo]::new($exe)
 $start.UseShellExecute=$false
 $start.ArgumentList.Add('--hud-validate')
 $start.ArgumentList.Add($report)
-if($InitiallyHidden){$start.ArgumentList.Add('--initially-hidden')}
 $proc=[System.Diagnostics.Process]::Start($start)
 try {
     [pscustomobject]@{PID=$proc.Id;Executable=$exe;SHA256=(Get-FileHash -LiteralPath $exe).Hash}|ConvertTo-Json|Set-Content -LiteralPath (Join-Path $report 'controller.json')

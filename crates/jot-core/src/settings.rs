@@ -186,9 +186,6 @@ pub struct Settings {
     /// taps routinely exceed the hold threshold, misreading tap-tap as
     /// hold→finalize. The timing-free gesture is Space-while-holding.
     pub double_tap_lock: bool,
-    /// Show the resting dot at the bottom of the screen when idle. Off = the
-    /// pill only appears while dictating.
-    pub show_idle_indicator: bool,
     pub sounds_enabled: bool,
     pub hotkey_key: HotkeyKey,
     /// None preserves legacy bare-key settings without changing their meaning.
@@ -237,7 +234,6 @@ impl Default for Settings {
             transcribe_model_override: None,
             cleanup_model_override: None,
             double_tap_lock: false,
-            show_idle_indicator: true,
             sounds_enabled: true,
             hotkey_key: HotkeyKey::default(),
             custom_hotkey: None,
@@ -581,7 +577,6 @@ mod tests {
         assert!(settings.smart_transcription);
         assert!(!settings.smart_cleanup_pass);
         assert!(!settings.double_tap_lock);
-        assert!(settings.show_idle_indicator);
         assert_eq!(settings.audio_retention_days, 7);
         assert_eq!(settings.hotkey_key, HotkeyKey::RightControl);
     }
@@ -645,8 +640,32 @@ mod tests {
     fn subscribers_hear_the_changed_key() {
         let (_temp, store) = store();
         let mut rx = store.subscribe();
-        store.update(Some("showIdleIndicator"), |s| s.show_idle_indicator = false);
-        assert_eq!(rx.try_recv().unwrap(), "showIdleIndicator");
+        store.update(Some("soundsEnabled"), |s| s.sounds_enabled = false);
+        assert_eq!(rx.try_recv().unwrap(), "soundsEnabled");
+    }
+
+    #[test]
+    fn a_removed_idle_indicator_key_keeps_every_other_setting() {
+        // 1.5.0 files carry "showIdleIndicator"; 1.5.1 has no such setting.
+        let rest = r#""hotkeyKey":"capsLock","dictationActivationMode":"toggle","audioRetentionDays":30,"soundsEnabled":false,"doubleTapLock":true,"uiTheme":"dark","typingWpm":75"#;
+        let expected =
+            serde_json::to_value(serde_json::from_str::<Settings>(&format!("{{{rest}}}")).unwrap())
+                .unwrap();
+        assert_ne!(expected, serde_json::to_value(Settings::default()).unwrap());
+        for old in ["true", "false"] {
+            let temp = tempfile::tempdir().unwrap();
+            let path = temp.path().join("settings.json");
+            std::fs::write(&path, format!(r#"{{"showIdleIndicator":{old},{rest}}}"#)).unwrap();
+            let store = SettingsStore::open(path.clone());
+            assert_eq!(serde_json::to_value(store.get()).unwrap(), expected);
+
+            // The next write drops the stale key and changes nothing else.
+            store.update(Some("soundsEnabled"), |s| s.sounds_enabled = false);
+            let written = std::fs::read_to_string(&path).unwrap();
+            assert!(!written.contains("showIdleIndicator"), "{written}");
+            let reopened = SettingsStore::open(path);
+            assert_eq!(serde_json::to_value(reopened.get()).unwrap(), expected);
+        }
     }
 
     #[test]

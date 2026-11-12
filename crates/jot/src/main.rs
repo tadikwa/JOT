@@ -153,7 +153,7 @@ fn main() -> Result<()> {
         // Closing the workspace leaves the tray icon and dictation running.
         cx.set_quit_mode(gpui::QuitMode::Explicit);
 
-        let hud = match open_hud(cx, app_services.settings.get().show_idle_indicator) {
+        let hud = match open_hud(cx) {
             Ok(hud) => hud,
             Err(error) => {
                 tracing::error!(%error, "could not open the HUD — dictation would be invisible");
@@ -256,7 +256,7 @@ fn init_tracing() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 /// The HUD host: a transparent, borderless, always-on-top window that spans the
 /// pill's widest state. It is opened once and never closed — hiding it would
 /// cost a window creation on the latency path of every key press.
-fn open_hud(cx: &mut App, show_idle_indicator: bool) -> Result<WindowHandle<PillView>> {
+fn open_hud(cx: &mut App) -> Result<WindowHandle<PillView>> {
     let (width, height) = pill::HUD_SIZE;
     // The real position is set from the work area immediately after creation;
     // this origin only has to be somewhere valid until then.
@@ -287,17 +287,8 @@ fn open_hud(cx: &mut App, show_idle_indicator: bool) -> Result<WindowHandle<Pill
             // Refuses focus, passes clicks through, and sits in the work area
             // rather than under the taskbar — see `window_shell`.
             overlay_result = window_shell::make_overlay(window, pill::HUD_BOTTOM_MARGIN);
-            cx.new(|_| {
-                let mut pill = PillView::new();
-                // Start at rest, not blank: the resting indicator is the only
-                // thing telling the user Jot is running at all.
-                pill.state = if show_idle_indicator {
-                    PillState::IdleDot
-                } else {
-                    PillState::Hidden
-                };
-                pill
-            })
+            // Nothing is drawn at rest: the tray icon says Jot is running.
+            cx.new(|_| PillView::new())
         },
     )?;
     if let Err(error) = overlay_result {
@@ -310,30 +301,13 @@ fn open_hud(cx: &mut App, show_idle_indicator: bool) -> Result<WindowHandle<Pill
 /// Bridges coordinator updates onto the pill, and plays the earcons.
 fn drive_pill(hud: WindowHandle<PillView>, services: Services, cx: &mut App) {
     let mut updates = services.coordinator.subscribe();
-    let mut settings_changes = services.settings.subscribe();
     cx.spawn(async move |cx| {
         let mut silence = SilenceReason::NoSpeech;
         let mut last_words = 0usize;
         loop {
-            let update = tokio::select! {
-                update = updates.recv() => match update {
-                    Ok(update) => update,
-                    Err(_) => continue,
-                },
-                // A toggled resting indicator must take effect immediately, not
-                // after the next unrelated transition.
-                change = settings_changes.recv() => {
-                    if matches!(change, Ok("showIdleIndicator")) {
-                        let show = services.settings.get().show_idle_indicator;
-                        let state = services.coordinator.state();
-                        let projected = PillView::project(state, silence, show);
-                        let _ = hud.update(cx, |view, _, cx| {
-                            view.state = projected;
-                            cx.notify();
-                        });
-                    }
-                    continue;
-                }
+            let update = match updates.recv().await {
+                Ok(update) => update,
+                Err(_) => continue,
             };
 
             let sounds = services.settings.get().sounds_enabled;
@@ -362,8 +336,7 @@ fn drive_pill(hud: WindowHandle<PillView>, services: Services, cx: &mut App) {
                     play_transition(state, sounds);
                     tray::set_dictating(state.is_recording());
 
-                    let show_idle = services.settings.get().show_idle_indicator;
-                    let mut projected = PillView::project(state, silence, show_idle);
+                    let mut projected = PillView::project(state, silence);
                     if let PillState::Success { words } = &mut projected {
                         *words = last_words;
                     }
@@ -389,9 +362,8 @@ fn drive_pill(hud: WindowHandle<PillView>, services: Services, cx: &mut App) {
                     });
 
                     if terminal {
-                        // The outcome is shown, then the pill goes back to rest.
+                        // The outcome is shown, then the pill disappears.
                         let hud = hud;
-                        let settings = services.settings.clone();
                         let coordinator = services.coordinator.clone();
                         cx.spawn(async move |cx| {
                             cx.background_executor()
@@ -399,13 +371,8 @@ fn drive_pill(hud: WindowHandle<PillView>, services: Services, cx: &mut App) {
                                 .await;
                             // Only if nothing new started in the meantime.
                             if coordinator.state().is_terminal() {
-                                let show = settings.get().show_idle_indicator;
                                 let _ = hud.update(cx, |view, _, cx| {
-                                    view.state = if show {
-                                        PillState::IdleDot
-                                    } else {
-                                        PillState::Hidden
-                                    };
+                                    view.state = PillState::Hidden;
                                     cx.notify();
                                 });
                             }

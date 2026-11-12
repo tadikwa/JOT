@@ -1719,24 +1719,6 @@ impl SettingsView {
                 widgets::field_row(tr(Msg::Language), tr(Msg::LanguageHint), theme, language)
                     .into_any_element(),
                 widgets::field_row(tr(Msg::Theme), "", theme, palette).into_any_element(),
-                widgets::toggle(
-                    "idle-indicator",
-                    tr(Msg::IdleIndicator),
-                    tr(Msg::IdleIndicatorHint),
-                    settings.show_idle_indicator,
-                    theme,
-                    {
-                        let store = self.services.settings.clone();
-                        move |_, _, cx| {
-                            let next = !store.get().show_idle_indicator;
-                            store.update(Some("showIdleIndicator"), |s| {
-                                s.show_idle_indicator = next
-                            });
-                            cx.refresh_windows();
-                        }
-                    },
-                )
-                .into_any_element(),
             ],
         )
         .into_any_element()

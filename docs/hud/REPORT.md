@@ -32,7 +32,7 @@ Les captures viennent de l’écran composé (`BitBlt` + `CAPTUREBLT`, après `D
 
 **Correction de validation :** les premiers essais utilisaient `bottom-7`, dans la marge transparente de 8 points. Leurs clics ne démontraient pas le passage sur la pilule. Ces essais intermédiaires sont conservés pour traçabilité et ne fondent pas la conclusion finale sur les pixels dessinés.
 
-États : premier affichage, contrôle fenêtre cachée, repos, état caché avec HWND affiché, warming, recording, verrouillage, processing, succès, notice, erreur et retour caché ; deux cycles par lancement. `--initially-hidden` permet de tester le premier affichage sans indicateur au repos.
+États : premier affichage, contrôle fenêtre cachée, repos, état caché avec HWND affiché, warming, recording, verrouillage, processing, succès, notice, erreur et retour caché ; deux cycles par lancement. Depuis 1.5.1, l’indicateur au repos et son réglage n’existent plus : les états « initial », « contrôle » et « caché » sont tous vides, et l’option `--initially-hidden` a été retirée. Les mesures ci-dessous, faites avec 1.4, restent valables pour les autres états.
 
 `processes.json` identifie les deux PID et l’exécutable. `result.json` indique HWND, classe réellement lue, parent/owner, PID/thread, styles, rectangle, DPI, placement, pixels, clics, focus et animation. La cible est fermée normalement puis attendue ; un Job Object tue la cible si le contrôleur disparaît. La cible surveille aussi son parent et possède sa propre échéance de 80 secondes ; le contrôleur est borné à 90 secondes. Le script `Validate-Hud.ps1` conserve son processus et le ferme en `finally` sans toucher aux autres Jot.
 
