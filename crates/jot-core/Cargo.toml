@@ -20,6 +20,7 @@ dirs = "6"
 parking_lot = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
+tracing-subscriber = "0.3"
 cpal = "0.15"
 hound = "3.5"
 rusqlite = { version = "0.32", features = ["bundled", "time", "functions"] }
@@ -50,3 +51,4 @@ features = [
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "fs"] }
+tracing-subscriber = "0.3"

@@ -393,6 +393,9 @@ mod platform {
 
     pub struct Uia(IUIAutomation);
 
+    /// A selection longer than this is not a word being fixed.
+    const MAX_SELECTION: i32 = 4096;
+
     pub fn run(rx: std::sync::mpsc::Receiver<Command>) {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
@@ -419,14 +422,21 @@ mod platform {
             Some(Self(automation))
         }
 
-        fn caret(element: &IUIAutomationElement) -> Option<IUIAutomationTextRange> {
+        /// The caret, or the selection when there is one (selecting the wrong
+        /// word is the usual way to fix it), with the field's own document
+        /// range: Chromium moves ranges out of the field into the page.
+        fn caret(
+            element: &IUIAutomationElement,
+        ) -> Option<(IUIAutomationTextRange, IUIAutomationTextRange)> {
             unsafe {
                 if let Ok(pattern) =
                     element.GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id)
                 {
                     let mut active = Default::default();
-                    if let Ok(range) = pattern.GetCaretRange(&mut active) {
-                        return Some(range);
+                    if let (Ok(range), Ok(document)) =
+                        (pattern.GetCaretRange(&mut active), pattern.DocumentRange())
+                    {
+                        return Some((range, document));
                     }
                 }
                 let pattern = element
@@ -436,10 +446,7 @@ mod platform {
                 if selection.Length().ok()? != 1 {
                     return None;
                 }
-                let range = selection.GetElement(0).ok()?;
-                // A real selection is not a caret right after an insertion.
-                let text = range.GetText(1).ok()?;
-                text.is_empty().then_some(range)
+                Some((selection.GetElement(0).ok()?, pattern.DocumentRange().ok()?))
             }
         }
     }
@@ -479,8 +486,10 @@ mod platform {
             back: usize,
             forward: usize,
         ) -> Option<CaretText> {
-            let caret = Self::caret(element)?;
+            let (caret, document) = Self::caret(element)?;
             unsafe {
+                // [start - back, caret start] and [caret start, caret end + forward]:
+                // together they cover a selection, so a word being retyped is seen.
                 let before = caret.Clone().ok()?;
                 before
                     .MoveEndpointByRange(
@@ -501,7 +510,7 @@ mod platform {
                     .MoveEndpointByRange(
                         TextPatternRangeEndpoint_Start,
                         &caret,
-                        TextPatternRangeEndpoint_End,
+                        TextPatternRangeEndpoint_Start,
                     )
                     .ok()?;
                 let moved_forward = after
@@ -511,14 +520,55 @@ mod platform {
                         forward as i32,
                     )
                     .ok()?;
-                // Bounded reads: twice the units covers CRLF and surrogate pairs.
+                // Never past the field: page text around a web composer changes on
+                // its own (and is not ours to read).
+                let past_start = before
+                    .CompareEndpoints(
+                        TextPatternRangeEndpoint_Start,
+                        &document,
+                        TextPatternRangeEndpoint_Start,
+                    )
+                    .ok()?
+                    < 0;
+                if past_start {
+                    before
+                        .MoveEndpointByRange(
+                            TextPatternRangeEndpoint_Start,
+                            &document,
+                            TextPatternRangeEndpoint_Start,
+                        )
+                        .ok()?;
+                }
+                let past_end = after
+                    .CompareEndpoints(
+                        TextPatternRangeEndpoint_End,
+                        &document,
+                        TextPatternRangeEndpoint_End,
+                    )
+                    .ok()?
+                    > 0;
+                if past_end {
+                    after
+                        .MoveEndpointByRange(
+                            TextPatternRangeEndpoint_End,
+                            &document,
+                            TextPatternRangeEndpoint_End,
+                        )
+                        .ok()?;
+                }
+                // Bounded reads: twice the units covers CRLF and surrogate pairs;
+                // the selection itself counts in `after`.
+                let selected = caret.GetText(MAX_SELECTION).ok()?.len() as i32;
                 let before_text = before.GetText(back as i32 * 2 + 8).ok()?.to_string();
-                let after_text = after.GetText(forward as i32 * 2 + 8).ok()?.to_string();
+                let after_text = after
+                    .GetText(forward as i32 * 2 + 8 + selected)
+                    .ok()?
+                    .to_string();
                 Some(CaretText {
                     before: before_text,
                     after: after_text,
-                    at_start: moved_back.unsigned_abs() < back as u32,
-                    at_end: (moved_forward as u32) < forward as u32,
+                    at_start: past_start || moved_back.unsigned_abs() < back as u32,
+                    at_end: past_end || (moved_forward as u32) < forward as u32,
                 })
             }
         }

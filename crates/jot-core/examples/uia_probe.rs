@@ -40,7 +40,7 @@ mod win {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
         KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_END,
-        VK_HOME, VK_LEFT, VK_RCONTROL, VK_RETURN,
+        VK_HOME, VK_LEFT, VK_RCONTROL, VK_RETURN, VK_SHIFT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowTextW,
@@ -62,6 +62,8 @@ mod win {
     }
 
     pub fn main() {
+        // Jot's own log lines (why a watch ended), never the field's text.
+        tracing_subscriber::fmt().with_target(false).init();
         let args: Vec<String> = std::env::args().skip(1).collect();
         // `accept <dictionary.json>`: what the Dictionary's "Accepter" does,
         // for a run without screen control (the app must not be running).
@@ -184,6 +186,11 @@ mod win {
             return;
         }
         app_learning::note_key_down();
+        // JOT_PROBE_CLEAR: start from an empty field (repeated runs repeat the text).
+        if std::env::var_os("JOT_PROBE_CLEAR").is_some() {
+            chord(VK_CONTROL, VIRTUAL_KEY(b'A' as u16));
+            key(VK_BACK);
+        }
         std::thread::sleep(Duration::from_millis(300));
         describe();
 
@@ -218,8 +225,13 @@ mod win {
         {
             std::thread::sleep(Duration::from_millis(ms));
         }
+        // JOT_PROBE_FAST: the watch starts right after the insertion, as in Jot.
+        let fast = std::env::var_os("JOT_PROBE_FAST").is_some();
         // The receipt: how long until the text provably sits before the caret.
         let receipt = loop {
+            if fast {
+                break None;
+            }
             let read = app_learning::probe_focused(Some(pid), text.chars().count() + 48, 48);
             if read.is_some_and(|r| {
                 app_learning::anchor(&text, &r.before, &r.after, r.at_start, r.at_end).is_some()
@@ -233,7 +245,7 @@ mod win {
         };
         println!("receipt: {receipt:?}");
         // Fictitious documents only: shows what the read saw near the caret.
-        if std::env::var_os("JOT_PROBE_DEBUG").is_some() {
+        if !fast && std::env::var_os("JOT_PROBE_DEBUG").is_some() {
             match app_learning::probe_focused(Some(pid), text.chars().count() + 48, 48) {
                 Some(r) => println!(
                     "debug: before {} chars ends {:?} | after {:?} | start {} end {}",
@@ -253,7 +265,7 @@ mod win {
                 None => println!("debug: no read"),
             }
         }
-        let reads: Vec<u128> = (0..10)
+        let reads: Vec<u128> = (0..if fast { 0 } else { 10 })
             .map(|_| {
                 let t = Instant::now();
                 let _ = app_learning::probe_focused(Some(pid), 400, 400);
@@ -283,6 +295,27 @@ mod win {
                 key(VK_BACK);
                 type_char('o');
                 (0..9).for_each(|_| app_learning::note_key_down());
+            }
+            // Select the wrong word, pause, retype it: how most people fix one.
+            "select" => {
+                key(VK_LEFT);
+                for _ in 0..9 {
+                    chord(VK_SHIFT, VK_LEFT);
+                }
+                std::thread::sleep(Duration::from_millis(1200));
+                if std::env::var_os("JOT_PROBE_DEBUG").is_some() {
+                    match app_learning::probe_focused(None, 80, 80) {
+                        Some(t) => println!(
+                            "debug selected: before {:?} | after {:?} | start {} end {}",
+                            t.before, t.after, t.at_start, t.at_end
+                        ),
+                        None => println!("debug selected: unreadable"),
+                    }
+                }
+                for c in "Loostream".chars() {
+                    type_char(c);
+                }
+                (0..19).for_each(|_| app_learning::note_key_down());
             }
             "outside" => {
                 chord(VK_CONTROL, VK_HOME);
@@ -314,6 +347,13 @@ mod win {
                     .map(|s| format!("{} → {}", s.wrong, s.term))
                     .collect();
                 println!("learned: correction seen, suggestions {pairs:?}");
+                if std::env::var_os("JOT_PROBE_DEBUG").is_some() {
+                    println!(
+                        "  before {:?}
+  after  {:?}",
+                        c.before, c.after
+                    );
+                }
             }
             None => println!("learned: nothing"),
         }
@@ -815,8 +855,9 @@ mod win {
     fn chord(modifier: VIRTUAL_KEY, vk: VIRTUAL_KEY) {
         send(&[
             input(modifier, 0, KEYBD_EVENT_FLAGS(0)),
-            input(vk, 0, KEYBD_EVENT_FLAGS(0)),
-            input(vk, 0, KEYEVENTF_KEYUP),
+            // Extended: a plain Left with Shift held is the keypad 4, not a selection.
+            input(vk, 0, KEYEVENTF_EXTENDEDKEY),
+            input(vk, 0, KEYEVENTF_EXTENDEDKEY | KEYEVENTF_KEYUP),
             input(modifier, 0, KEYEVENTF_KEYUP),
         ]);
     }
