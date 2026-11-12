@@ -39,6 +39,7 @@ use std::time::Duration;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Step {
     Engine,
+    Activation,
     Key,
     Models,
     Microphone,
@@ -58,9 +59,20 @@ enum Choice {
 fn route(choice: Option<Choice>) -> &'static [Step] {
     use Step::*;
     match choice {
-        Some(Choice::Local) => &[Engine, Models, Microphone, TryIt, Done],
-        Some(Choice::Both) => &[Engine, Key, Models, Microphone, TryIt, Done],
-        _ => &[Engine, Key, Microphone, TryIt, Done],
+        Some(Choice::Local) => &[Engine, Activation, Models, Microphone, TryIt, Done],
+        Some(Choice::Both) => &[Engine, Activation, Key, Models, Microphone, TryIt, Done],
+        _ => &[Engine, Activation, Key, Microphone, TryIt, Done],
+    }
+}
+
+/// What the activation step shows first: Toggle on a new profile (the
+/// preferred mode), the current mode when setup is reopened from the tray, so
+/// rerunning the guide never changes a configured user's setting.
+fn initial_activation(settings: &jot_core::settings::Settings) -> DictationActivationMode {
+    if settings.has_completed_onboarding {
+        settings.dictation_activation_mode
+    } else {
+        DictationActivationMode::Toggle
     }
 }
 
@@ -72,6 +84,8 @@ pub struct OnboardingView {
     services: Services,
     step: Step,
     choice: Option<Choice>,
+    /// Selected on the activation step; written to settings on "Continue".
+    activation: DictationActivationMode,
     /// The pack being downloaded, once the user confirmed.
     download: Option<Arc<Download>>,
     api_key: Entity<TextField>,
@@ -120,10 +134,12 @@ impl OnboardingView {
         })
         .detach();
 
+        let activation = initial_activation(&services.settings.get());
         Self {
             services,
             step: Step::Engine,
             choice: None,
+            activation,
             download: None,
             api_key,
             status: None,
@@ -221,6 +237,35 @@ impl OnboardingView {
                 _ => true,
             })
             .unwrap_or(Step::Done)
+    }
+
+    /// The step before `step` on the chosen route, skipping what `after` skips.
+    fn before(&self, step: Step) -> Step {
+        let route = route(self.choice);
+        let position = route.iter().position(|s| *s == step).unwrap_or(0);
+        route[..position]
+            .iter()
+            .rev()
+            .copied()
+            .find(|previous| match previous {
+                Step::Key => credentials::api_key().is_none(),
+                Step::Models => !LOCAL_PACKS.iter().all(|p| p.installed()),
+                _ => true,
+            })
+            .unwrap_or(Step::Engine)
+    }
+
+    /// Writes the existing setting the hotkey hook and Settings already read.
+    fn confirm_activation(&mut self, cx: &mut Context<Self>) {
+        let mode = self.activation;
+        self.services
+            .settings
+            .update(Some("dictationActivationMode"), |s| {
+                s.dictation_activation_mode = mode
+            });
+        self.status = None;
+        self.step = self.after(Step::Activation);
+        cx.notify();
     }
 
     fn choose(&mut self, choice: Choice, cx: &mut Context<Self>) {
@@ -383,6 +428,81 @@ impl OnboardingView {
                         Choice::Both,
                         cx,
                     ))
+                    .into_any_element()
+            }
+
+            Step::Activation => {
+                let mut options = div()
+                    .id("onboarding-activation-options")
+                    .role(Role::RadioGroup)
+                    .aria_label(tr(Msg::StepActivation))
+                    .flex()
+                    .flex_wrap()
+                    .gap(theme::spacing::XS);
+                for (id, mode, label, description) in [
+                    (
+                        "setup-toggle",
+                        DictationActivationMode::Toggle,
+                        Msg::Toggle,
+                        Msg::ToggleHint,
+                    ),
+                    (
+                        "setup-hold",
+                        DictationActivationMode::Hold,
+                        Msg::Hold,
+                        Msg::HoldHint,
+                    ),
+                ] {
+                    let selected = self.activation == mode;
+                    options = options.child(
+                        widgets::button(
+                            id,
+                            tr(label),
+                            if selected {
+                                ButtonKind::Primary
+                            } else {
+                                ButtonKind::Secondary
+                            },
+                            true,
+                            theme,
+                            cx.listener(move |this, _, _, cx| {
+                                this.activation = mode;
+                                cx.notify();
+                            }),
+                        )
+                        .flex_1()
+                        .min_w(px(190.0))
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .child(
+                            div()
+                                .text_size(theme::type_scale::LABEL)
+                                .child(tr(description)),
+                        )
+                        .role(Role::RadioButton)
+                        .aria_label(format!("{}. {}", tr(label), tr(description)))
+                        .aria_toggled(if selected {
+                            gpui::Toggled::True
+                        } else {
+                            gpui::Toggled::False
+                        }),
+                    );
+                }
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(theme::spacing::S)
+                    .child(paragraph(tr(Msg::SetupActivationHint), theme))
+                    .child(options)
+                    .child(widgets::hug(widgets::button(
+                        "confirm-activation",
+                        tr(Msg::Continue),
+                        ButtonKind::Primary,
+                        true,
+                        theme,
+                        cx.listener(|this, _, _, cx| this.confirm_activation(cx)),
+                    )))
                     .into_any_element()
             }
 
@@ -613,6 +733,20 @@ impl Render for OnboardingView {
                     .flex_col()
                     .gap(theme::spacing::S)
                     .child(div().h(px(1.0)).w_full().bg(theme.outline_variant))
+                    .when(step != Step::Engine, |column| {
+                        column.child(widgets::hug(widgets::button(
+                            "back",
+                            tr(Msg::Back),
+                            ButtonKind::Secondary,
+                            true,
+                            theme,
+                            cx.listener(|this, _, _, cx| {
+                                this.status = None;
+                                this.step = this.before(this.step);
+                                cx.notify();
+                            }),
+                        )))
+                    })
                     .child(widgets::hug(widgets::button(
                         "later",
                         tr(Msg::Later),
@@ -636,6 +770,7 @@ fn progress(step: Step, choice: Option<Choice>, theme: Theme) -> impl IntoElemen
     let total = route.len();
     let label = match step {
         Step::Engine => Msg::StepEngine,
+        Step::Activation => Msg::StepActivation,
         Step::Models => Msg::StepModels,
         Step::Key => Msg::StepKey,
         Step::Microphone => Msg::StepMicrophone,
@@ -731,7 +866,26 @@ mod tests {
         ] {
             let steps = route(choice);
             assert_eq!(steps.first(), Some(&Step::Engine));
+            assert_eq!(steps.get(1), Some(&Step::Activation));
             assert_eq!(steps.last(), Some(&Step::Done));
+        }
+    }
+
+    #[test]
+    fn a_new_profile_starts_on_toggle_and_a_configured_one_keeps_its_mode() {
+        use jot_core::settings::Settings;
+        let fresh = Settings::default();
+        assert_eq!(initial_activation(&fresh), DictationActivationMode::Toggle);
+        for mode in [
+            DictationActivationMode::Hold,
+            DictationActivationMode::Toggle,
+        ] {
+            let configured = Settings {
+                has_completed_onboarding: true,
+                dictation_activation_mode: mode,
+                ..Settings::default()
+            };
+            assert_eq!(initial_activation(&configured), mode);
         }
     }
 }

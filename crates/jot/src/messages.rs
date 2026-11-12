@@ -231,6 +231,10 @@ messages! {
     StepKey => "Connect Gemini", "Connecter Gemini";
     StepEngine => "Choose the engine", "Choisir le moteur";
     SetupEngineHint => "Where should your dictations be transcribed? You can change this at any time in Settings.", "Où vos dictées doivent-elles être transcrites ? Vous pourrez changer ce choix à tout moment dans les Paramètres.";
+    StepActivation => "How do you want to start dictation?", "Comment voulez-vous déclencher la dictée ?";
+    SetupActivationHint => "This works with Gemini and local alike, with your dictation key. Esc always cancels. You can change it later in Settings → Dictation and shortcuts.", "Ce choix vaut pour Gemini comme pour le local, avec votre touche de dictée. Échap annule toujours. Vous pourrez le changer dans Paramètres → Dictée et raccourcis.";
+    Continue => "Continue", "Continuer";
+    Back => "Back", "Retour";
     ChooseGemini => "Gemini (online)", "Gemini (en ligne)";
     ChooseGeminiHint => "Fast on any PC. The recording is sent to Google's Gemini API with your own API key.", "Rapide sur tout PC. L’enregistrement est envoyé à l’API Gemini de Google avec votre propre clé API.";
     ChooseLocal => "100% local (no key needed)", "100 % local (aucune clé nécessaire)";
