@@ -101,7 +101,10 @@ mod win {
             return;
         }
         // Keys go only to a text field of the target: never to a menu item.
-        if !focus_text(hwnd, pid, args.get(2).map(String::as_str)) {
+        // JOT_PROBE_NO_UIA: `insert` into a window with no UIA text field
+        // (Notepad++), trusting its own focus; the title already names our tab.
+        let no_uia = scenario == "insert" && std::env::var_os("JOT_PROBE_NO_UIA").is_some();
+        if !no_uia && !focus_text(hwnd, pid, args.get(2).map(String::as_str)) {
             describe();
             println!("no UIA text field focused in the target — no key sent (clean refusal)");
             return;
@@ -120,6 +123,10 @@ mod win {
         key(VK_RETURN);
         if scenario == "dictate" {
             dictate(hwnd, pid, args.get(2).map(String::as_str));
+            return;
+        }
+        if scenario == "insert" {
+            insert_and_compare(pid);
             return;
         }
         // `typing`: Jot's own typing, JOT_PROBE_RUNS lines, each read back.
@@ -315,6 +322,185 @@ mod win {
         // The clipboard fallback must not cost the user their clipboard.
         if !clipboard.is_empty() {
             jot_core::win32::restore_clipboard(clipboard);
+        }
+    }
+
+    /// `insert`: JOT_PROBE_TEXT_FILE inserted as Jot does (JOT_PROBE_MODE
+    /// ladder | type | paste; JOT_PROBE_WATCH=1 adds the correction watch),
+    /// then the whole document is read back until it stops changing.
+    /// Fictitious texts only: prints where the document differs.
+    fn insert_and_compare(pid: u32) {
+        use windows::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+        let path = std::env::var("JOT_PROBE_TEXT_FILE").expect("JOT_PROBE_TEXT_FILE");
+        let raw = std::fs::read_to_string(path).unwrap();
+        let text = raw
+            .trim_start_matches('\u{feff}')
+            .trim_end_matches(['\r', '\n'])
+            .to_string();
+        let mode = std::env::var("JOT_PROBE_MODE").unwrap_or_else(|_| "ladder".into());
+        // JOT_PROBE_CLEAR: empty the probe's own document first.
+        if std::env::var_os("JOT_PROBE_CLEAR").is_some() {
+            chord(VK_CONTROL, VIRTUAL_KEY(b'A' as u16));
+            key(VK_BACK);
+        }
+        std::thread::sleep(Duration::from_millis(400));
+        let before = app_learning::normalize(&document(pid));
+        let held: Vec<&str> = [
+            (0x10, "Shift"),
+            (0x11, "Ctrl"),
+            (0x12, "Alt"),
+            (0x5B, "LWin"),
+            (0x5C, "RWin"),
+        ]
+        .iter()
+        .filter(|(vk, _)| unsafe { GetAsyncKeyState(*vk) } as u16 & 0x8000 != 0)
+        .map(|(_, name)| *name)
+        .collect();
+        println!("modifiers held before insertion: {held:?}");
+        let clipboard = jot_core::win32::snapshot_clipboard();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        jot_core::runtime::install(runtime.handle().clone());
+        let context = DictationContext {
+            target_pid: Some(pid),
+            ..Default::default()
+        };
+        let started = Instant::now();
+        let outcome = match mode.as_str() {
+            "type" => match std::env::var("JOT_PROBE_PACE_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+            {
+                // One SendInput per character, that far apart.
+                Some(pace) => {
+                    for c in text.chars() {
+                        jot_core::win32::type_text(&c.to_string());
+                        std::thread::sleep(Duration::from_millis(pace));
+                    }
+                    format!("paced {pace} ms")
+                }
+                None => format!("type_text {}", jot_core::win32::type_text(&text)),
+            },
+            // A burst per word; after each, a pause (`words`) or a WM_NULL
+            // round trip to the focused window's thread (`sync`).
+            "words" | "sync" => {
+                use windows::Win32::UI::WindowsAndMessaging::{
+                    SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_NULL,
+                };
+                let pace: u64 = std::env::var("JOT_PROBE_PACE_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(10);
+                let target = unsafe { GetForegroundWindow() };
+                let mut word = String::new();
+                let mut waits = Vec::new();
+                for c in text.chars() {
+                    word.push(c);
+                    if c.is_whitespace() {
+                        jot_core::win32::type_text(&word);
+                        word.clear();
+                        if mode == "words" {
+                            std::thread::sleep(Duration::from_millis(pace));
+                        } else {
+                            let t = Instant::now();
+                            unsafe {
+                                SendMessageTimeoutW(
+                                    target,
+                                    WM_NULL,
+                                    windows::Win32::Foundation::WPARAM(0),
+                                    LPARAM(0),
+                                    SMTO_ABORTIFHUNG,
+                                    500,
+                                    None,
+                                )
+                            };
+                            waits.push(t.elapsed().as_micros());
+                        }
+                    }
+                }
+                jot_core::win32::type_text(&word);
+                format!("{mode} (waits µs {waits:?})")
+            }
+            "paste" => {
+                jot_core::win32::write_clipboard(&text);
+                format!("post_paste {}", jot_core::win32::post_paste())
+            }
+            _ => format!(
+                "{:?}",
+                runtime.block_on(InsertionCoordinator::new().insert(&text, &context))
+            ),
+        };
+        println!(
+            "{mode}: {outcome} in {} ms ({} chars)",
+            started.elapsed().as_millis(),
+            text.chars().count()
+        );
+        if std::env::var_os("JOT_PROBE_WATCH").is_some() {
+            app_learning::watch(Watch {
+                dictation_id: uuid::Uuid::new_v4(),
+                inserted: text.clone(),
+                target_pid: Some(pid),
+                sink: Box::new(|_| {}),
+            });
+        }
+        // Until the document has not changed for 1.5 s, at most 25 s.
+        let expected = format!("{before}{}", app_learning::normalize(&text));
+        let (mut last, mut changed) = (String::new(), Instant::now());
+        while changed.elapsed() < Duration::from_millis(1500)
+            && started.elapsed() < Duration::from_secs(25)
+        {
+            let now = app_learning::normalize(&document(pid));
+            if !now.is_empty() && now != last {
+                last = now;
+                changed = Instant::now();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let settled = changed.duration_since(started).as_millis();
+        // Chrome's UIA reports a cleared textarea's line break at the end.
+        if last.trim() == expected.trim() {
+            println!("document: exact, settled after {settled} ms");
+        } else {
+            let (a, b): (Vec<char>, Vec<char>) =
+                (expected.chars().collect(), last.chars().collect());
+            let i = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+            let around = |v: &[char]| -> String {
+                v[i.saturating_sub(15).min(v.len())..(i + 60).min(v.len())]
+                    .iter()
+                    .collect()
+            };
+            println!(
+                "document: ALTERED after {settled} ms — expected {} chars, got {}, first difference at {}",
+                a.len(),
+                b.len(),
+                i.saturating_sub(before.chars().count())
+            );
+            println!("  expected …{:?}", around(&a));
+            println!("  got      …{:?}", around(&b));
+        }
+        app_learning::stop(false);
+        if mode == "paste" && !clipboard.is_empty() {
+            jot_core::win32::restore_clipboard(clipboard);
+        }
+    }
+
+    /// Whole text of the focused document of `pid`, or "" when unreadable.
+    fn document(pid: u32) -> String {
+        use windows::Win32::UI::Accessibility::IUIAutomationTextPattern;
+        unsafe {
+            let uia: IUIAutomation =
+                CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).unwrap();
+            let Ok(element) = uia.GetFocusedElement() else {
+                return String::new();
+            };
+            if element.CurrentProcessId().unwrap_or_default() as u32 != pid {
+                return String::new();
+            }
+            element
+                .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                .and_then(|p| p.DocumentRange())
+                .and_then(|r| r.GetText(-1))
+                .map(|s| s.to_string())
+                .unwrap_or_default()
         }
     }
 

@@ -141,6 +141,7 @@ impl PillView {
             DictationState::Cancelled => PillState::Hidden,
             DictationState::Done(outcome) => match outcome {
                 DictationOutcome::Inserted => PillState::Success { words: 0 },
+                DictationOutcome::Unconfirmed => PillState::Notice(Msg::HudUnconfirmed.into()),
                 DictationOutcome::AwaitingChip => PillState::Notice(Msg::HudCopied.into()),
                 DictationOutcome::CopiedToClipboard => PillState::Notice(Msg::HudCopied.into()),
                 DictationOutcome::HeldForSecureField => PillState::Notice(Msg::HudHeld.into()),

@@ -53,8 +53,11 @@ pub enum DictationFailure {
 /// Terminal outcome of a successful-enough session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DictationOutcome {
-    /// Text landed at the cursor via the insertion ladder.
+    /// Text landed at the cursor via the insertion ladder, and was read back.
     Inserted,
+    /// Sent to the app but not read back; left on the clipboard. The user,
+    /// who sees the field, decides whether a Ctrl+V is needed.
+    Unconfirmed,
     /// Focus changed mid-flight; user was offered a chip instead of a blind paste (F17).
     AwaitingChip,
     /// Ladder exhausted; text left on the clipboard with a visible hint (F16).
@@ -125,6 +128,7 @@ pub enum DictationEvent {
 
     // Insertion
     Inserted,
+    InsertionUnconfirmed,
     InsertionFellBackToClipboard,
     FrontmostChangedAwaitingChip,
     InsertionBlockedSecure,
@@ -175,6 +179,7 @@ pub fn transition(state: DictationState, event: DictationEvent) -> Option<Dictat
 
         // inserting — no cancel here: the text exists, History has it regardless.
         (S::Inserting, E::Inserted) => Some(S::Done(DictationOutcome::Inserted)),
+        (S::Inserting, E::InsertionUnconfirmed) => Some(S::Done(DictationOutcome::Unconfirmed)),
         (S::Inserting, E::InsertionFellBackToClipboard) => {
             Some(S::Done(DictationOutcome::CopiedToClipboard))
         }

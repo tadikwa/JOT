@@ -817,6 +817,11 @@ impl DictationCoordinator {
 
         let (status, event) = match insertion {
             InsertionOutcome::Inserted => (SessionStatus::Inserted, DictationEvent::Inserted),
+            // History: the text is on the clipboard, which is all Jot can vouch for.
+            InsertionOutcome::Unconfirmed => (
+                SessionStatus::CopiedToClipboard,
+                DictationEvent::InsertionUnconfirmed,
+            ),
             InsertionOutcome::FrontmostChanged => (
                 SessionStatus::AwaitingChip,
                 DictationEvent::FrontmostChangedAwaitingChip,
@@ -1716,6 +1721,11 @@ mod tests {
     #[tokio::test]
     async fn insertion_outcomes_are_recorded_faithfully() {
         for (outcome, expected, status) in [
+            (
+                InsertionOutcome::Unconfirmed,
+                DictationOutcome::Unconfirmed,
+                SessionStatus::CopiedToClipboard,
+            ),
             (
                 InsertionOutcome::FrontmostChanged,
                 DictationOutcome::AwaitingChip,

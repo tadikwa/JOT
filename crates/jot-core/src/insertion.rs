@@ -20,30 +20,50 @@
 //!            (text goes to the clipboard; the HUD offers it)
 //!   guard 2: a password field has focus -> refuse entirely, no clipboard leak
 //!
-//!   tier 1: synthetic Unicode typing into a proven text control (no clipboard)
-//!   tier 2: clipboard + synthesized Ctrl+V with guarded restore
+//!   tier 1: clipboard + synthesized Ctrl+V with guarded restore
+//!   tier 2: the clipboard is unavailable: synthetic Unicode typing into a
+//!           proven text control
 //!   tier 3: text left on the clipboard, visible hint
+//!
+//!   receipt: "Inserted" only once UI Automation reads the text right before
+//!            the caret. Otherwise "Unconfirmed": the text stays on the
+//!            clipboard, the HUD says Ctrl+V recovers it, nothing is re-sent.
 //! ```
 //!
-//! Tier 1 is the Windows counterpart of the macOS Accessibility write: it is the
-//! only path that never touches the clipboard. Windows has no non-destructive
-//! "insert at selection" automation call — `IUIAutomationValuePattern::SetValue`
-//! replaces the entire control's contents — so typing is the honest equivalent,
-//! gated on UI Automation confirming a text control actually has focus.
+//! Paste comes first because it is one atomic insertion. Typed keys go through
+//! the target's per-keystroke handling (autocorrect, suggestions, key-repeat
+//! detection), none of it built for keys arriving at injection speed: the
+//! Windows 11 Notepad (11.2607) garbles a typed burst into repeated letters and
+//! "…", even at 5 ms per character, while the same text pasted lands exact.
 
 use crate::transcription::DictationContext;
 use crate::win32::{self, FocusKind};
 use async_trait::async_trait;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long the clipboard keeps the transcript before the user's own contents
 /// go back. Slow applications read the clipboard late; restoring too early
 /// pastes the user's OLD clipboard.
 pub const RESTORE_DELAY: Duration = Duration::from_secs(1);
 
+/// How long a pasted text may take to show up in the field.
+const RECEIPT_WAIT: Duration = Duration::from_secs(1);
+/// Typed text lands at the target's own pace (the Notepad once took ~31 ms
+/// per injected character).
+const RECEIPT_WAIT_PER_TYPED_CHAR: Duration = Duration::from_millis(50);
+const RECEIPT_POLL: Duration = Duration::from_millis(25);
+/// Characters read before the inserted text, so an identical text already
+/// sitting at the caret is not mistaken for ours.
+const RECEIPT_CONTEXT: usize = 48;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertionOutcome {
+    /// Sent, and read back at the caret.
     Inserted,
+    /// Sent, but the field could not be read back (no UI Automation text) or
+    /// does not show the text. It is left on the clipboard for a manual
+    /// Ctrl+V; never re-sent, so it cannot land twice.
+    Unconfirmed,
     FrontmostChanged,
     FellBackToClipboard,
     /// A password field had focus — the text stays in History, never on the
@@ -84,33 +104,51 @@ impl TextInserting for InsertionCoordinator {
             return InsertionOutcome::FrontmostChanged;
         }
 
-        // Tier 1: type it. No clipboard involved, so nothing to restore and
-        // nothing for a clipboard manager to archive. Never for several lines:
-        // a typed line break is an Enter, which sends a chat message.
-        if text.chars().count() <= win32::MAX_TYPED_CHARS
-            && !text.contains('\n')
-            && win32::focus_kind() == FocusKind::EditableText
-            && win32::type_text(text)
-        {
-            tracing::info!("inserted by typing");
-            return InsertionOutcome::Inserted;
-        }
+        // The field before the insertion, for the receipt. None: it has no UI
+        // Automation text, so delivery cannot be confirmed.
+        let reach = text.chars().count() + RECEIPT_CONTEXT;
+        let prior = text_before_caret(context.target_pid, reach);
 
         // Guard 1 re-check: the focus queries above take a UI Automation
         // round-trip, and an Alt+Tab in that window would land the Ctrl+V in the
         // wrong app.
         if moved_away(context) {
-            tracing::info!("foreground changed during the typing attempt — no blind paste");
+            tracing::info!("foreground changed during the focus checks — no blind paste");
             copy_only(text);
             return InsertionOutcome::FrontmostChanged;
         }
 
-        // Tier 2: guarded paste. "True" means the Ctrl+V was POSTED — there is
-        // no OS-level delivery receipt for a synthetic paste. That is the
-        // industry floor; the text also stays recoverable in History.
-        if paste(text).await {
-            tracing::info!("Ctrl+V posted (delivery is best-effort)");
-            return InsertionOutcome::Inserted;
+        // Tier 1: guarded paste.
+        let readable = prior.is_some();
+        if let Some(restore) = paste(text) {
+            if receipt(text, prior, context.target_pid, RECEIPT_WAIT).await {
+                restore.later();
+                tracing::info!("inserted by paste, read back at the caret");
+                return InsertionOutcome::Inserted;
+            }
+            // The transcript stays on the clipboard: it is the recovery.
+            tracing::info!(
+                readable,
+                "paste sent, not confirmed — left on the clipboard"
+            );
+            return InsertionOutcome::Unconfirmed;
+        }
+
+        // Tier 2: no clipboard, so type it. Never for several lines: a typed
+        // line break is an Enter, which sends a chat message.
+        if text.chars().count() <= win32::MAX_TYPED_CHARS
+            && !text.contains('\n')
+            && win32::focus_kind() == FocusKind::EditableText
+            && win32::type_text(text)
+        {
+            let wait = RECEIPT_WAIT_PER_TYPED_CHAR * text.chars().count() as u32 + RECEIPT_WAIT;
+            if receipt(text, prior, context.target_pid, wait).await {
+                tracing::info!("inserted by typing, read back at the caret");
+                return InsertionOutcome::Inserted;
+            }
+            tracing::info!("typed, not confirmed");
+            copy_only(text);
+            return InsertionOutcome::Unconfirmed;
         }
 
         // Tier 3: clipboard floor.
@@ -138,30 +176,85 @@ pub fn copy_only(text: &str) {
     win32::write_clipboard(text);
 }
 
-/// Writes the transcript, posts Ctrl+V, and puts the user's clipboard back a
-/// second later — but only if nothing else has touched it in the meantime.
-///
-/// Returns as soon as Ctrl+V is posted. The restore runs detached so the session
-/// is not pinned in `Inserting` for a second after the text visibly landed:
-/// that window used to silently reject the next dictation's `begin`.
-async fn paste(text: &str) -> bool {
+/// Writes the transcript and posts Ctrl+V. None when either failed (the text,
+/// if written, stays on the clipboard as the fallback content).
+fn paste(text: &str) -> Option<Restore> {
     let snapshot = win32::snapshot_clipboard();
-    let Some(sequence) = win32::write_clipboard(text) else {
+    let sequence = win32::write_clipboard(text)?;
+    if !win32::post_paste() {
+        return None;
+    }
+    Some(Restore {
+        snapshot,
+        sequence,
+        posted: Instant::now(),
+    })
+}
+
+/// The user's clipboard as it was before a paste.
+struct Restore {
+    snapshot: win32::ClipboardSnapshot,
+    sequence: u32,
+    posted: Instant,
+}
+
+impl Restore {
+    /// Puts the user's clipboard back a second after the paste — but only if
+    /// nothing else has touched it in the meantime. Detached, so the session
+    /// is not pinned in `Inserting` after the text visibly landed: that window
+    /// used to silently reject the next dictation's `begin`.
+    fn later(self) {
+        crate::runtime::spawn(async move {
+            tokio::time::sleep(RESTORE_DELAY.saturating_sub(self.posted.elapsed())).await;
+            // A user copy mid-flight wins.
+            if win32::clipboard_sequence_number() == self.sequence && !self.snapshot.is_empty() {
+                win32::restore_clipboard(self.snapshot);
+            }
+        });
+    }
+}
+
+/// Text right before the caret of the focused field of `pid`, line breaks
+/// normalized, when UI Automation can read it.
+fn text_before_caret(pid: Option<u32>, chars: usize) -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        win32::on_input_thread(move || crate::app_learning::probe_focused(pid, chars, 0))
+            .map(|read| crate::app_learning::normalize(&read.before))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (pid, chars);
+        None
+    }
+}
+
+/// Waits up to `wait` for the field to show `text` at the caret. False at once
+/// when the field was unreadable before the insertion.
+async fn receipt(text: &str, prior: Option<String>, pid: Option<u32>, wait: Duration) -> bool {
+    let Some(prior) = prior else {
         return false;
     };
-    if !win32::post_paste() {
-        // Leave the text on the clipboard — it is the fallback content.
-        return false;
-    }
-    crate::runtime::spawn(async move {
-        tokio::time::sleep(RESTORE_DELAY).await;
-        // Restore only if nothing else touched the clipboard since our write: a
-        // user copy mid-flight wins.
-        if win32::clipboard_sequence_number() == sequence && !snapshot.is_empty() {
-            win32::restore_clipboard(snapshot);
+    let reach = text.chars().count() + RECEIPT_CONTEXT;
+    let started = Instant::now();
+    loop {
+        if let Some(now) = text_before_caret(pid, reach)
+            && landed(text, &prior, &now)
+        {
+            return true;
         }
-    });
-    true
+        if started.elapsed() >= wait {
+            return false;
+        }
+        tokio::time::sleep(RECEIPT_POLL).await;
+    }
+}
+
+/// The field now ends, at the caret, with `text`, and did not already before
+/// (the same dictation twice in a row).
+fn landed(text: &str, prior: &str, now: &str) -> bool {
+    let text = crate::app_learning::normalize(text);
+    !text.trim().is_empty() && now != prior && now.ends_with(text.as_str())
 }
 
 // ---------------------------------------------------------------------------
@@ -222,6 +315,25 @@ mod tests {
         // that a nonexistent process is still in front.
         let foreground = win32::foreground_app().pid;
         assert_eq!(moved_away(&context), foreground.is_some());
+    }
+
+    #[test]
+    fn a_receipt_needs_the_text_at_the_caret_and_a_change() {
+        let text = "Je vais ouvrir le rapport.";
+        assert!(landed(
+            text,
+            "Bonjour.\n",
+            "Bonjour.\nJe vais ouvrir le rapport."
+        ));
+        // The garbled Notepad burst, the text missing, or still on its way.
+        assert!(!landed(text, "", "Je aais ouvrir ……….."));
+        assert!(!landed(text, "", "Je vais ouvrir le"));
+        // Already there before: an identical dictation that did not land.
+        let before = "Bonjour. Je vais ouvrir le rapport.";
+        assert!(!landed(text, before, before));
+        // Line endings differ between controls.
+        assert!(landed("un\r\ndeux", "x", "x un\ndeux"));
+        assert!(!landed("   ", "a", "a   "));
     }
 
     #[tokio::test]

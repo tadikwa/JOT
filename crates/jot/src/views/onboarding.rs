@@ -113,6 +113,7 @@ impl OnboardingView {
                     update,
                     jot_core::coordinator::CoordinatorUpdate::State(DictationState::Done(
                         DictationOutcome::Inserted
+                            | DictationOutcome::Unconfirmed
                             | DictationOutcome::CopiedToClipboard
                             | DictationOutcome::AwaitingChip
                     ))

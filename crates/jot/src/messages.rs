@@ -266,6 +266,7 @@ messages! {
     StepTry => "Try dictating", "Essayer la dictée";
     StepDone => "Ready to dictate", "Prêt à dicter";
     HudCopied => "Copied — press Ctrl+V to paste", "Copié. Appuyez sur Ctrl+V pour coller.";
+    HudUnconfirmed => "Sent, not confirmed — if it is missing, press Ctrl+V", "Envoyé sans confirmation. S’il manque, appuyez sur Ctrl+V.";
     HudHeld => "Password field — saved to History only", "Champ de mot de passe. Texte conservé dans l’historique.";
     HudOffline => "Offline — saved, will send when you reconnect", "Hors ligne. Envoi à la reconnexion.";
     HudSilent => "Didn't catch that", "Aucune parole détectée";
