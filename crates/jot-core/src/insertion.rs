@@ -17,17 +17,21 @@
 //!
 //! ```text
 //!   guard 1: foreground app changed since dictation started -> NEVER paste blind
-//!            (text goes to the clipboard; the HUD offers it)
 //!   guard 2: a password field has focus -> refuse entirely, no clipboard leak
+//!   guard 3: focus is provably not text (button, list, a web page outside
+//!            any field) -> nothing sent
+//!            (guards 1 and 3: the recovery window offers the text to copy)
 //!
 //!   tier 1: clipboard + synthesized Ctrl+V with guarded restore
 //!   tier 2: the clipboard is unavailable: synthetic Unicode typing into a
 //!           proven text control
 //!   tier 3: text left on the clipboard, visible hint
 //!
-//!   receipt: "Inserted" only once UI Automation reads the text right before
-//!            the caret. Otherwise "Unconfirmed": the text stays on the
-//!            clipboard, the HUD says Ctrl+V recovers it, nothing is re-sent.
+//!   receipt: a readable field must show the text right before the caret,
+//!            or it is "Unconfirmed" (recovery window). A field UI Automation
+//!            cannot read (Notepad++, classic Win32 edits) counts as inserted:
+//!            not verifiable is not failed. Nothing is ever re-sent, and the
+//!            user's clipboard comes back either way.
 //! ```
 //!
 //! Paste comes first because it is one atomic insertion. Typed keys go through
@@ -58,13 +62,16 @@ const RECEIPT_CONTEXT: usize = 48;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertionOutcome {
-    /// Sent, and read back at the caret.
+    /// Sent, and read back at the caret — or sent into a field UI Automation
+    /// cannot read, where delivery is not verifiable.
     Inserted,
-    /// Sent, but the field could not be read back (no UI Automation text) or
-    /// does not show the text. It is left on the clipboard for a manual
-    /// Ctrl+V; never re-sent, so it cannot land twice.
+    /// Sent into a readable field that does not show the text. Never re-sent,
+    /// so it cannot land twice: the recovery window offers it to copy.
     Unconfirmed,
+    /// Not sent: the user left the app they were dictating into.
     FrontmostChanged,
+    /// Not sent: focus is provably not a text field.
+    NoTextField,
     FellBackToClipboard,
     /// A password field had focus — the text stays in History, never on the
     /// clipboard.
@@ -92,7 +99,8 @@ impl TextInserting for InsertionCoordinator {
         // Guard 2: a password field, or the secure desktop. The transcript stays
         // in History only — putting it on the clipboard would leak it to every
         // clipboard reader on the machine.
-        if win32::focus_kind() == FocusKind::Password {
+        let focus = win32::focus_kind();
+        if focus == FocusKind::Password {
             tracing::warn!("password field focused at insert time — refusing (History only)");
             return InsertionOutcome::BlockedSecureField;
         }
@@ -100,8 +108,13 @@ impl TextInserting for InsertionCoordinator {
         // Guard 1: is the user still where they started dictating?
         if moved_away(context) {
             tracing::info!("foreground changed since dictation started — no blind paste");
-            copy_only(text);
             return InsertionOutcome::FrontmostChanged;
+        }
+
+        // Guard 3: a Ctrl+V on a button or a file list goes nowhere at best.
+        if focus == FocusKind::NotText {
+            tracing::info!("focus is not a text field — nothing sent");
+            return InsertionOutcome::NoTextField;
         }
 
         // The field before the insertion, for the receipt. None: it has no UI
@@ -114,24 +127,17 @@ impl TextInserting for InsertionCoordinator {
         // wrong app.
         if moved_away(context) {
             tracing::info!("foreground changed during the focus checks — no blind paste");
-            copy_only(text);
             return InsertionOutcome::FrontmostChanged;
         }
 
         // Tier 1: guarded paste.
         let readable = prior.is_some();
         if let Some(restore) = paste(text) {
-            if receipt(text, prior, context.target_pid, RECEIPT_WAIT).await {
-                restore.later();
-                tracing::info!("inserted by paste, read back at the caret");
-                return InsertionOutcome::Inserted;
-            }
-            // The transcript stays on the clipboard: it is the recovery.
-            tracing::info!(
-                readable,
-                "paste sent, not confirmed — left on the clipboard"
-            );
-            return InsertionOutcome::Unconfirmed;
+            let landed = receipt(text, prior, context.target_pid, RECEIPT_WAIT).await;
+            // The recovery window copies on demand: the user's own clipboard
+            // comes back whatever happened.
+            restore.later();
+            return verdict(landed, readable, "paste");
         }
 
         // Tier 2: no clipboard, so type it. Never for several lines: a typed
@@ -142,18 +148,32 @@ impl TextInserting for InsertionCoordinator {
             && win32::type_text(text)
         {
             let wait = RECEIPT_WAIT_PER_TYPED_CHAR * text.chars().count() as u32 + RECEIPT_WAIT;
-            if receipt(text, prior, context.target_pid, wait).await {
-                tracing::info!("inserted by typing, read back at the caret");
-                return InsertionOutcome::Inserted;
-            }
-            tracing::info!("typed, not confirmed");
-            copy_only(text);
-            return InsertionOutcome::Unconfirmed;
+            let landed = receipt(text, prior, context.target_pid, wait).await;
+            return verdict(landed, readable, "typing");
         }
 
         // Tier 3: clipboard floor.
         copy_only(text);
         InsertionOutcome::FellBackToClipboard
+    }
+}
+
+/// Read back: inserted. Unreadable field: not verifiable, which is not a
+/// failure (Notepad++ never shows its text to UI Automation). Readable but the
+/// text is not there: unconfirmed, for the recovery window.
+fn verdict(landed: bool, readable: bool, how: &str) -> InsertionOutcome {
+    if landed {
+        tracing::info!(how, "inserted, read back at the caret");
+        InsertionOutcome::Inserted
+    } else if !readable {
+        tracing::info!(
+            how,
+            "sent into a field UI Automation cannot read — not verifiable"
+        );
+        InsertionOutcome::Inserted
+    } else {
+        tracing::info!(how, "sent, but the readable field does not show it");
+        InsertionOutcome::Unconfirmed
     }
 }
 
@@ -170,8 +190,8 @@ fn moved_away(context: &DictationContext) -> bool {
     }
 }
 
-/// Puts text on the clipboard WITHOUT restore — the tier-3 floor and the
-/// focus-changed path ("Copied — press Ctrl+V").
+/// Puts text on the clipboard WITHOUT restore — the tier-3 floor, and the
+/// recovery window's Copy button.
 pub fn copy_only(text: &str) {
     win32::write_clipboard(text);
 }
@@ -296,6 +316,14 @@ impl TextInserting for FakeInserter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_readable_field_without_the_text_is_unconfirmed() {
+        assert_eq!(verdict(true, true, "paste"), InsertionOutcome::Inserted);
+        // Notepad++ and classic Edit fields: sent, just not verifiable.
+        assert_eq!(verdict(false, false, "paste"), InsertionOutcome::Inserted);
+        assert_eq!(verdict(false, true, "paste"), InsertionOutcome::Unconfirmed);
+    }
 
     #[test]
     fn an_unknown_target_pid_never_reads_as_a_move() {

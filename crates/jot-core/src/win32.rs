@@ -41,8 +41,11 @@ pub enum FocusKind {
     EditableText,
     /// A password box, or the secure desktop. Never type or paste here.
     Password,
-    /// Focus is somewhere that will not take text, or UI Automation could not
-    /// answer at all.
+    /// Provably not a place for text: a button, a link, a list, a menu, or a
+    /// read-only document such as a web page outside any field. Nothing is sent.
+    NotText,
+    /// UI Automation cannot tell (no answer, or a bespoke control without a
+    /// text pattern, like Notepad++'s editor): the text is sent, unverified.
     Unknown,
 }
 
@@ -194,8 +197,15 @@ mod platform {
         QueryFullProcessImageNameW,
     };
     use windows::Win32::UI::Accessibility::{
-        CUIAutomation, IUIAutomation, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
-        UIA_TextPatternId,
+        CUIAutomation, IUIAutomation, IUIAutomationValuePattern, UIA_ButtonControlTypeId,
+        UIA_CheckBoxControlTypeId, UIA_DocumentControlTypeId, UIA_EditControlTypeId,
+        UIA_HyperlinkControlTypeId, UIA_ImageControlTypeId, UIA_ListControlTypeId,
+        UIA_ListItemControlTypeId, UIA_MenuBarControlTypeId, UIA_MenuControlTypeId,
+        UIA_MenuItemControlTypeId, UIA_RadioButtonControlTypeId, UIA_ScrollBarControlTypeId,
+        UIA_SliderControlTypeId, UIA_SplitButtonControlTypeId, UIA_TabControlTypeId,
+        UIA_TabItemControlTypeId, UIA_TextPatternId, UIA_TitleBarControlTypeId,
+        UIA_ToolBarControlTypeId, UIA_TreeControlTypeId, UIA_TreeItemControlTypeId,
+        UIA_ValuePatternId,
     };
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         GetKeyboardLayout, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
@@ -306,6 +316,16 @@ mod platform {
                 return FocusKind::Password;
             }
             let control_type = element.CurrentControlType().unwrap_or_default();
+            // A browser page outside any field is a Document whose value says
+            // read-only; an editable document (Word, Notepad) does not.
+            if control_type == UIA_DocumentControlTypeId
+                && element
+                    .GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+                    .and_then(|value| value.CurrentIsReadOnly())
+                    .is_ok_and(|read_only| read_only.as_bool())
+            {
+                return FocusKind::NotText;
+            }
             if control_type == UIA_EditControlTypeId || control_type == UIA_DocumentControlTypeId {
                 return FocusKind::EditableText;
             }
@@ -313,6 +333,33 @@ mod platform {
             // when its control type is something bespoke (terminals, editors).
             if element.GetCurrentPattern(UIA_TextPatternId).is_ok() {
                 return FocusKind::EditableText;
+            }
+            // Only controls that never hold a caret; Pane, Window, Custom and
+            // Group stay Unknown, since editors hide behind those.
+            if [
+                UIA_ButtonControlTypeId,
+                UIA_CheckBoxControlTypeId,
+                UIA_HyperlinkControlTypeId,
+                UIA_ImageControlTypeId,
+                UIA_ListControlTypeId,
+                UIA_ListItemControlTypeId,
+                UIA_MenuBarControlTypeId,
+                UIA_MenuControlTypeId,
+                UIA_MenuItemControlTypeId,
+                UIA_RadioButtonControlTypeId,
+                UIA_ScrollBarControlTypeId,
+                UIA_SliderControlTypeId,
+                UIA_SplitButtonControlTypeId,
+                UIA_TabControlTypeId,
+                UIA_TabItemControlTypeId,
+                UIA_TitleBarControlTypeId,
+                UIA_ToolBarControlTypeId,
+                UIA_TreeControlTypeId,
+                UIA_TreeItemControlTypeId,
+            ]
+            .contains(&control_type)
+            {
+                return FocusKind::NotText;
             }
             FocusKind::Unknown
         }

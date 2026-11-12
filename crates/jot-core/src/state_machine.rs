@@ -55,10 +55,11 @@ pub enum DictationFailure {
 pub enum DictationOutcome {
     /// Text landed at the cursor via the insertion ladder, and was read back.
     Inserted,
-    /// Sent to the app but not read back; left on the clipboard. The user,
-    /// who sees the field, decides whether a Ctrl+V is needed.
+    /// Sent into a readable field that does not show it; the recovery window
+    /// offers it to copy, nothing is re-sent.
     Unconfirmed,
-    /// Focus changed mid-flight; user was offered a chip instead of a blind paste (F17).
+    /// Not sent (focus changed mid-flight, or not on a text field); the
+    /// recovery window offers it instead of a blind paste (F17).
     AwaitingChip,
     /// Ladder exhausted; text left on the clipboard with a visible hint (F16).
     CopiedToClipboard,

@@ -29,6 +29,7 @@ mod hotkey_hook;
 mod hud_validation;
 mod i18n;
 mod pill;
+mod recovery;
 mod services;
 #[cfg(target_os = "windows")]
 mod single_instance;
@@ -304,6 +305,9 @@ fn drive_pill(hud: WindowHandle<PillView>, services: Services, cx: &mut App) {
     cx.spawn(async move |cx| {
         let mut silence = SilenceReason::NoSpeech;
         let mut last_words = 0usize;
+        // Set by a not-inserted outcome; the text follows in `Result`.
+        let mut not_inserted = false;
+        let mut recovery = None;
         loop {
             let update = match updates.recv().await {
                 Ok(update) => update,
@@ -321,6 +325,10 @@ fn drive_pill(hud: WindowHandle<PillView>, services: Services, cx: &mut App) {
                 CoordinatorUpdate::SilenceReason(reason) => silence = reason,
                 CoordinatorUpdate::Result(text) => {
                     last_words = text.split_whitespace().count();
+                    if std::mem::take(&mut not_inserted) {
+                        let current = recovery.take();
+                        recovery = cx.update(|cx| recovery::show(current, text, cx));
+                    }
                 }
                 CoordinatorUpdate::CoachingHint(hint) => {
                     let Some(hint) = hint else { continue };
@@ -333,6 +341,14 @@ fn drive_pill(hud: WindowHandle<PillView>, services: Services, cx: &mut App) {
                     });
                 }
                 CoordinatorUpdate::State(state) => {
+                    not_inserted = matches!(
+                        state,
+                        DictationState::Done(
+                            DictationOutcome::Unconfirmed
+                                | DictationOutcome::AwaitingChip
+                                | DictationOutcome::CopiedToClipboard
+                        )
+                    );
                     play_transition(state, sounds);
                     tray::set_dictating(state.is_recording());
 

@@ -102,7 +102,15 @@ pub fn install_window_icons<V: 'static>(
 /// behind it, which looks exactly like a pill that never appeared.
 pub fn make_overlay(window: &Window, bottom_margin: f32) -> anyhow::Result<()> {
     let hwnd = hwnd_of(window).ok_or_else(|| anyhow::anyhow!("HUD has no Win32 handle"))?;
-    platform::make_overlay(hwnd)?;
+    platform::make_overlay(hwnd, true)?;
+    platform::place_on_active_display(hwnd, bottom_margin)
+}
+
+/// Like [`make_overlay`], but the window takes clicks: it still never
+/// activates, so the user's app keeps the keyboard focus.
+pub fn make_popup(window: &Window, bottom_margin: f32) -> anyhow::Result<()> {
+    let hwnd = hwnd_of(window).ok_or_else(|| anyhow::anyhow!("popup has no Win32 handle"))?;
+    platform::make_overlay(hwnd, false)?;
     platform::place_on_active_display(hwnd, bottom_margin)
 }
 
@@ -250,7 +258,7 @@ mod platform {
         queried.is_ok() && info.dwFlags.0 & 0x0000_0001 != 0
     }
 
-    pub fn make_overlay(hwnd: isize) -> anyhow::Result<()> {
+    pub fn make_overlay(hwnd: isize, click_through: bool) -> anyhow::Result<()> {
         let hwnd = HWND(hwnd as *mut _);
         unsafe {
             SetLastError(ERROR_SUCCESS);
@@ -265,7 +273,11 @@ mod platform {
             // GPUI uses DirectComposition, never UpdateLayeredWindow (which SLA disables).
             let wanted = (current & !WS_EX_WINDOWEDGE.0)
                 | WS_EX_LAYERED.0
-                | WS_EX_TRANSPARENT.0
+                | if click_through {
+                    WS_EX_TRANSPARENT.0
+                } else {
+                    0
+                }
                 | WS_EX_NOACTIVATE.0
                 | WS_EX_TOOLWINDOW.0;
             SetLastError(ERROR_SUCCESS);
@@ -394,7 +406,7 @@ mod platform {
     pub fn high_contrast() -> bool {
         false
     }
-    pub fn make_overlay(_hwnd: isize) -> anyhow::Result<()> {
+    pub fn make_overlay(_hwnd: isize, _click_through: bool) -> anyhow::Result<()> {
         Ok(())
     }
     pub fn place_on_active_display(_hwnd: isize, _margin: f32) -> anyhow::Result<()> {

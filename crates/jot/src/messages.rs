@@ -189,7 +189,8 @@ messages! {
     NoSpeech => "No speech", "Sans parole";
     InFlight => "In progress", "En cours";
     CopiedClipboard => "Copied to clipboard", "Copié dans le presse-papiers";
-    CopiedReady => "Copied and ready to paste", "Copié, prêt à coller";
+    NotInserted => "Not inserted", "Non inséré";
+    NotInsertedDetail => "Not inserted. Copy it from History.", "Non inséré. Copiez-le depuis l’Historique.";
     HeldPassword => "Kept in History because the target is a password field", "Conservé dans l’historique car le champ est réservé aux mots de passe";
     QueuedDetail => "Queued. Will send when you reconnect.", "En attente d’une connexion pour l’envoi.";
     RecoveredDetail => "Recovered. The transcript is in History.", "Dictée récupérée dans l’historique.";
@@ -266,7 +267,10 @@ messages! {
     StepTry => "Try dictating", "Essayer la dictée";
     StepDone => "Ready to dictate", "Prêt à dicter";
     HudCopied => "Copied — press Ctrl+V to paste", "Copié. Appuyez sur Ctrl+V pour coller.";
-    HudUnconfirmed => "Sent, not confirmed — if it is missing, press Ctrl+V", "Envoyé sans confirmation. S’il manque, appuyez sur Ctrl+V.";
+    RecoveryTitle => "Not inserted", "Texte non inséré";
+    RecoveryCopy => "Copy", "Copier";
+    RecoveryCopied => "Copied", "Copié";
+    RecoveryClose => "Close", "Fermer";
     HudHeld => "Password field — saved to History only", "Champ de mot de passe. Texte conservé dans l’historique.";
     HudOffline => "Offline — saved, will send when you reconnect", "Hors ligne. Envoi à la reconnexion.";
     HudSilent => "Didn't catch that", "Aucune parole détectée";

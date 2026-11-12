@@ -141,9 +141,10 @@ impl PillView {
             DictationState::Cancelled => PillState::Hidden,
             DictationState::Done(outcome) => match outcome {
                 DictationOutcome::Inserted => PillState::Success { words: 0 },
-                DictationOutcome::Unconfirmed => PillState::Notice(Msg::HudUnconfirmed.into()),
-                DictationOutcome::AwaitingChip => PillState::Notice(Msg::HudCopied.into()),
-                DictationOutcome::CopiedToClipboard => PillState::Notice(Msg::HudCopied.into()),
+                // The recovery window speaks for these; the pill steps aside.
+                DictationOutcome::Unconfirmed
+                | DictationOutcome::AwaitingChip
+                | DictationOutcome::CopiedToClipboard => PillState::Hidden,
                 DictationOutcome::HeldForSecureField => PillState::Notice(Msg::HudHeld.into()),
                 DictationOutcome::QueuedForRetry => PillState::Notice(Msg::HudOffline.into()),
                 DictationOutcome::Silent => match silence {

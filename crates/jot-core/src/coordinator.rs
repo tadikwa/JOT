@@ -817,12 +817,12 @@ impl DictationCoordinator {
 
         let (status, event) = match insertion {
             InsertionOutcome::Inserted => (SessionStatus::Inserted, DictationEvent::Inserted),
-            // History: the text is on the clipboard, which is all Jot can vouch for.
+            // Not in the app: History and the recovery window hold it.
             InsertionOutcome::Unconfirmed => (
-                SessionStatus::CopiedToClipboard,
+                SessionStatus::AwaitingChip,
                 DictationEvent::InsertionUnconfirmed,
             ),
-            InsertionOutcome::FrontmostChanged => (
+            InsertionOutcome::FrontmostChanged | InsertionOutcome::NoTextField => (
                 SessionStatus::AwaitingChip,
                 DictationEvent::FrontmostChangedAwaitingChip,
             ),
@@ -1724,10 +1724,15 @@ mod tests {
             (
                 InsertionOutcome::Unconfirmed,
                 DictationOutcome::Unconfirmed,
-                SessionStatus::CopiedToClipboard,
+                SessionStatus::AwaitingChip,
             ),
             (
                 InsertionOutcome::FrontmostChanged,
+                DictationOutcome::AwaitingChip,
+                SessionStatus::AwaitingChip,
+            ),
+            (
+                InsertionOutcome::NoTextField,
                 DictationOutcome::AwaitingChip,
                 SessionStatus::AwaitingChip,
             ),

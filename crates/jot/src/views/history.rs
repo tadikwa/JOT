@@ -1717,7 +1717,8 @@ fn format_time(at: OffsetDateTime) -> String {
 fn status_chip_label(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Inserted => tr(Msg::Inserted),
-        SessionStatus::CopiedToClipboard | SessionStatus::AwaitingChip => tr(Msg::Copied),
+        SessionStatus::CopiedToClipboard => tr(Msg::Copied),
+        SessionStatus::AwaitingChip => tr(Msg::NotInserted),
         SessionStatus::HeldSecure => tr(Msg::Held),
         SessionStatus::QueuedForRetry => tr(Msg::Queued),
         SessionStatus::Recovered => tr(Msg::Recovered),
@@ -1734,7 +1735,7 @@ fn status_label(status: SessionStatus) -> &'static str {
     match status {
         SessionStatus::Inserted => tr(Msg::Inserted),
         SessionStatus::CopiedToClipboard => tr(Msg::CopiedClipboard),
-        SessionStatus::AwaitingChip => tr(Msg::CopiedReady),
+        SessionStatus::AwaitingChip => tr(Msg::NotInsertedDetail),
         SessionStatus::HeldSecure => tr(Msg::HeldPassword),
         SessionStatus::QueuedForRetry => tr(Msg::QueuedDetail),
         SessionStatus::Recovered => tr(Msg::RecoveredDetail),
@@ -1987,6 +1988,9 @@ mod tests {
         // not imply it is ready to paste.
         assert!(!status_label(SessionStatus::Recovered).contains("paste"));
         assert!(!status_label(SessionStatus::HeldSecure).contains("Copied"));
+        // Not inserted means not copied either, until the user asks.
+        assert!(!status_label(SessionStatus::AwaitingChip).contains("Copied"));
+        assert!(!status_label(SessionStatus::AwaitingChip).contains("paste"));
     }
 
     #[test]
