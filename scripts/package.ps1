@@ -100,7 +100,7 @@ try {
     Copy-Item (Join-Path $root 'docs/v15/NOTICE.md') (Join-Path $stage 'NOTICE-FR.md')
     if ($TestBuild) { New-Item -ItemType File -Path (Join-Path $stage 'jot-test-profile') | Out-Null }
 
-    $zipName = if ($TestBuild) { "Jot-$version-test-portable.zip" } else { "Jot-$version-windows-x64.zip" }
+    $zipName = if ($TestBuild) { "Jot-$version-test-portable.zip" } else { "Jot-$version-portable.zip" }
     $zip = Join-Path $dist $zipName
     if (Test-Path $zip) { Remove-Item -Force $zip }
     Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip

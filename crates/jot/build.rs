@@ -23,11 +23,43 @@ fn main() {
         .join("assets/jot.ico");
     let script = out.join("jot.rc");
     let resource = out.join("jot.res");
+    // Explorer's Details tab and SmartScreen read the name and version here.
+    let version = env::var("CARGO_PKG_VERSION").expect("CARGO_PKG_VERSION");
+    let numeric = version
+        .split(['-', '+'])
+        .next()
+        .unwrap_or("0.0.0")
+        .replace('.', ",");
     fs::write(
         &script,
         format!(
-            "1 ICON \"{}\"\n",
-            icon.display().to_string().replace('\\', "/")
+            "1 ICON \"{icon}\"\n\
+             1 VERSIONINFO\n\
+             FILEVERSION {numeric},0\n\
+             PRODUCTVERSION {numeric},0\n\
+             FILEOS 0x40004\n\
+             FILETYPE 0x1\n\
+             BEGIN\n\
+             BLOCK \"StringFileInfo\"\n\
+             BEGIN\n\
+             BLOCK \"040904B0\"\n\
+             BEGIN\n\
+             VALUE \"CompanyName\", \"tadikwa\"\n\
+             VALUE \"FileDescription\", \"Jot - voice dictation\"\n\
+             VALUE \"FileVersion\", \"{version}\"\n\
+             VALUE \"InternalName\", \"jot\"\n\
+             VALUE \"LegalCopyright\", \"Apache-2.0\"\n\
+             VALUE \"OriginalFilename\", \"jot.exe\"\n\
+             VALUE \"ProductName\", \"Jot\"\n\
+             VALUE \"ProductVersion\", \"{version}\"\n\
+             END\n\
+             END\n\
+             BLOCK \"VarFileInfo\"\n\
+             BEGIN\n\
+             VALUE \"Translation\", 0x409, 1200\n\
+             END\n\
+             END\n",
+            icon = icon.display().to_string().replace('\\', "/")
         ),
     )
     .expect("writing Jot resource script");
