@@ -213,6 +213,12 @@ pub struct Settings {
     pub transcription_engine: TranscriptionEngine,
     pub local_reformulation: LocalReformulation,
     pub local_unload: LocalUnload,
+    /// Test-only diagnostic, off by default: when the fidelity check refuses a
+    /// local rewrite, keep the refused text and the reason beside the dictation
+    /// (`diagnostic.json`). Never leaves the PC, never logged.
+    pub keep_rejected_reformulations: bool,
+    /// Days before those diagnostics are deleted (the dictation itself stays).
+    pub rejected_reformulation_retention_days: i64,
     /// Ask GitHub Releases at most once a day at startup whether a newer Jot
     /// exists. Only the app version leaves the PC; nothing is downloaded.
     pub check_updates: bool,
@@ -247,6 +253,8 @@ impl Default for Settings {
             transcription_engine: TranscriptionEngine::Gemini,
             local_reformulation: LocalReformulation::Fast,
             local_unload: LocalUnload::FiveMinutes,
+            keep_rejected_reformulations: false,
+            rejected_reformulation_retention_days: 7,
             check_updates: true,
             include_prereleases: false,
             gate_trips: Vec::new(),

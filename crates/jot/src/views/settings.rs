@@ -1393,6 +1393,35 @@ impl SettingsView {
             ));
         }
 
+        let keeping = settings.keep_rejected_reformulations;
+        let mut diagnostic_row = div().flex().flex_wrap().gap(theme::spacing::XS);
+        for (days, label) in [
+            (1, ui("1 day", "1 jour")),
+            (7, ui("7 days", "7 jours")),
+            (30, ui("30 days", "30 jours")),
+        ] {
+            let store = self.services.settings.clone();
+            diagnostic_row = diagnostic_row.child(widgets::button(
+                ("diagnostic-retention", days as u64),
+                label,
+                if settings.rejected_reformulation_retention_days == days {
+                    ButtonKind::Primary
+                } else {
+                    ButtonKind::Secondary
+                },
+                keeping,
+                theme,
+                move |_, _, cx| {
+                    store.update(Some("rejectedReformulationRetentionDays"), |s| {
+                        s.rejected_reformulation_retention_days = days
+                    });
+                    let now = store.get();
+                    jot_core::runtime::spawn_blocking(move || jot_core::diagnostic::sweep(&now));
+                    cx.refresh_windows();
+                },
+            ));
+        }
+
         widgets::section(
             tr(Msg::Privacy),
             theme,
@@ -1407,6 +1436,43 @@ impl SettingsView {
                     tr(Msg::RetentionHint),
                     theme,
                     retention_row,
+                )
+                .into_any_element(),
+                widgets::toggle(
+                    "keep-rejected-reformulations",
+                    ui(
+                        "Diagnostic: keep refused rewrites",
+                        "Diagnostic : conserver les reformulations refusées",
+                    ),
+                    ui(
+                        "For tests. When the safety check refuses the local rewrite, Jot still inserts the raw transcript; this also keeps the refused text and the reason in the History, on this PC only. Turning it off deletes them.",
+                        "Pour les tests. Quand le contrôle refuse la reformulation locale, Jot insère toujours la transcription brute ; ceci conserve en plus le texte refusé et la raison dans l’Historique, sur ce PC uniquement. Désactiver les efface.",
+                    ),
+                    keeping,
+                    theme,
+                    {
+                        let store = self.services.settings.clone();
+                        move |_, _, cx| {
+                            store.update(Some("keepRejectedReformulations"), |s| {
+                                s.keep_rejected_reformulations = !s.keep_rejected_reformulations
+                            });
+                            let now = store.get();
+                            jot_core::runtime::spawn_blocking(move || {
+                                jot_core::diagnostic::sweep(&now)
+                            });
+                            cx.refresh_windows();
+                        }
+                    },
+                )
+                .into_any_element(),
+                widgets::field_row(
+                    ui("Keep diagnostics for", "Conserver les diagnostics"),
+                    ui(
+                        "Then they are deleted; the dictation itself stays.",
+                        "Ils sont ensuite effacés ; la dictée elle-même reste.",
+                    ),
+                    theme,
+                    diagnostic_row,
                 )
                 .into_any_element(),
                 widgets::toggle(

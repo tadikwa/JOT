@@ -1231,6 +1231,7 @@ impl TranscriptionServicing for LocalTranscriptionService {
             });
         }
 
+        let reformulation_started = Instant::now();
         let cleaned = match self.engine.reformulate(pack, &raw, &vocabulary).await {
             Ok(response) => {
                 let cleaned = tidy_single_item_list(&validation::strip_artifacts(&response));
@@ -1240,7 +1241,38 @@ impl TranscriptionServicing for LocalTranscriptionService {
                         tracing::warn!(reason, "local reformulation rejected — inserting raw");
                         model_id.push_str(":rejected/");
                         model_id.push_str(&reason.replace(' ', "_"));
-                        replacement::apply(&rules, &raw)
+                        let inserted = replacement::apply(&rules, &raw);
+                        let settings = self.settings.get();
+                        if settings.keep_rejected_reformulations
+                            && let Some(folder) = audio_path.parent().map(Path::to_path_buf)
+                        {
+                            let diagnostic = crate::diagnostic::RejectedReformulation {
+                                recorded_at: time::OffsetDateTime::now_utc(),
+                                model_id: model_id.clone(),
+                                detail: crate::fidelity::explain(&raw, &cleaned, &reason),
+                                reason,
+                                raw_transcript: raw.clone(),
+                                model_response: (response != cleaned).then_some(response),
+                                proposed: cleaned,
+                                inserted: inserted.clone(),
+                                reformulation_ms: reformulation_started.elapsed().as_millis()
+                                    as u64,
+                            };
+                            let keep_days = settings.rejected_reformulation_retention_days;
+                            // Off the insertion path; the sweep keeps retention
+                            // honest in a session that runs for days.
+                            crate::runtime::spawn_blocking(move || {
+                                diagnostic.write(&folder);
+                                if let Some(root) = folder.parent() {
+                                    crate::diagnostic::purge(
+                                        root,
+                                        Some(keep_days),
+                                        time::OffsetDateTime::now_utc(),
+                                    );
+                                }
+                            });
+                        }
+                        inserted
                     }
                 }
             }

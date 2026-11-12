@@ -89,6 +89,10 @@ pub fn meta_json(folder: &Path) -> PathBuf {
     folder.join("meta.json")
 }
 
+pub fn diagnostic_json(folder: &Path) -> PathBuf {
+    folder.join("diagnostic.json")
+}
+
 /// Bytes per second of the capture format: 16 kHz mono 16-bit PCM.
 pub const WAV_BYTES_PER_SECOND: u64 = 32_000;
 /// Canonical 44-byte RIFF/PCM header written by `hound`.

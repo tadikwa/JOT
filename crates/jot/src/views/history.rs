@@ -86,15 +86,24 @@ enum Version {
     Current,
     Raw,
     Cleaned,
+    /// The rewrite the fidelity check refused; only with the opt-in diagnostic.
+    Rejected,
     Corrections,
 }
 impl Version {
-    const ALL: [Self; 4] = [Self::Current, Self::Raw, Self::Cleaned, Self::Corrections];
+    const ALL: [Self; 5] = [
+        Self::Current,
+        Self::Raw,
+        Self::Cleaned,
+        Self::Rejected,
+        Self::Corrections,
+    ];
     fn label(self) -> &'static str {
         match self {
             Self::Current => ui("Current text", "Texte actuel"),
             Self::Raw => ui("Raw", "Brut"),
             Self::Cleaned => ui("Cleaned", "Nettoyé"),
+            Self::Rejected => ui("Refused rewrite", "Proposition refusée"),
             Self::Corrections => ui("Corrections", "Corrections"),
         }
     }
@@ -110,6 +119,8 @@ struct Detail {
     retryable: bool,
     /// Which engine and stages produced the text; None for dictations older than 1.5.
     engine: Option<String>,
+    /// The refused rewrite and why, kept by the opt-in diagnostic.
+    rejected: Option<(SharedString, SharedString)>,
 }
 impl Detail {
     fn new(record: DictationRecord, corrections: Vec<Correction>, retryable: bool) -> Self {
@@ -129,6 +140,15 @@ impl Detail {
             engine: jot_core::meta::SessionMeta::read(&record.folder)
                 .and_then(|meta| meta.model_id)
                 .map(|id| engine_label(&id)),
+            rejected: jot_core::diagnostic::RejectedReformulation::read(&record.folder).map(|d| {
+                let why = format!(
+                    "{} {} · {} ms",
+                    ui("Refused by the check:", "Refusée par le contrôle :"),
+                    d.detail.unwrap_or(d.reason),
+                    d.reformulation_ms
+                );
+                (d.proposed.into(), why.into())
+            }),
             record,
             retryable,
         }
@@ -138,6 +158,7 @@ impl Detail {
             Version::Current => Some(&self.current),
             Version::Raw => self.raw.as_ref(),
             Version::Cleaned => self.cleaned.as_ref(),
+            Version::Rejected => self.rejected.as_ref().map(|(text, _)| text),
             Version::Corrections => None,
         }
     }
@@ -1112,6 +1133,9 @@ impl HistoryView {
                 let versions = Version::ALL
                     .into_iter()
                     .enumerate()
+                    .filter(|(_, version)| {
+                        *version != Version::Rejected || detail.rejected.is_some()
+                    })
                     .map(|(index, version)| {
                         widgets::button(
                             ("history-version", index),
@@ -1192,6 +1216,15 @@ impl HistoryView {
                         );
                     }
                 } else {
+                    if let (Version::Rejected, Some((_, why))) = (self.version, &detail.rejected) {
+                        children.push(
+                            div()
+                                .text_size(theme::type_scale::LABEL)
+                                .text_color(theme.on_surface_variant)
+                                .child(why.clone())
+                                .into_any_element(),
+                        );
+                    }
                     children.push(
                         div()
                             .p(theme::spacing::S)
@@ -1753,6 +1786,18 @@ fn engine_label(model_id: &str) -> String {
         ("rejected", "number_changed" | "number_lost") => ui(
             "rejected: a number was changed or lost",
             "refusé : un nombre a été modifié ou perdu",
+        ),
+        ("rejected", "unit_added") => ui(
+            "rejected: a unit was added (minutes, %, GB…)",
+            "refusé : une unité a été ajoutée (minutes, %, Go…)",
+        ),
+        ("rejected", "restriction_lost") => ui(
+            "rejected: a condition (only if, unless…) was lost",
+            "refusé : une condition (uniquement si, sauf si…) a disparu",
+        ),
+        ("rejected", "qualifier_lost") => ui(
+            "rejected: a degree (not necessarily…) was lost",
+            "refusé : un degré (pas forcément…) a disparu",
         ),
         ("rejected", _) => ui("rejected by the safety check", "refusé par le contrôle"),
         ("missing", _) => ui("not installed", "non installé"),

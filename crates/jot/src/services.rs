@@ -158,6 +158,7 @@ impl Services {
                 audio_retention_days: settings.get().audio_retention_days,
             }
             .purge_expired_audio(&file_layout::recordings_root(), OffsetDateTime::now_utc());
+            jot_core::diagnostic::sweep(&settings.get());
         });
     }
 }

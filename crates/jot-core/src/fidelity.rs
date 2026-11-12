@@ -28,6 +28,9 @@ pub fn check(raw: &str, cleaned: &str) -> Result<(), &'static str> {
     if !corrects && required.iter().any(|n| *n > 1 && !kept.contains(n)) {
         return Err("number_lost");
     }
+    if !units_added(raw, cleaned).is_empty() {
+        return Err("unit_added");
+    }
     if has(&HEDGE, raw) && !has(&HEDGE, cleaned) {
         return Err("hedge_lost");
     }
@@ -45,6 +48,124 @@ pub fn check(raw: &str, cleaned: &str) -> Result<(), &'static str> {
     }
     Ok(())
 }
+
+/// The dictated words behind a rejection, for the opt-in local diagnostic only
+/// (`crate::diagnostic`): unlike the reason, this quotes the dictation, so it
+/// must never be logged.
+pub fn explain(raw: &str, cleaned: &str, reason: &str) -> Option<String> {
+    let list = |terms: Vec<String>| {
+        let terms: BTreeSet<String> = terms.into_iter().collect();
+        (!terms.is_empty()).then(|| {
+            terms
+                .iter()
+                .map(|t| format!("« {t} »"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        })
+    };
+    let found = |pattern: &Regex, text: &str| {
+        pattern
+            .find_iter(&text.replace('’', "'"))
+            .map(|m| m.as_str().to_lowercase())
+            .collect::<Vec<_>>()
+    };
+    let values = |set: BTreeSet<u64>| set.iter().map(u64::to_string).collect::<Vec<_>>();
+    let (what, terms) = match reason {
+        "number_changed" => (
+            "nombre absent du brut",
+            values(&numbers(&LIST_MARKER.replace_all(cleaned, "")) - &numbers(raw)),
+        ),
+        "number_lost" => (
+            "nombre du brut absent de la reformulation",
+            values(
+                numbers(&COLON.replace_all(raw, " : "))
+                    .into_iter()
+                    .filter(|n| *n > 1 && !numbers(cleaned).contains(n))
+                    .collect(),
+            ),
+        ),
+        "unit_added" => ("unité absente du brut", units_added(raw, cleaned)),
+        "hedge_lost" => ("incertitude disparue", found(&HEDGE, raw)),
+        "negation_lost" => ("négation disparue", found(&NEGATION, raw)),
+        "restriction_lost" => ("condition restrictive disparue", found(&RESTRICTIVE, raw)),
+        "qualifier_lost" => (
+            "degré disparu",
+            found(
+                &QUALIFIER,
+                &RETRACTED_QUALIFIER.replace_all(&raw.replace('’', "'"), ""),
+            ),
+        ),
+        _ => return None,
+    };
+    list(terms).map(|terms| format!("{what} : {terms}"))
+}
+
+/// Units written in the rewrite whose kind (minutes, %, Go…) the speaker never
+/// said: « vingt de temps » became « vingt minutes » (1.6 field test T12).
+/// Compared by kind, so « dix heures » → « 10 h » and « seize gigas » → « 16 Go »
+/// pass. Returns the offending words as written in the rewrite.
+/// shortcut: a kind already said elsewhere in the dictation hides a new one
+/// on another number; pair each unit with its number if that shows up.
+fn units_added(raw: &str, cleaned: &str) -> Vec<String> {
+    UNITS
+        .iter()
+        .filter(|unit| !unit.is_match(raw))
+        .filter_map(|unit| unit.find(cleaned))
+        // An abbreviation match carries its digit and the next character.
+        .map(|m| {
+            let unit = m
+                .as_str()
+                .trim_start_matches(|c: char| c.is_ascii_digit() || c.is_whitespace());
+            match unit.char_indices().last() {
+                Some((i, c)) if unit.len() > 1 && !c.is_alphanumeric() && !"%€$".contains(c) => {
+                    unit[..i].trim_end()
+                }
+                _ => unit,
+            }
+            .to_string()
+        })
+        .collect()
+}
+
+// Spelled-out words anywhere; symbols and abbreviations only right after a
+// digit (« 5 s », not the « s » of a word). Checked on the 116 bench references
+// and the 20 accepted rewrites of the 1.6 field test: no false alarm.
+static UNITS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
+    [
+        (r"secondes?|seconds?", r"s|sec"),
+        (r"minutes?", r"min|mn"),
+        (r"heures?|hours?", r"h"),
+        (r"jours?|days?", r"j"),
+        (r"semaines?|weeks?", ""),
+        (r"mois|months?", ""),
+        // Not a bare « an »: it is also the English article.
+        (r"ans|années?|years?", ""),
+        (r"pour ?cents?|pourcentage|percent", r"%"),
+        (r"euros?", r"€|EUR"),
+        (r"dollars?", r"\$|USD"),
+        (
+            r"(?:kilo|méga|mega|giga|téra|tera)(?:octets?|bytes?)|(?:méga|mega|giga|téra|tera)s?|octets?|bytes?",
+            r"[KMGT]i?[oB]",
+        ),
+        (r"(?:kilo|méga|mega|giga)bits?", r"[KMG]bit/s|[KMG]bps|[KMG]b/s"),
+        (r"(?:kilo|méga|mega|giga)?hertz", r"[kKMG]?Hz"),
+        (r"(?:kilo|centi|milli)?mètres?|(?:kilo|centi|milli)?meters?", r"km|cm|mm|m"),
+        // « un kilo deux » is 1,2 kg.
+        (r"(?:kilo|milli)?grammes?|(?:kilo|milli)?grams?|kilos?", r"kg|mg|g"),
+        (r"volts?|watts?|ampères?", r"[kKm]?[VWA]"),
+        (r"pouces?|inch(?:es)?", ""),
+        (r"millisecondes?|milliseconds?", r"ms"),
+    ]
+    .into_iter()
+    .map(|(words, abbreviations)| {
+        let mut pattern = format!(r"(?i:\b(?:{words})\b)");
+        if !abbreviations.is_empty() {
+            pattern.push_str(&format!(r"|\d\s?(?:{abbreviations})(?:[^\w]|$)"));
+        }
+        Regex::new(&pattern).unwrap()
+    })
+    .collect()
+});
 
 // A necessary condition (« uniquement si ») weakened to a plain « si » changes
 // what is allowed (1.5.1 field test). A plain « si » is not checked.
@@ -360,6 +481,69 @@ mod tests {
             ),
             Ok(())
         );
+    }
+
+    #[test]
+    fn an_invented_unit_is_rejected_and_a_rewritten_one_passes() {
+        // 1.6 field test T12: the ASR dropped a word, the model filled it in.
+        let t12 = "On a peut-être gagné, on a peut-être gagné à peu près vingt de temps, sans pouvoir encore confirmer ce chiffre.";
+        let invented =
+            "On a peut-être gagné environ vingt minutes, sans pouvoir encore confirmer ce chiffre.";
+        assert_eq!(check(t12, invented), Err("unit_added"));
+        assert_eq!(
+            explain(t12, invented, "unit_added").as_deref(),
+            Some("unité absente du brut : « minutes »")
+        );
+        assert_eq!(
+            check(t12, "On a peut-être gagné à peu près 20 %."),
+            Err("unit_added")
+        );
+        for (raw, cleaned) in [
+            ("Je viens à dix heures.", "Je viens à 10 h."),
+            ("Il a seize gigas de RAM.", "Il a 16 Go de RAM."),
+            ("Le repas coûte dix-huit euros.", "Le repas coûte 18 €."),
+            ("Il pèse un kilo deux.", "Il pèse 1,2 kg."),
+            ("Attends cinq secondes.", "Attends 5 s."),
+            // Not units: a word starting with one, and English « an ».
+            (
+                "La machine a 4 vCPU et un 5G.",
+                "La machine a 4 vCPU et un 5G.",
+            ),
+            ("It is an option.", "It's an option."),
+        ] {
+            assert_eq!(check(raw, cleaned), Ok(()), "{cleaned}");
+        }
+        // The unit layer alone: `numbers` still reads « pour cent » and
+        // « mille cent » as an extra 100, a separate, older false rejection.
+        assert!(units_added("On a gagné vingt pour cent.", "On a gagné 20 %.").is_empty());
+        assert!(units_added("deux mille cent euros", "2 100 €").is_empty());
+    }
+
+    #[test]
+    fn explain_quotes_what_the_check_missed() {
+        assert_eq!(
+            explain(
+                "Je pense que ça marche, peut-être.",
+                "Ça marche.",
+                "hedge_lost"
+            )
+            .as_deref(),
+            Some("incertitude disparue : « je pense », « peut-être »")
+        );
+        assert_eq!(
+            explain(
+                "Ce sera uniquement après la validation.",
+                "Ce sera après la validation.",
+                "restriction_lost"
+            )
+            .as_deref(),
+            Some("condition restrictive disparue : « uniquement après »")
+        );
+        assert_eq!(
+            explain("Il faut 3 postes.", "Il faut 5 postes.", "number_changed").as_deref(),
+            Some("nombre absent du brut : « 5 »")
+        );
+        assert_eq!(explain("a", "b", "length ratio"), None);
     }
 
     #[test]

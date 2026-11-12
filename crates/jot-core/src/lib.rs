@@ -20,6 +20,7 @@ pub mod activity;
 pub mod audio;
 pub mod coordinator;
 pub mod credentials;
+pub mod diagnostic;
 pub mod dictionary;
 pub mod fidelity;
 pub mod file_layout;
