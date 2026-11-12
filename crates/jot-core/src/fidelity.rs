@@ -140,7 +140,7 @@ static UNITS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         (r"mois|months?", ""),
         // Not a bare « an »: it is also the English article.
         (r"ans|années?|years?", ""),
-        (r"pour ?cents?|pourcentage|percent", r"%"),
+        (r"pour[ -]?cents?|pourcentage|percent", r"%"),
         (r"euros?", r"€|EUR"),
         (r"dollars?", r"\$|USD"),
         (
@@ -289,7 +289,8 @@ impl Spoken {
             // quatre-vingt(s)
             (Kind::Tens, Some((4, Kind::Unit))) => value == 20,
             (Kind::Tens, Some((_, Kind::Hundred | Kind::Thousand))) => true,
-            (Kind::Hundred, Some((_, Kind::Unit | Kind::Tens))) => true,
+            // deux mille cent = 2100
+            (Kind::Hundred, Some((_, Kind::Unit | Kind::Tens | Kind::Thousand))) => true,
             (Kind::Thousand, Some(_)) => true,
             _ => false,
         };
@@ -314,9 +315,15 @@ impl Spoken {
 pub fn numbers(text: &str) -> BTreeSet<u64> {
     static THOUSANDS: LazyLock<Regex> =
         LazyLock::new(|| Regex::new(r"(\d{1,3})[ \u{a0}\u{202f}](\d{3})\b").unwrap());
+    // « vingt pour cent » is 20 %, not 20 and 100. Only right after a number:
+    // « une table pour cent personnes » keeps its 100.
+    static PERCENT: LazyLock<Regex> = LazyLock::new(|| {
+        Regex::new(r"(\d|\b(?:un|une|deux|trois|quatre|cinq|six|sept|huit|neuf|dix|onze|douze|treize|quatorze|quinze|seize|vingts?|trente|quarante|cinquante|soixante|cents?|mille))[ \u{a0}-]+pour[ -]?cents?\b").unwrap()
+    });
     let lowered = THOUSANDS
         .replace_all(&text.to_lowercase(), "$1$2")
         .into_owned();
+    let lowered = PERCENT.replace_all(&lowered, "$1 %");
     let mut found = BTreeSet::new();
     let mut spoken = Spoken::default();
     // Hyphens join a compound (« quatre-vingt-douze »); any other separator,
@@ -513,10 +520,52 @@ mod tests {
         ] {
             assert_eq!(check(raw, cleaned), Ok(()), "{cleaned}");
         }
-        // The unit layer alone: `numbers` still reads « pour cent » and
-        // « mille cent » as an extra 100, a separate, older false rejection.
-        assert!(units_added("On a gagné vingt pour cent.", "On a gagné 20 %.").is_empty());
-        assert!(units_added("deux mille cent euros", "2 100 €").is_empty());
+        // Formerly refused: « pour cent » and « mille cent » read as an extra 100.
+        for (raw, cleaned) in [
+            (
+                "Il y a vingt pour cent de remise.",
+                "Il y a 20 % de remise.",
+            ),
+            ("Ça coûte deux mille cent euros.", "Ça coûte 2 100 €."),
+            ("Ça coûte deux mille cent euros.", "Ça coûte 2100 €."),
+            ("On vise quatre-vingt-dix pour cent.", "On vise 90 %."),
+            ("Une remise de cinq pour-cent.", "Une remise de 5 %."),
+            ("Cent pour cent sûr.", "100 % sûr."),
+            ("Mille cent personnes.", "1 100 personnes."),
+        ] {
+            assert_eq!(check(raw, cleaned), Ok(()), "{cleaned}");
+        }
+        // The same words still guard the facts.
+        for (raw, cleaned, reason) in [
+            (
+                "Il y a vingt pour cent de remise.",
+                "Il y a 25 % de remise.",
+                "number_changed",
+            ),
+            (
+                "Il y a vingt pour cent de remise.",
+                "Il y a de la remise.",
+                "number_lost",
+            ),
+            (
+                "Ça coûte deux mille cent euros.",
+                "Ça coûte 2 000 €.",
+                "number_changed",
+            ),
+            (
+                "Ça coûte deux mille cent euros.",
+                "Ça coûte 2 000 € et 100 €.",
+                "number_changed",
+            ),
+            (
+                "Une table pour cent personnes.",
+                "Une table pour des personnes.",
+                "number_lost",
+            ),
+            ("Deux mille, cent fois.", "2100 fois.", "number_changed"),
+        ] {
+            assert_eq!(check(raw, cleaned), Err(reason), "{cleaned}");
+        }
     }
 
     #[test]
