@@ -1138,8 +1138,10 @@ impl HistoryView {
                 let versions = Version::ALL
                     .into_iter()
                     .enumerate()
-                    .filter(|(_, version)| {
-                        *version != Version::Rejected || detail.rejected.is_some()
+                    .filter(|(_, version)| match version {
+                        Version::Rejected => detail.rejected.is_some(),
+                        Version::Corrections => !detail.corrections.is_empty(),
+                        _ => true,
                     })
                     .map(|(index, version)| {
                         widgets::button(
