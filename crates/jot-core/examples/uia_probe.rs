@@ -122,6 +122,59 @@ mod win {
             dictate(hwnd, pid, args.get(2).map(String::as_str));
             return;
         }
+        // `typing`: Jot's own typing, JOT_PROBE_RUNS lines, each read back.
+        if scenario == "typing" {
+            let runs: usize = std::env::var("JOT_PROBE_RUNS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10);
+            let mut altered = 0;
+            for run in 0..runs {
+                if run > 0 {
+                    key(VK_RETURN);
+                }
+                std::thread::sleep(Duration::from_millis(150));
+                let line = format!("{run:02} {SHORT} Kubernetes, PowerShell et l’été.");
+                let started = Instant::now();
+                // JOT_PROBE_PACE_MS: one character at a time, that far apart.
+                match std::env::var("JOT_PROBE_PACE_MS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                {
+                    Some(pace) => {
+                        for c in line.chars() {
+                            jot_core::win32::type_text(&c.to_string());
+                            std::thread::sleep(Duration::from_millis(pace));
+                        }
+                    }
+                    None => {
+                        jot_core::win32::type_text(&line);
+                    }
+                }
+                let typed_ms = started.elapsed().as_millis();
+                // Until the line provably sits before the caret, up to 5 s.
+                let mut read = String::new();
+                let waited = Instant::now();
+                while waited.elapsed() < Duration::from_secs(5) {
+                    read = last_line(pid);
+                    if read == line {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if read == line {
+                    println!(
+                        "run {run}: typed in {typed_ms} ms, landed after {} ms",
+                        waited.elapsed().as_millis()
+                    );
+                } else {
+                    altered += 1;
+                    println!("run {run}: typed {line:?} ({typed_ms} ms), read {read:?} after 5 s");
+                }
+            }
+            println!("typing: {altered}/{runs} lines altered");
+            return;
+        }
         app_learning::note_key_down();
         std::thread::sleep(Duration::from_millis(300));
         describe();

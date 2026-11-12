@@ -32,6 +32,14 @@ const TICK: Duration = Duration::from_millis(500);
 const ANCHOR_RETRY: Duration = Duration::from_millis(100);
 /// Ctrl+V lands whenever the target app reads its queue.
 const ANCHOR_WAIT: Duration = Duration::from_millis(1500);
+/// Typed text lands at the target's own pace: the Windows 11 Notepad takes
+/// about 31 ms per injected character, whatever the pacing.
+const ANCHOR_WAIT_PER_CHAR: Duration = Duration::from_millis(50);
+
+fn anchor_wait(inserted: &str) -> Duration {
+    let chars = inserted.chars().count().min(crate::win32::MAX_TYPED_CHARS) as u32;
+    ANCHOR_WAIT + ANCHOR_WAIT_PER_CHAR * chars
+}
 
 static KEY_DOWNS: AtomicU64 = AtomicU64::new(0);
 
@@ -340,7 +348,7 @@ fn run_with<F: Field>(field: &F, rx: std::sync::mpsc::Receiver<Command>) {
                         deadline: started + OBSERVATION,
                     });
                 }
-                None if started.elapsed() < ANCHOR_WAIT => {
+                None if started.elapsed() < anchor_wait(&watch.inserted) => {
                     pending = Some((watch, started, keys_at_start))
                 }
                 None => tracing::info!("correction watch: field not compatible — nothing observed"),
@@ -693,6 +701,22 @@ mod tests {
             // Another field: the watch is over, edits there are not ours.
             fake.set("Je vais ouvrir Lxxstream.", 18, Some(2));
             wait(700);
+        });
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].after, FIXED);
+    }
+
+    /// The Windows 11 Notepad shows typed text ~31 ms per character late: the
+    /// receipt must wait for it rather than give the field up.
+    #[test]
+    fn a_slow_target_is_still_anchored() {
+        let found = run_case("", |fake, _| {
+            wait(1700);
+            fake.set(INSERTED, 25, Some(1));
+            wait(300);
+            fake.set(FIXED, 25, Some(1));
+            note_key_down();
+            wait(1200);
         });
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].after, FIXED);
