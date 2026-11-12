@@ -477,7 +477,7 @@ mod platform {
     }
 
     pub fn write_clipboard(text: &str) -> Option<u32> {
-        let _guard = ClipboardGuard::open()?;
+        let guard = ClipboardGuard::open()?;
         let mut utf16: Vec<u16> = text.encode_utf16().collect();
         utf16.push(0);
         let bytes = unsafe {
@@ -495,8 +495,11 @@ mod platform {
                     write_format(format, &0_u32.to_le_bytes());
                 }
             }
-            Some(GetClipboardSequenceNumber())
         }
+        // Closing bumps the sequence number again; read it before closing and
+        // the later "untouched?" check always fails, so the restore never runs.
+        drop(guard);
+        Some(clipboard_sequence_number())
     }
 
     // Keeps the `Interface` import honest across `windows` versions where
