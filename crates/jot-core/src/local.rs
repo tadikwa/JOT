@@ -13,7 +13,7 @@ use crate::dictionary::DictionaryStore;
 use crate::gemini::TranscriptionError;
 use crate::settings::{LocalReformulation, SettingsStore};
 use crate::transcription::{DictationContext, TranscriptionResult, TranscriptionServicing};
-use crate::{file_layout, replacement, timeout, validation};
+use crate::{file_layout, timeout, validation};
 use async_trait::async_trait;
 use base64::Engine as _;
 use parking_lot::Mutex;
@@ -1210,12 +1210,11 @@ impl TranscriptionServicing for LocalTranscriptionService {
         // Silence/hum hallucinations and empty output both land here; the
         // coordinator tells silence from a dropped transcript by energy.
         let raw = parse_asr(&content).ok_or(TranscriptionError::EmptyTranscript)?;
-        let rules = self.dictionary.replacement_rules();
 
         let mut model_id = format!("local/{}", Pack::Transcription.model_name());
         let Some(pack) = reformulation else {
             return Ok(TranscriptionResult {
-                cleaned_transcript: replacement::apply(&rules, &raw),
+                cleaned_transcript: self.dictionary.correct(&raw),
                 raw_transcript: raw,
                 model_id,
             });
@@ -1225,7 +1224,7 @@ impl TranscriptionServicing for LocalTranscriptionService {
         if !pack.installed() {
             model_id.push_str(":missing");
             return Ok(TranscriptionResult {
-                cleaned_transcript: replacement::apply(&rules, &raw),
+                cleaned_transcript: self.dictionary.correct(&raw),
                 raw_transcript: raw,
                 model_id,
             });
@@ -1236,12 +1235,12 @@ impl TranscriptionServicing for LocalTranscriptionService {
             Ok(response) => {
                 let cleaned = tidy_single_item_list(&validation::strip_artifacts(&response));
                 match reformulation_verdict(&raw, &cleaned) {
-                    Ok(()) => replacement::apply(&rules, &cleaned),
+                    Ok(()) => self.dictionary.correct(&cleaned),
                     Err(reason) => {
                         tracing::warn!(reason, "local reformulation rejected — inserting raw");
                         model_id.push_str(":rejected/");
                         model_id.push_str(&reason.replace(' ', "_"));
-                        let inserted = replacement::apply(&rules, &raw);
+                        let inserted = self.dictionary.correct(&raw);
                         let settings = self.settings.get();
                         if settings.keep_rejected_reformulations
                             && let Some(folder) = audio_path.parent().map(Path::to_path_buf)
@@ -1282,7 +1281,7 @@ impl TranscriptionServicing for LocalTranscriptionService {
                 tracing::info!(?error, "local reformulation unavailable — inserting raw");
                 model_id.push(':');
                 model_id.push_str(error.class());
-                replacement::apply(&rules, &raw)
+                self.dictionary.correct(&raw)
             }
         };
         Ok(TranscriptionResult {
@@ -1801,9 +1800,15 @@ mod tests {
                         }
                         Err(error) => (String::new(), Err(format!("{error:?}"))),
                     };
+                    // What Jot inserts with this vocabulary and no rules.
+                    let inserted = crate::replacement::repair_elisions(
+                        vocabulary.iter().map(String::as_str),
+                        if verdict.is_ok() { &llm } else { raw },
+                    );
                     let line = serde_json::json!({
                         "id": case["id"],
                         "model": pack.model_name(),
+                        "inserted": inserted,
                         "latency": (latency * 1000.0).round() / 1000.0,
                         "accepted": verdict.is_ok(),
                         "reason": verdict.err(),

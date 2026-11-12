@@ -31,7 +31,6 @@
 use crate::dictionary::DictionaryStore;
 use crate::gemini::{GeminiClient, TranscriptionError};
 use crate::prompt;
-use crate::replacement;
 use crate::settings::{FormattingPolicy, GeminiConfig, SettingsStore, TranscriptionEngine};
 use crate::validation;
 use crate::{timeout, validation::Verdict};
@@ -248,7 +247,6 @@ impl GeminiTranscriptionService {
         config: &GeminiConfig,
     ) -> String {
         let tone = prompt::tone_category(context.target_app_exe.as_deref());
-        let rules = self.dictionary.replacement_rules();
         let text = prompt::cleanup_prompt(
             raw,
             tone,
@@ -273,17 +271,17 @@ impl GeminiTranscriptionService {
                 if verdict.accepted {
                     // The dictionary's hard guarantee: explicit wrong→right
                     // rules always win.
-                    replacement::apply(&rules, &cleaned)
+                    self.dictionary.correct(&cleaned)
                 } else {
                     self.record_gate_trip(&verdict);
-                    replacement::apply(&rules, raw)
+                    self.dictionary.correct(raw)
                 }
             }
             // A deadline miss or network hiccup on cleanup never costs the
             // dictation — and the dictionary guarantee still holds.
             Err(error) => {
                 tracing::info!("cleanup unavailable ({error}) — inserting raw");
-                replacement::apply(&rules, raw)
+                self.dictionary.correct(raw)
             }
         }
     }
@@ -391,8 +389,7 @@ impl TranscriptionServicing for GeminiTranscriptionService {
             // The gate is deliberately NOT run here: with no second model there
             // is no independent reference, and validate(raw: X, cleaned: X)
             // passes trivially, so running it would be theatre rather than safety.
-            let rules = self.dictionary.replacement_rules();
-            let text = replacement::apply(&rules, &trimmed);
+            let text = self.dictionary.correct(&trimmed);
             return Ok(TranscriptionResult {
                 raw_transcript: trimmed,
                 cleaned_transcript: text,

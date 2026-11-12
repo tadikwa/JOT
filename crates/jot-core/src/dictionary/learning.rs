@@ -299,6 +299,23 @@ pub fn suspicious_case(term: &str) -> bool {
 }
 
 fn spelling_confidence(wrong: &str, right: &str) -> Option<u8> {
+    // "l'oustream" for "Loostream": the elided letter is the term's own first
+    // letter, so it is scored as part of the word instead of ruling the pair out.
+    let joined;
+    let mut chars = wrong.chars();
+    let wrong = match (
+        crate::replacement::elision_letter(right),
+        chars.next(),
+        chars.next(),
+    ) {
+        (Some(letter), Some(first), Some('\'' | '’'))
+            if first.to_lowercase().eq(std::iter::once(letter)) =>
+        {
+            joined = format!("{letter}{}", chars.as_str());
+            joined.as_str()
+        }
+        _ => wrong,
+    };
     if wrong
         .chars()
         .chain(right.chars())
@@ -466,6 +483,30 @@ mod tests {
         assert_eq!(
             pairs("Le projet jott avance.", "Le projet Jot avance."),
             rule("jott", "Jot")
+        );
+        // The term's first letter heard as an article: a rule, kept with its apostrophe.
+        assert_eq!(
+            pairs("Je vais ouvrir l'oustream.", "Je vais ouvrir Loostream."),
+            rule("l'oustream", "Loostream")
+        );
+        assert_eq!(
+            pairs("Lance d’oustream ici.", "Lance Doostream ici."),
+            rule("d’oustream", "Doostream")
+        );
+        // Only the apostrophe removed: no spelling evidence, so never a rule
+        // ("l'application" reads the same). "n'" never joins a rule.
+        assert_eq!(
+            pairs("Lance d’ocker ici.", "Lance Docker ici."),
+            vec![("d’ocker".into(), "Docker".into(), true)]
+        );
+        assert_eq!(
+            pairs("Ouvre l'application.", "Ouvre Lapplication."),
+            vec![("l'application".into(), "Lapplication".into(), true)]
+        );
+        assert!(
+            pairs("Il n'oustream pas.", "Il Noostream pas.")
+                .iter()
+                .all(|(_, _, term_only)| *term_only)
         );
         // Proposed as typed, flagged, never repaired.
         assert_eq!(

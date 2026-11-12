@@ -437,12 +437,12 @@ mod win {
         println!(
             "e2e: {added} suggestion(s); before review, next dictation {:?} → {:?}",
             next,
-            jot_core::replacement::apply(&store.replacement_rules(), next)
+            store.correct(next)
         );
         for s in &pending {
             store.accept_suggestion(s.id).unwrap();
         }
-        let corrected = jot_core::replacement::apply(&store.replacement_rules(), next);
+        let corrected = store.correct(next);
         println!(
             "e2e: after Accepter, deterministic rule {:?} → {:?}; recognition vocabulary {:?}",
             next,

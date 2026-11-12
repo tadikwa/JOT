@@ -47,10 +47,15 @@ pub fn apply(rules: &[Rule], text: &str) -> String {
     // Match only the original text: generated replacements cannot trigger another rule.
     let mut edits: Vec<(std::ops::Range<usize>, String)> = Vec::new();
     for rule in ordered {
-        let Ok(regex) = RegexBuilder::new(&regex::escape(&rule.wrong))
-            .case_insensitive(true)
-            .build()
-        else {
+        // ' and ’ are the same apostrophe to the user: a rule learned with one matches both.
+        let pattern: String = regex::escape(&rule.wrong)
+            .chars()
+            .map(|c| match c {
+                '\'' | '’' => "['’]".to_string(),
+                c => c.to_string(),
+            })
+            .collect();
+        let Ok(regex) = RegexBuilder::new(&pattern).case_insensitive(true).build() else {
             continue;
         };
         for found in regex.find_iter(text) {
@@ -74,6 +79,26 @@ pub fn apply(rules: &[Rule], text: &str) -> String {
     }
 
     result
+}
+
+/// French elides only before a vowel or a mute h, so a term's own first
+/// consonant elided in front of it ("l'Loostream") is never French: the
+/// recognizer heard that consonant as an article. "n'" is left out: dropping it
+/// could drop a negation.
+pub(crate) fn elision_letter(term: &str) -> Option<char> {
+    let first = term.chars().next()?.to_lowercase().next()?;
+    "cdjlmst".contains(first).then_some(first)
+}
+
+/// "l'Loostream" → "Loostream", only for the given dictionary terms. Runs after
+/// [`apply`], on its output, because a rule or the model may be what put the
+/// term behind the stray elision. Every other apostrophe is left as it is.
+pub fn repair_elisions<'a>(terms: impl IntoIterator<Item = &'a str>, text: &str) -> String {
+    let rules: Vec<Rule> = terms
+        .into_iter()
+        .filter_map(|term| Some(Rule::new(format!("{}'{term}", elision_letter(term)?), term)))
+        .collect();
+    apply(&rules, text)
 }
 
 /// True when the match is not glued to a word character on either side.
@@ -201,6 +226,43 @@ mod tests {
             apply(&rules, "Cooper netties and cooper netties."),
             "Kubernetes and Kubernetes."
         );
+    }
+
+    #[test]
+    fn rules_match_either_apostrophe() {
+        let rules = [Rule::new("l'oustream", "Loostream")];
+        assert_eq!(apply(&rules, "Ouvre l’oustream."), "Ouvre Loostream.");
+        assert_eq!(apply(&rules, "de l'oustream"), "de Loostream");
+        assert_eq!(apply(&rules, "l'oustreamer"), "l'oustreamer");
+    }
+
+    #[test]
+    fn stray_elisions_before_a_term_are_repaired() {
+        let fix = |text| repair_elisions(["Loostream", "Docker", "jot"], text);
+        assert_eq!(
+            fix("Ouvre l'Loostream maintenant."),
+            "Ouvre Loostream maintenant."
+        );
+        assert_eq!(fix("L’Loostream est prêt."), "Loostream est prêt.");
+        assert_eq!(fix("de l'Loostream"), "de Loostream");
+        assert_eq!(fix("l'image d'Docker"), "l'image Docker");
+        assert_eq!(fix("J'jot vite"), "Jot vite");
+    }
+
+    #[test]
+    fn genuine_elisions_and_other_words_are_left_alone() {
+        let fix = |text| repair_elisions(["Loostream", "Ollama", "Netflix", "Lyon"], text);
+        for text in [
+            "l'application, l'heure, l'ours, l'ostéopathe et la loutre.",
+            "Lance l'Ollama local.",
+            "Je n'Netflix pas.",
+            "l'Loostreamer et xl'Loostream",
+            "Je vais à Lyon, l'ion est chargé.",
+            "Le streaming de Loostream.",
+        ] {
+            assert_eq!(fix(text), text);
+        }
+        assert_eq!(repair_elisions([], "l'Loostream"), "l'Loostream");
     }
 
     #[test]

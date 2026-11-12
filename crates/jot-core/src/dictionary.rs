@@ -487,6 +487,14 @@ impl DictionaryStore {
             .collect()
     }
 
+    /// What every inserted text goes through: the explicit rules, then the
+    /// repair of a stray elision in front of a dictionary term ("l'Loostream").
+    pub fn correct(&self, text: &str) -> String {
+        let fixed = crate::replacement::apply(&self.replacement_rules(), text);
+        let terms: Vec<String> = self.ranked().into_iter().map(|entry| entry.term).collect();
+        crate::replacement::repair_elisions(terms.iter().map(String::as_str), &fixed)
+    }
+
     /// Deterministic rules for the replacement engine (ALL entries with misspellings).
     pub fn replacement_rules(&self) -> Vec<Rule> {
         let mut entries = self.ranked();
@@ -784,6 +792,49 @@ mod tests {
         Correction {
             corrected_at: OffsetDateTime::now_utc(),
             ..correction(id, before, after)
+        }
+    }
+
+    /// The real run: the recognizer hears "l'oustream", then "l'ostream", and
+    /// the model restores the term behind the elision ("l'Loostream").
+    #[test]
+    fn an_elided_term_is_learned_and_never_inserted_with_its_stray_article() {
+        let (_temp, store) = store();
+        let fix = app_fix(
+            "d1",
+            "Je vais ouvrir l'oustream.",
+            "Je vais ouvrir Loostream.",
+        );
+        assert_eq!(store.learn_from_app_correction(&fix).unwrap(), 1);
+        assert_eq!(store.correct("Ouvre l'Loostream."), "Ouvre l'Loostream.");
+        let suggestion = store.suggestions()[0].clone();
+        assert!(!suggestion.term_only);
+        store.accept_suggestion(suggestion.id).unwrap();
+        for (inserted, expected) in [
+            (
+                "Ouvre l'oustream maintenant.",
+                "Ouvre Loostream maintenant.",
+            ),
+            (
+                "Ouvre l’oustream maintenant.",
+                "Ouvre Loostream maintenant.",
+            ),
+            (
+                "Ouvre l'Loostream maintenant.",
+                "Ouvre Loostream maintenant.",
+            ),
+            (
+                "L'Loostream est prêt, de l'Loostream.",
+                "Loostream est prêt, de Loostream.",
+            ),
+            // A variant never seen stays as heard: no fuzzy guess.
+            ("Ouvre l'ostream maintenant.", "Ouvre l'ostream maintenant."),
+            (
+                "l'application, l'heure, l'ours, Loustream et la loutre.",
+                "l'application, l'heure, l'ours, Loustream et la loutre.",
+            ),
+        ] {
+            assert_eq!(store.correct(inserted), expected);
         }
     }
 
