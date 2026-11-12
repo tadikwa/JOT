@@ -184,7 +184,7 @@ messages! {
     CancelledDetail => "Cancelled — the recording is kept", "Dictée annulée. L’enregistrement est conservé.";
     HistoryOffline => "You were offline. Jot will send the recording when you reconnect.", "Vous étiez hors ligne. Jot enverra l’enregistrement à la reconnexion.";
     HistoryNetwork => "Couldn't reach Gemini", "Impossible de joindre Gemini";
-    HistoryTimeout => "Gemini took too long to answer", "Gemini a mis trop de temps à répondre";
+    HistoryTimeout => "The transcription took too long", "La transcription a pris trop de temps";
     Auth => "No usable API key — add one in Settings", "Ajoutez une clé API valide dans les paramètres";
     ModelAccess => "Your key can't use this model — see Settings → Advanced settings", "Votre clé ne donne pas accès à ce modèle. Consultez les paramètres avancés.";
     Quota => "Daily quota reached", "Quota quotidien atteint";

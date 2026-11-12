@@ -1736,30 +1736,35 @@ fn engine_label(model_id: &str) -> String {
         "qwen3.5-9b" => "Qwen3.5 9B",
         other => other,
     };
-    match outcome {
-        "" => format!("{head} → {model}"),
-        "rejected" => format!(
-            "{head} · {model} {}",
-            ui(
-                "rejected by the safety check — raw transcript kept",
-                "refusé par le contrôle : transcription brute conservée"
-            )
-        ),
-        "missing" => format!(
-            "{head} · {model} {}",
-            ui(
-                "not installed — raw transcript kept",
-                "non installé : transcription brute conservée"
-            )
-        ),
-        _ => format!(
-            "{head} · {model} {}",
-            ui(
-                "unavailable — raw transcript kept",
-                "indisponible : transcription brute conservée"
-            )
-        ),
+    if outcome.is_empty() {
+        return format!("{head} → {model}");
     }
+    // 1.5.0 stored a bare "rejected"; 1.5.1 adds the check that failed.
+    let (outcome, reason) = outcome.split_once('/').unwrap_or((outcome, ""));
+    let why = match (outcome, reason) {
+        ("rejected", "hedge_lost") => ui(
+            "rejected: a nuance (maybe, I think…) was lost",
+            "refusé : une nuance (peut-être, je pense…) a disparu",
+        ),
+        ("rejected", "negation_lost") => ui(
+            "rejected: a negation was lost",
+            "refusé : une négation a disparu",
+        ),
+        ("rejected", "number_changed" | "number_lost") => ui(
+            "rejected: a number was changed or lost",
+            "refusé : un nombre a été modifié ou perdu",
+        ),
+        ("rejected", _) => ui("rejected by the safety check", "refusé par le contrôle"),
+        ("missing", _) => ui("not installed", "non installé"),
+        ("timeout", _) => ui("too slow (time limit reached)", "trop lent (délai dépassé)"),
+        ("startfail", _) => ui("did not start", "n’a pas démarré"),
+        ("error", _) => ui("engine error", "erreur du moteur"),
+        _ => ui("unavailable", "indisponible"),
+    };
+    format!(
+        "{head} · {model} {why} — {}",
+        ui("raw transcript kept", "transcription brute conservée")
+    )
 }
 
 /// Display copy for stored error codes. Raw API diagnostics stay in the record.
@@ -1887,6 +1892,29 @@ mod tests {
             engine_label("local/qwen3-asr-1.7b+qwen3.5-4b:error")
         );
         assert!(!missing.contains("→"), "{missing}");
+        // Every way the raw text was kept reads differently, and says so.
+        let kept: Vec<String> = [
+            "rejected",
+            "rejected/hedge_lost",
+            "rejected/negation_lost",
+            "rejected/number_changed",
+            "timeout",
+            "startfail",
+            "error",
+            "missing",
+        ]
+        .iter()
+        .map(|o| engine_label(&format!("local/qwen3-asr-1.7b+qwen3.5-4b:{o}")))
+        .collect();
+        for (i, label) in kept.iter().enumerate() {
+            assert!(!label.contains("→"), "{label}");
+            assert!(
+                label.contains("raw transcript kept")
+                    || label.contains("transcription brute conservée"),
+                "{label}"
+            );
+            assert!(!kept[..i].contains(label), "duplicate: {label}");
+        }
     }
 
     #[test]

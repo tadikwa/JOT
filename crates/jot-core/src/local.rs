@@ -385,6 +385,62 @@ pub struct LocalEngine {
     dictating: Mutex<Dictating>,
     status: Mutex<EngineStatus>,
     device: tokio::sync::OnceCell<Option<(String, String)>>,
+    /// Measured speeds of the loaded reformulation model on this machine.
+    speeds: Mutex<Speeds>,
+    /// System prompt the reformulation server holds in its cache, if any.
+    cached_system: Mutex<Option<String>>,
+}
+
+/// Reformulation speeds in tokens/s, learned from llama-server's `timings`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Speeds {
+    prompt: f64,
+    generation: f64,
+}
+
+impl Speeds {
+    /// A slow 15 W laptop CPU, until this machine has been measured.
+    const UNMEASURED: Self = Self {
+        prompt: 30.0,
+        generation: 4.0,
+    };
+
+    /// Twice the expected time plus slack, between 15 s and 2 minutes: a
+    /// slow CPU gets the time it needs, a stuck server is still abandoned.
+    fn budget(self, uncached_prompt_tokens: u64, output_tokens: u64) -> Duration {
+        let expected =
+            uncached_prompt_tokens as f64 / self.prompt + output_tokens as f64 / self.generation;
+        Duration::from_secs_f64((2.0 * expected + 5.0).clamp(15.0, 120.0))
+    }
+
+    /// Short runs measure overhead, not speed: they are ignored.
+    fn learn(&mut self, timings: &serde_json::Value) {
+        let speed = |n: &str, rate: &str, min: u64| {
+            (timings[n].as_u64().unwrap_or(0) >= min)
+                .then(|| timings[rate].as_f64())
+                .flatten()
+                .filter(|v| v.is_finite() && *v > 0.0)
+        };
+        if let Some(rate) = speed("prompt_n", "prompt_per_second", 32) {
+            self.prompt = rate;
+        }
+        if let Some(rate) = speed("predicted_n", "predicted_per_second", 16) {
+            self.generation = rate;
+        }
+    }
+
+    /// After a timeout the machine is slower than measured (another app, a
+    /// power plan): the next budget doubles, up to the cap.
+    fn slow_down(&mut self) {
+        self.prompt /= 2.0;
+        self.generation /= 2.0;
+    }
+}
+
+/// Rough token count of French/English text for budgets (measured ≈ 3.5
+/// chars per token on Qwen3.5; 3 keeps the estimate on the safe side).
+fn approx_tokens(text: &str) -> u64 {
+    text.chars().count() as u64 / 3 + 1
 }
 
 /// Held while the engine is in use; dropping it restarts the idle delay.
@@ -415,6 +471,8 @@ impl LocalEngine {
             dictating: Mutex::new(Box::new(|| false)),
             status: Mutex::new(EngineStatus::default()),
             device: tokio::sync::OnceCell::new(),
+            speeds: Mutex::new(Speeds::UNMEASURED),
+            cached_system: Mutex::new(None),
         });
         Self::spawn_reaper(Arc::downgrade(&engine));
         engine
@@ -649,7 +707,7 @@ impl LocalEngine {
         Ok(port)
     }
 
-    async fn llm_port(&self, pack: Pack) -> Result<u16, String> {
+    async fn llm_port(&self, pack: Pack, vocabulary: &[String]) -> Result<u16, String> {
         let mut slot = self.llm.lock().await;
         if let Some((loaded, server)) = slot.as_mut()
             && *loaded == pack
@@ -658,23 +716,58 @@ impl LocalEngine {
             return Ok(server.port);
         }
         *slot = None; // a different model was chosen: free its memory first
+        *self.cached_system.lock() = None;
+        *self.speeds.lock() = Speeds::UNMEASURED;
         let artifact = pack.artifacts()[0];
+        // One slot: after an abandoned request the next one lands in the same
+        // slot and reuses its cached system prompt, instead of a cold empty
+        // slot (measured: 4.1 s of prefill again, +230 MB per extra slot).
         let args = vec![
             "-m".into(),
             models_dir().join(artifact.file).display().to_string(),
+            "-np".into(),
+            "1".into(),
         ];
         let server = self.start("llm", args, 8_192).await?;
         let port = server.port;
+        // Still under the lock, so a reformulation waits for this and its own
+        // budget never pays the cold prefill of the ~800-token system prompt
+        // (the cause of the timeouts right after "LLM ready").
+        let system = system_prompt(vocabulary, false);
+        let started = Instant::now();
+        let primer = serde_json::json!({
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_message(".", false)},
+            ],
+            "temperature": 0,
+            "max_tokens": 4,
+            "chat_template_kwargs": {"enable_thinking": false},
+        });
+        match self.chat(port, primer, START_BUDGET).await {
+            Ok((_, timings)) => {
+                self.speeds.lock().learn(&timings);
+                *self.cached_system.lock() = Some(system);
+                tracing::info!(
+                    seconds = started.elapsed().as_secs_f32(),
+                    prompt_tokens = timings["prompt_n"].as_u64(),
+                    speeds = ?*self.speeds.lock(),
+                    "local LLM primed"
+                );
+            }
+            Err(error) => tracing::warn!(?error, "local LLM priming failed"),
+        }
         *slot = Some((pack, server));
         Ok(port)
     }
 
+    /// The reply's text and llama-server's `timings` (token counts and speeds).
     async fn chat(
         &self,
         port: u16,
         body: serde_json::Value,
         deadline: Duration,
-    ) -> Result<String, Failure> {
+    ) -> Result<(String, serde_json::Value), Failure> {
         *self.last_used.lock() = Instant::now();
         let response = self
             .http
@@ -696,7 +789,7 @@ impl LocalEngine {
                 response.status()
             )));
         }
-        let json: serde_json::Value = response.json().await.map_err(|e| {
+        let mut json: serde_json::Value = response.json().await.map_err(|e| {
             if e.is_timeout() {
                 Failure::Timeout
             } else {
@@ -704,13 +797,14 @@ impl LocalEngine {
             }
         })?;
         *self.last_used.lock() = Instant::now();
-        json["choices"][0]["message"]["content"]
+        let content = json["choices"][0]["message"]["content"]
             .as_str()
             .map(str::to_string)
-            .ok_or_else(|| Failure::Engine("réponse llama-server illisible".into()))
+            .ok_or_else(|| Failure::Engine("réponse llama-server illisible".into()))?;
+        Ok((content, json["timings"].take()))
     }
 
-    pub async fn warm(&self, reformulation: Option<Pack>) {
+    pub async fn warm(&self, reformulation: Option<Pack>, vocabulary: &[String]) {
         let _busy = self.busy();
         if Pack::Transcription.installed()
             && let Err(error) = self.asr_port().await
@@ -718,23 +812,36 @@ impl LocalEngine {
             tracing::warn!(%error, "local ASR warm-up failed");
         }
         if let Some(pack) = reformulation.filter(|p| p.installed())
-            && let Err(error) = self.llm_port(pack).await
+            && let Err(error) = self.llm_port(pack, vocabulary).await
         {
             tracing::warn!(%error, "local LLM warm-up failed");
         }
     }
 
+    // Phase logs carry durations and token counts only — never text or audio.
     async fn transcribe(
         &self,
         wav: &[u8],
         duration: Duration,
         vocabulary: &[String],
     ) -> Result<String, Failure> {
-        let port = self.asr_port().await.map_err(Failure::Engine)?;
+        let started = Instant::now();
+        let port = self.asr_port().await.map_err(Failure::Start)?;
+        let start_ms = started.elapsed().as_millis() as u64;
         let body = asr_body(wav, duration, vocabulary);
         // CPU-only machines run ~0.3× real time; the cloud budget is not enough.
         let deadline = timeout::overall_deadline(duration) + duration;
-        self.chat(port, body, deadline).await
+        let started = Instant::now();
+        let result = self.chat(port, body, deadline).await;
+        tracing::info!(
+            audio_s = duration.as_secs_f32(),
+            start_ms,
+            inference_ms = started.elapsed().as_millis() as u64,
+            budget_s = deadline.as_secs(),
+            ok = result.is_ok(),
+            "local ASR phase"
+        );
+        result.map(|(content, _)| content)
     }
 
     async fn reformulate(
@@ -743,21 +850,63 @@ impl LocalEngine {
         raw: &str,
         vocabulary: &[String],
     ) -> Result<String, Failure> {
-        let port = self.llm_port(pack).await.map_err(Failure::Engine)?;
+        let started = Instant::now();
+        let port = self
+            .llm_port(pack, vocabulary)
+            .await
+            .map_err(Failure::Start)?;
+        let start_ms = started.elapsed().as_millis() as u64;
         let words = raw.split_whitespace().count() as u64;
         let lists = looks_enumerated(raw);
+        let system = system_prompt(vocabulary, lists);
+        let user = user_message(raw, lists);
+        let cached = self.cached_system.lock().as_deref() == Some(system.as_str());
+        let uncached = approx_tokens(&user) + if cached { 0 } else { approx_tokens(&system) };
+        // Measured: the output runs 1.1–1.3 tokens per input word.
+        let deadline = self.speeds.lock().budget(uncached, words * 13 / 10 + 8);
         let body = serde_json::json!({
             "messages": [
-                {"role": "system", "content": system_prompt(vocabulary, lists)},
-                {"role": "user", "content": user_message(raw, lists)},
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
             ],
             "temperature": 0,
             "max_tokens": words * 3 + 64,
             "chat_template_kwargs": {"enable_thinking": false},
         });
-        // Measured: 75 words take 1.5 s on a GPU and 13 s on a CPU.
-        let deadline = Duration::from_secs_f64((10.0 + words as f64 * 0.25).min(90.0));
-        self.chat(port, body, deadline).await
+        let started = Instant::now();
+        let result = self.chat(port, body, deadline).await;
+        let inference_ms = started.elapsed().as_millis() as u64;
+        let budget_s = deadline.as_secs_f32();
+        match &result {
+            Ok((_, timings)) => {
+                self.speeds.lock().learn(timings);
+                *self.cached_system.lock() = Some(system);
+                tracing::info!(
+                    words,
+                    start_ms,
+                    inference_ms,
+                    budget_s,
+                    prompt_tokens = timings["prompt_n"].as_u64(),
+                    cached_tokens = timings["cache_n"].as_u64(),
+                    output_tokens = timings["predicted_n"].as_u64(),
+                    "local LLM phase"
+                );
+            }
+            Err(error) => {
+                if matches!(error, Failure::Timeout) {
+                    self.speeds.lock().slow_down();
+                }
+                tracing::info!(
+                    words,
+                    start_ms,
+                    inference_ms,
+                    budget_s,
+                    error = error.class(),
+                    "local LLM phase failed"
+                );
+            }
+        }
+        result.map(|(content, _)| content)
     }
 }
 
@@ -788,14 +937,30 @@ fn asr_body(wav: &[u8], duration: Duration, vocabulary: &[String]) -> serde_json
 #[derive(Debug)]
 enum Failure {
     Timeout,
+    /// The server did not start (or died loading).
+    Start(String),
+    /// Inference failed: HTTP error, unreadable reply, dropped connection.
     Engine(String),
+}
+
+impl Failure {
+    /// Stored after `:` in the History's `model_id`, and logged.
+    fn class(&self) -> &'static str {
+        match self {
+            Failure::Timeout => "timeout",
+            Failure::Start(_) => "startfail",
+            Failure::Engine(_) => "error",
+        }
+    }
 }
 
 impl From<Failure> for TranscriptionError {
     fn from(failure: Failure) -> Self {
         match failure {
             Failure::Timeout => TranscriptionError::Timeout,
-            Failure::Engine(detail) => TranscriptionError::LocalEngine(detail),
+            Failure::Start(detail) | Failure::Engine(detail) => {
+                TranscriptionError::LocalEngine(detail)
+            }
         }
     }
 }
@@ -1000,7 +1165,10 @@ impl LocalTranscriptionService {
 impl TranscriptionServicing for LocalTranscriptionService {
     async fn warm(&self) {
         let pack = Pack::for_reformulation(self.settings.get().local_reformulation);
-        self.engine.warm(pack).await;
+        let vocabulary = self
+            .dictionary
+            .sanitized_vocabulary(LOCAL_VOCABULARY_BUDGET);
+        self.engine.warm(pack, &vocabulary).await;
     }
 
     async fn transcribe(
@@ -1060,7 +1228,8 @@ impl TranscriptionServicing for LocalTranscriptionService {
                     Ok(()) => replacement::apply(&rules, &cleaned),
                     Err(reason) => {
                         tracing::warn!(reason, "local reformulation rejected — inserting raw");
-                        model_id.push_str(":rejected");
+                        model_id.push_str(":rejected/");
+                        model_id.push_str(&reason.replace(' ', "_"));
                         replacement::apply(&rules, &raw)
                     }
                 }
@@ -1069,10 +1238,8 @@ impl TranscriptionServicing for LocalTranscriptionService {
             // never costs the dictation.
             Err(error) => {
                 tracing::info!(?error, "local reformulation unavailable — inserting raw");
-                model_id.push_str(match error {
-                    Failure::Timeout => ":timeout",
-                    Failure::Engine(_) => ":error",
-                });
+                model_id.push(':');
+                model_id.push_str(error.class());
                 replacement::apply(&rules, &raw)
             }
         };
@@ -1326,6 +1493,43 @@ mod tests {
     }
 
     #[test]
+    fn reformulation_budget_follows_the_measured_machine() {
+        // Unmeasured: a 20-word dictation on a slow laptop gets far more than
+        // 1.5.0's fixed 15 s, a stuck server is still cut at 2 minutes.
+        let slow = Speeds::UNMEASURED.budget(150, 34);
+        assert!(slow > Duration::from_secs(25), "{slow:?}");
+        assert_eq!(
+            Speeds::UNMEASURED.budget(100_000, 0),
+            Duration::from_secs(120)
+        );
+        // Learned from this dev machine (≈200 / 18 tok/s): the floor applies.
+        let mut speeds = Speeds::UNMEASURED;
+        speeds.learn(&serde_json::json!({
+            "prompt_n": 823, "prompt_per_second": 200.0,
+            "predicted_n": 152, "predicted_per_second": 18.0,
+        }));
+        assert_eq!(
+            speeds,
+            Speeds {
+                prompt: 200.0,
+                generation: 18.0
+            }
+        );
+        assert_eq!(speeds.budget(150, 34), Duration::from_secs(15));
+        // A 4-token primer says nothing about generation speed.
+        speeds.learn(&serde_json::json!({
+            "prompt_n": 10, "prompt_per_second": 1.0,
+            "predicted_n": 4, "predicted_per_second": 1.0,
+        }));
+        assert_eq!(speeds.generation, 18.0);
+        assert_eq!(speeds.prompt, 200.0);
+        // A timeout doubles the next budget.
+        let before = speeds.budget(2_000, 300);
+        speeds.slow_down();
+        assert!(speeds.budget(2_000, 300) > before * 3 / 2);
+    }
+
+    #[test]
     fn reformulation_that_answers_or_echoes_the_frame_is_rejected() {
         let question = "Combien font douze fois douze ?";
         assert!(reformulation_verdict(question, "Combien font douze fois douze ?").is_ok());
@@ -1537,11 +1741,11 @@ mod tests {
             .unwrap();
         runtime.block_on(async {
             let engine = LocalEngine::new();
-            engine.warm(Some(pack)).await;
             // JOT_REFORM_VOCAB="Jot;Ctrl": the Dictionary terms, as production sends them.
             let vocabulary: Vec<String> = std::env::var("JOT_REFORM_VOCAB")
                 .map(|v| v.split(';').map(str::to_string).collect())
                 .unwrap_or_default();
+            engine.warm(Some(pack), &vocabulary).await;
             for file in std::env::var("JOT_REFORM_CASES").expect("cases").split(';') {
                 let cases: Vec<serde_json::Value> =
                     serde_json::from_str(&std::fs::read_to_string(file).unwrap()).unwrap();
