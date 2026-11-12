@@ -103,7 +103,8 @@ mod win {
         // Keys go only to a text field of the target: never to a menu item.
         // JOT_PROBE_NO_UIA: `insert` into a window with no UIA text field
         // (Notepad++), trusting its own focus; the title already names our tab.
-        let no_uia = scenario == "insert" && std::env::var_os("JOT_PROBE_NO_UIA").is_some();
+        let no_uia = matches!(scenario, "insert" | "dictate")
+            && std::env::var_os("JOT_PROBE_NO_UIA").is_some();
         if !no_uia && !focus_text(hwnd, pid, args.get(2).map(String::as_str)) {
             describe();
             println!("no UIA text field focused in the target — no key sent (clean refusal)");
@@ -597,6 +598,12 @@ mod win {
             println!("dictate: target lost the foreground — stopping without it");
         }
         tap();
+        if std::env::var_os("JOT_PROBE_NO_UIA").is_some() {
+            // Nothing to read back: the caller checks the field itself.
+            std::thread::sleep(Duration::from_secs(12));
+            println!("dictate: stopped, field not readable here");
+            return;
+        }
         let started = Instant::now();
         let landed = loop {
             let line = last_line(pid);
