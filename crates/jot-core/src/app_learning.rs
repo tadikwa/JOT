@@ -258,37 +258,47 @@ fn try_anchor<F: Field>(field: &F, watch: &Watch) -> Option<(F::Element, Anchor)
     Some((element, anchor))
 }
 
-/// One observation tick. False: the observation is over.
-fn tick<F: Field>(field: &F, observation: &mut Observation<F::Element>) -> bool {
+/// One observation tick. Err: the observation is over, and why (logged).
+fn tick<F: Field>(
+    field: &F,
+    observation: &mut Observation<F::Element>,
+) -> Result<(), &'static str> {
     if std::time::Instant::now() >= observation.deadline {
-        return false;
+        return Err("window elapsed");
     }
     // Focus elsewhere, another window, a password box, a destroyed element.
     let Some(focused) = field.focused(observation.watch.target_pid) else {
-        return false;
+        return Err("focus left the field");
     };
     if !field.same(&focused, &observation.element) {
-        return false;
+        return Err("focus moved to another element");
     }
     let reach = observation.anchor.inserted.chars().count() * 2 + 2 * CONTEXT + 64;
     let Some(text) = field.read(&observation.element, reach, reach) else {
-        return false;
+        return Err("field unreadable");
     };
     let window = format!("{}{}", text.before, text.after);
     // The contexts are gone (edited, caret moved far away): stop, keeping only
     // the last stable reading.
     let Some(segment) = locate(&observation.anchor, &window, text.at_start, text.at_end) else {
-        return false;
+        return Err("segment context lost");
     };
     if observation.seen.as_ref() == Some(&segment) {
         observation.edited = (segment != observation.anchor.inserted).then(|| segment.clone());
     }
     observation.seen = Some(segment);
-    true
+    Ok(())
 }
 
-fn finish<E>(observation: Observation<E>) {
+fn finish<E>(observation: Observation<E>, why: &str) {
     let typed = key_downs() > observation.keys_at_start;
+    // Never the text: only why the watch ended and what it saw.
+    tracing::info!(
+        why,
+        edited = observation.edited.is_some(),
+        typed,
+        "correction watch: ended"
+    );
     if let Some(correction) = evidence(
         observation.watch.dictation_id,
         &observation.anchor,
@@ -318,7 +328,7 @@ fn run_with<F: Field>(field: &F, rx: std::sync::mpsc::Receiver<Command>) {
         match command {
             Ok(Command::Start(watch)) => {
                 if let Some(observation) = active.take() {
-                    finish(observation);
+                    finish(observation, "new dictation");
                 }
                 let started = std::time::Instant::now();
                 pending = Some((watch, started, key_downs()));
@@ -328,7 +338,7 @@ fn run_with<F: Field>(field: &F, rx: std::sync::mpsc::Receiver<Command>) {
                 if let Some(observation) = active.take()
                     && learn
                 {
-                    finish(observation);
+                    finish(observation, "stopped");
                 }
                 continue;
             }
@@ -338,6 +348,10 @@ fn run_with<F: Field>(field: &F, rx: std::sync::mpsc::Receiver<Command>) {
         if let Some((watch, started, keys_at_start)) = pending.take() {
             match try_anchor(field, &watch) {
                 Some((element, anchor)) => {
+                    tracing::info!(
+                        after_ms = started.elapsed().as_millis() as u64,
+                        "correction watch: anchored"
+                    );
                     active = Some(Observation {
                         watch,
                         element,
@@ -356,9 +370,9 @@ fn run_with<F: Field>(field: &F, rx: std::sync::mpsc::Receiver<Command>) {
             continue;
         }
         if let Some(observation) = active.as_mut()
-            && !tick(field, observation)
+            && let Err(why) = tick(field, observation)
         {
-            finish(active.take().expect("checked above"));
+            finish(active.take().expect("checked above"), why);
         }
     }
 }
