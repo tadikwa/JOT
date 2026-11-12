@@ -34,8 +34,36 @@ pub fn check(raw: &str, cleaned: &str) -> Result<(), &'static str> {
     if !corrects && has(&NEGATION, raw) && !has(&NEGATION, cleaned) {
         return Err("negation_lost");
     }
+    if has(&RESTRICTIVE, raw) && !has(&RESTRICTION_KEPT, cleaned) {
+        return Err("restriction_lost");
+    }
+    let qualified = RETRACTED_QUALIFIER
+        .replace_all(&raw.replace('’', "'"), "")
+        .into_owned();
+    if has(&QUALIFIER, &qualified) && !has(&QUALIFIER, cleaned) {
+        return Err("qualifier_lost");
+    }
     Ok(())
 }
+
+// A necessary condition (« uniquement si ») weakened to a plain « si » changes
+// what is allowed (1.5.1 field test). A plain « si » is not checked.
+static RESTRICTIVE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:uniquement|seulement|exclusivement) (?:si|s'|après|quand|lorsqu|une fois)|\bque si\b|\bqu'(?:à condition|après|une fois)|\bà condition (?:que|qu'|de|d')|\bsauf (?:si|s')|\bà moins (?:que|qu')|\bpourvu qu|\bonly (?:if|when|after|once)\b|\bunless\b|\bprovided (?:that )?\b|\bexcept (?:if|when)\b|\bas long as\b").unwrap()
+});
+// Any wording that still restricts, so a rephrased condition passes.
+static RESTRICTION_KEPT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:uniquement|seulement|exclusivement|que si|qu'à condition|qu'après|qu'une fois|à condition|sauf|à moins|pourvu|only|unless|provided|except|as long as)\b").unwrap()
+});
+// « pas forcément très puissant » is not « pas très puissant » (1.5.1 field test).
+static QUALIFIER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\bpas (?:forcément|nécessairement|vraiment|tout à fait|complètement|entièrement|totalement)\b|\bnot (?:necessarily|really|quite|entirely|completely|fully)\b").unwrap()
+});
+// Right after « enfin » or « non » the same words take something back
+// (« enfin pas vraiment le serveur, plutôt l'application »): they may go.
+static RETRACTED_QUALIFIER: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"(?i)\b(?:enfin|non|pardon|ou plutôt|well|sorry|or rather)\b[ ,]*(?:ce n'est |ce n'était |c'est |c'était |it's |it was )?(?:pas|not) (?:forcément|nécessairement|vraiment|tout à fait|complètement|entièrement|totalement|necessarily|really|quite|entirely|completely|fully)\b").unwrap()
+});
 
 static COLON: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)\bdeux[- ]points?\b").unwrap());
 static LIST_MARKER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?m)^\s*\d+[.)]\s").unwrap());
@@ -265,6 +293,72 @@ mod tests {
                 "Supprime le dossier backup."
             ),
             Err("negation_lost")
+        );
+        // 1.5.1 field tests: a necessary condition and a degree qualifier.
+        let only_if = "Si les sauvegardes sont terminées et uniquement si les sauvegardes sont terminées, on pourra intervenir demain.";
+        assert_eq!(
+            check(
+                only_if,
+                "Si les sauvegardes sont terminées, on pourra intervenir demain."
+            ),
+            Err("restriction_lost")
+        );
+        assert_eq!(
+            check(
+                "Ship it on Friday unless Paul objects.",
+                "Ship it on Friday, and ask Paul."
+            ),
+            Err("restriction_lost")
+        );
+        assert_eq!(
+            check(
+                "Mon ordinateur n'est pas forcément très puissant.",
+                "Mon ordinateur n'est pas très puissant."
+            ),
+            Err("qualifier_lost")
+        );
+    }
+
+    #[test]
+    fn rephrased_conditions_and_retractions_pass() {
+        let only_if = "Si les sauvegardes sont terminées et uniquement si les sauvegardes sont terminées, on pourra intervenir demain.";
+        for kept in [
+            "Uniquement si les sauvegardes sont terminées, on pourra intervenir demain.",
+            "On ne pourra intervenir demain que si les sauvegardes sont terminées.",
+            "Si, et seulement si, les sauvegardes sont terminées, on pourra intervenir demain.",
+            "On pourra intervenir demain, à condition que les sauvegardes soient terminées.",
+        ] {
+            assert_eq!(check(only_if, kept), Ok(()), "{kept}");
+        }
+        // A plain « si » is not a restriction to keep word for word.
+        assert_eq!(
+            check(
+                "Euh, si tu as le temps, regarde le rapport.",
+                "Si tu as le temps, regarde le rapport."
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check(
+                "Le portable n'est pas forcément plus rapide.",
+                "Le portable n'est pas nécessairement plus rapide."
+            ),
+            Ok(())
+        );
+        // « enfin pas vraiment le serveur » is the retraction itself: it goes.
+        assert_eq!(
+            check(
+                "Le serveur était lent, enfin pas vraiment le serveur, c'était plutôt l'application qui répondait lentement.",
+                "L'application répondait lentement."
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check(
+                "The server was slow, well, not really the server, I mean the app.",
+                "The app was slow."
+            ),
+            Ok(())
         );
     }
 
