@@ -562,7 +562,11 @@ async fn run_hotkey_grammar(
                 }
             } else {
                 processor.activation_mode = preferences.dictation_activation_mode;
-                processor.chord_binding = preferences.custom_hotkey.is_some();
+                // The hook's live binding, not the saved one: they differ until applied.
+                processor.chord_binding = matches!(
+                    hotkey_hook::active_binding(),
+                    Some(jot_core::hotkey::HotkeyBinding::Chord(chord)) if !chord.is_modifier_only()
+                );
                 processor.double_tap_lock_enabled = preferences.double_tap_lock;
                 let effects = processor.handle(event, at);
                 if let Some(window) = effects.arm_timer {

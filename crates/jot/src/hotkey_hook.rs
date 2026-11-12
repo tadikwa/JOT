@@ -40,6 +40,8 @@ static BIND_ERROR: AtomicU32 = AtomicU32::new(0);
 static CAPTURING: AtomicBool = AtomicBool::new(false);
 static CAPTURED: AtomicU64 = AtomicU64::new(0);
 static CAPTURE_READY: AtomicBool = AtomicBool::new(false);
+/// Asks the hook thread to forget stale key state before the next captured key.
+static CAPTURE_RESET: AtomicBool = AtomicBool::new(false);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BindError {
     Invalid,
@@ -58,12 +60,23 @@ pub fn prepare_binding(binding: HotkeyBinding) -> Result<(), BindError> {
     platform::rebind(binding, false)?;
     // A successful retry of the same saved shortcut must reach the apply command.
     REQUESTED_BINDING.store(0, Ordering::SeqCst);
+    // An error about an earlier request must not stick to this one.
+    BIND_ERROR.store(0, Ordering::SeqCst);
     Ok(())
 }
 pub fn start_capture() {
     CAPTURED.store(0, Ordering::SeqCst);
     CAPTURE_READY.store(false, Ordering::SeqCst);
+    CAPTURE_RESET.store(true, Ordering::SeqCst);
     CAPTURING.store(true, Ordering::SeqCst);
+}
+/// Every captured key has been released: the candidate is final until confirmed.
+pub fn capture_ready() -> bool {
+    CAPTURE_READY.load(Ordering::SeqCst)
+}
+/// The binding the hook is really listening to, which can lag the saved one.
+pub fn active_binding() -> Option<HotkeyBinding> {
+    HotkeyBinding::decode(HOTKEY_BINDING.load(Ordering::SeqCst))
 }
 pub fn stop_capture() {
     CAPTURING.store(false, Ordering::SeqCst);
@@ -161,6 +174,11 @@ impl Decision {
 }
 const VK_ESCAPE: u32 = 0x1B;
 const VK_SPACE: u32 = 0x20;
+const VK_CAPITAL: u32 = 0x14;
+/// The fake left Ctrl that AltGr sends on AZERTY and other AltGr layouts. Kept
+/// apart so it counts as Ctrl for Ctrl+Alt+key (as Windows sees it) but never
+/// as the physical left Ctrl of a modifier-only shortcut.
+const ALTGR_CTRL: u32 = 0x100;
 /// Bare modifiers are not "another key was typed": holding Shift to capitalise
 /// mid-dictation must not read as an accidental chord.
 fn is_modifier(vk: u32) -> bool {
@@ -171,6 +189,7 @@ fn is_modifier(vk: u32) -> bool {
             ..=0xA5   // sided shift, control, alt
             | 0x5B | 0x5C   // VK_LWIN / VK_RWIN
             | 0x14 // VK_CAPITAL
+            | ALTGR_CTRL
     )
 }
 /// The hook policy, testable without a message loop.
@@ -224,28 +243,103 @@ fn classify(
 }
 /// Physical edges are the single event source, even for registered chords.
 struct PhysicalKeyboard {
-    down: [bool; 256],
+    down: [bool; 257],
     bare_pressed: Option<HotkeyKey>,
     chord_pressed: Option<HotkeyChord>,
     owned_main: Option<u32>,
+    /// Capture: every sided modifier pressed, and the first other key.
+    capture_sided: u32,
+    capture_main: Option<HotkeyChord>,
 }
 impl Default for PhysicalKeyboard {
     fn default() -> Self {
         Self {
-            down: [false; 256],
+            down: [false; 257],
             bare_pressed: None,
             chord_pressed: None,
             owned_main: None,
+            capture_sided: 0,
+            capture_main: None,
         }
     }
 }
 impl PhysicalKeyboard {
     fn modifiers(&self) -> u32 {
-        let any = |keys: &[usize]| keys.iter().any(|key| self.down[*key]);
+        let any = |keys: &[u32]| keys.iter().any(|key| self.down[*key as usize]);
         (u32::from(any(&[0x12, 0xA4, 0xA5])) * HotkeyChord::ALT)
-            | (u32::from(any(&[0x11, 0xA2, 0xA3])) * HotkeyChord::CTRL)
+            | (u32::from(any(&[0x11, 0xA2, 0xA3, ALTGR_CTRL])) * HotkeyChord::CTRL)
             | (u32::from(any(&[0x10, 0xA0, 0xA1])) * HotkeyChord::SHIFT)
             | (u32::from(any(&[0x5B, 0x5C])) * HotkeyChord::WIN)
+    }
+    fn sided(&self) -> u32 {
+        HotkeyChord::SIDES
+            .iter()
+            .filter(|(_, vk)| self.down[*vk as usize])
+            .fold(0, |bits, (bit, _)| bits | bit)
+    }
+    fn holds(&self, chord: HotkeyChord) -> bool {
+        let held = if chord.is_modifier_only() {
+            self.sided()
+        } else {
+            self.modifiers()
+        };
+        held & chord.modifiers == chord.modifiers
+    }
+    fn captured(&self) -> HotkeyBinding {
+        match self.capture_main {
+            Some(main) if main.vk == VK_CAPITAL && main.modifiers == 0 => {
+                HotkeyBinding::Bare(HotkeyKey::CapsLock)
+            }
+            Some(main) => HotkeyBinding::Chord(main),
+            None => HotkeyChord::SIDES
+                .iter()
+                .find(|(bit, _)| *bit == self.capture_sided)
+                .and_then(|(_, vk)| HotkeyKey::from_vk(*vk))
+                .map(HotkeyBinding::Bare)
+                .unwrap_or(HotkeyBinding::Chord(HotkeyChord {
+                    modifiers: self.capture_sided,
+                    vk: 0,
+                })),
+        }
+    }
+    /// A key-up can be lost to the secure desktop (Win+L, Ctrl+Alt+Del, UAC).
+    /// A modifier left "down" here would block every chord and taint captures,
+    /// so modifiers Windows no longer reports as held are released.
+    /// shortcut: relies on GetAsyncKeyState being current for keys other than
+    /// the one in flight; swallowed keys are skipped because Windows never saw them.
+    fn forget_released(
+        &mut self,
+        current: u32,
+        still_down: impl Fn(u32) -> bool,
+    ) -> Option<HotkeyEvent> {
+        let swallowed = self
+            .bare_pressed
+            .filter(|key| key.must_suppress())
+            .map(HotkeyKey::vk_code);
+        for vk in [0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0x5B, 0x5C, ALTGR_CTRL] {
+            // The AltGr fake Ctrl shows in the async state as left Ctrl.
+            let windows_vk = if vk == ALTGR_CTRL { 0xA2 } else { vk };
+            if vk != current
+                && Some(vk) != swallowed
+                && self.down[vk as usize]
+                && !still_down(windows_vk)
+            {
+                self.down[vk as usize] = false;
+            }
+        }
+        if let Some(key) = self.bare_pressed
+            && !self.down[key.vk_code() as usize]
+        {
+            self.bare_pressed = None;
+            return Some(HotkeyEvent::HotkeyUp);
+        }
+        if let Some(chord) = self.chord_pressed
+            && !self.holds(chord)
+        {
+            self.chord_pressed = None;
+            return Some(HotkeyEvent::HotkeyUp);
+        }
+        None
     }
     fn handle(
         &mut self,
@@ -255,30 +349,36 @@ impl PhysicalKeyboard {
         cancel: bool,
         space: bool,
     ) -> Decision {
+        let capturing = CAPTURING.load(Ordering::SeqCst);
+        if capturing && CAPTURE_RESET.swap(false, Ordering::SeqCst) {
+            self.down = [false; 257];
+            self.capture_sided = 0;
+            self.capture_main = None;
+        }
         let Some(key) = self.down.get_mut(vk as usize) else {
             return Decision::IGNORE;
         };
         let repeat = *key && is_down;
         *key = is_down;
-        if CAPTURING.load(Ordering::SeqCst) {
+        if capturing {
             if CAPTURE_READY.load(Ordering::SeqCst) && vk != VK_ESCAPE {
                 // Let Tab/Enter navigate the confirmation controls, without arming dictation.
                 return Decision::IGNORE;
             }
             if vk == VK_ESCAPE && is_down {
                 CAPTURED.store(u64::MAX, Ordering::SeqCst);
-            } else if CAPTURED.load(Ordering::SeqCst) == 0 {
-                if is_down && !repeat && !is_modifier(vk) {
-                    CAPTURED.store(
-                        HotkeyBinding::Chord(HotkeyChord {
-                            vk,
-                            modifiers: self.modifiers(),
-                        })
-                        .encode(),
-                        Ordering::SeqCst,
-                    );
-                } else if !is_down && let Some(key) = HotkeyKey::from_vk(vk) {
-                    CAPTURED.store(HotkeyBinding::Bare(key).encode(), Ordering::SeqCst);
+            } else if is_down && !repeat && CAPTURED.load(Ordering::SeqCst) != u64::MAX {
+                if let Some(bit) = HotkeyChord::sided_bit(vk) {
+                    self.capture_sided |= bit;
+                } else if vk != ALTGR_CTRL && self.capture_main.is_none() {
+                    self.capture_main = Some(HotkeyChord {
+                        vk,
+                        modifiers: self.modifiers(),
+                    });
+                }
+                // Live preview: the candidate grows while keys are held.
+                if self.capture_sided != 0 || self.capture_main.is_some() {
+                    CAPTURED.store(self.captured().encode(), Ordering::SeqCst);
                 }
             }
             if CAPTURED.load(Ordering::SeqCst) != 0 && self.down.iter().all(|down| !down) {
@@ -289,9 +389,15 @@ impl PhysicalKeyboard {
                 swallow: true,
             };
         }
+        // A bare key pressed before a rebind keeps its release on the bare path,
+        // or the grammar would wait for that release forever.
+        let bare = match binding {
+            Some(HotkeyBinding::Bare(key)) => Some(key),
+            _ => None,
+        };
         if self.chord_pressed.is_none()
             && self.owned_main.is_none()
-            && let Some(HotkeyBinding::Bare(key)) = binding
+            && let Some(key) = self.bare_pressed.or(bare)
         {
             return classify(vk, is_down, key, &mut self.bare_pressed, cancel, space);
         }
@@ -300,14 +406,24 @@ impl PhysicalKeyboard {
             self.owned_main = None;
         }
         if let Some(chord) = self.chord_pressed {
-            if !is_down && (vk == chord.vk || self.modifiers() & chord.modifiers != chord.modifiers)
-            {
+            if !is_down && (vk == chord.vk || !self.holds(chord)) {
                 self.chord_pressed = None;
                 return Decision {
                     event: Some(HotkeyEvent::HotkeyUp),
                     swallow: owned,
                 };
             }
+        } else if !repeat
+            && is_down
+            && self.owned_main.is_none()
+            && let Some(HotkeyBinding::Chord(chord)) = binding
+            && chord.is_modifier_only()
+            && HotkeyChord::sided_bit(vk).is_some()
+            && self.sided() == chord.modifiers
+        {
+            // Modifiers pass through: other apps still see an ordinary chord.
+            self.chord_pressed = Some(chord);
+            return Decision::pass(HotkeyEvent::HotkeyDown);
         } else if !repeat
             && is_down
             && self.owned_main.is_none()
@@ -326,6 +442,22 @@ impl PhysicalKeyboard {
                 swallow: true,
             };
         }
+        // Modifier-only chords follow the bare-key grammar: Space locks, and a
+        // typed key (Ctrl+Maj+T) is an accidental chord.
+        let modifier_only = match (self.chord_pressed, binding) {
+            (Some(chord), _) | (None, Some(HotkeyBinding::Chord(chord))) => {
+                chord.is_modifier_only()
+            }
+            _ => false,
+        };
+        if modifier_only && is_down && vk != VK_ESCAPE {
+            if vk == VK_SPACE && space && self.chord_pressed.is_some() {
+                return Decision::eat(HotkeyEvent::SpaceLock);
+            }
+            if !is_modifier(vk) {
+                return Decision::pass(HotkeyEvent::OtherKeyDown);
+            }
+        }
         if is_down && vk == VK_ESCAPE {
             return if cancel {
                 Decision::eat(HotkeyEvent::EscDown)
@@ -343,7 +475,7 @@ mod platform {
     use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
     use windows::Win32::System::Threading::GetCurrentThreadId;
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        HOT_KEY_MODIFIERS, RegisterHotKey, UnregisterHotKey,
+        GetAsyncKeyState, HOT_KEY_MODIFIERS, RegisterHotKey, UnregisterHotKey,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG,
@@ -388,7 +520,10 @@ mod platform {
                     let _ = UnregisterHotKey(None, id);
                 }
             }
-            let id = if let HotkeyBinding::Chord(chord) = binding {
+            // Modifier-only chords have no key for Windows to reserve; the hook alone owns them.
+            let id = if let HotkeyBinding::Chord(chord) = binding
+                && !chord.is_modifier_only()
+            {
                 let id = if self.active.and_then(|entry| entry.1) == Some(0x4A01) {
                     0x4A02
                 } else {
@@ -513,9 +648,24 @@ mod platform {
         if !is_down && message != WM_KEYUP && message != WM_SYSKEYUP {
             return unsafe { CallNextHookEx(None, code, wparam, lparam) };
         }
+        // AltGr = fake left Ctrl (scan code 0x21D) + right Alt.
+        let vk = if info.vkCode == 0xA2 && info.scanCode == 0x21D {
+            ALTGR_CTRL
+        } else {
+            info.vkCode
+        };
         let decision = KEYBOARD.with(|keyboard| {
-            keyboard.borrow_mut().handle(
-                info.vkCode,
+            let mut keyboard = keyboard.borrow_mut();
+            if is_down
+                && !CAPTURING.load(Ordering::SeqCst)
+                && let Some(event) = keyboard.forget_released(vk, |vk| {
+                    (unsafe { GetAsyncKeyState(vk as i32) }) as u16 & 0x8000 != 0
+                })
+            {
+                emit(event);
+            }
+            keyboard.handle(
+                vk,
                 is_down,
                 HotkeyBinding::decode(HOTKEY_BINDING.load(Ordering::SeqCst)),
                 CANCEL_ENABLED.load(Ordering::SeqCst),
@@ -599,6 +749,44 @@ mod platform {
                 activated,
                 "same shortcut must become active after its conflict is cleared"
             );
+        }
+
+        #[test]
+        fn save_reset_loop_always_activates_the_latest_choice() {
+            let _guard = NATIVE_HOTKEY_LOCK.lock().unwrap();
+            let chord = HotkeyBinding::Chord(HotkeyChord {
+                modifiers: 7,
+                vk: 0x87,
+            });
+            let modifier_only = HotkeyBinding::Chord(HotkeyChord {
+                modifiers: 0x800 | 0x2000,
+                vk: 0,
+            });
+            let default = HotkeyBinding::Bare(HotkeyKey::default());
+            let mut reservations = Registrations::default();
+            for _ in 0..3 {
+                for binding in [
+                    chord,
+                    default,
+                    modifier_only,
+                    default,
+                    HotkeyBinding::Bare(HotkeyKey::RightWin),
+                ] {
+                    reservations.prepare(binding).unwrap();
+                    reservations.apply(binding).unwrap();
+                    assert_eq!(reservations.active.unwrap().0, binding);
+                    assert_eq!(
+                        reservations.active.unwrap().1.is_some(),
+                        binding == chord,
+                        "only key chords reserve a Windows hotkey"
+                    );
+                }
+            }
+            drop(reservations);
+            unsafe {
+                RegisterHotKey(None, 0x4A13, HOT_KEY_MODIFIERS(7 | 0x4000), 0x87).unwrap();
+                UnregisterHotKey(None, 0x4A13).unwrap();
+            }
         }
 
         #[test]
@@ -995,6 +1183,348 @@ mod chord_tests {
                 .map(|event| processor.handle(event, Duration::from_millis(3)).intents),
             Some(vec![HotkeyIntent::Finalize])
         );
+    }
+
+    const RCTRL: u32 = 0xA3;
+    const RALT: u32 = 0xA5;
+    const RSHIFT: u32 = 0xA1;
+    const LWIN: u32 = 0x5B;
+    const RWIN: u32 = 0x5C;
+    const D: u32 = 0x44;
+    fn sided(modifiers: u32) -> HotkeyBinding {
+        HotkeyBinding::Chord(HotkeyChord { modifiers, vk: 0 })
+    }
+    fn feed(
+        keyboard: &mut PhysicalKeyboard,
+        processor: &mut HotkeyProcessor,
+        binding: HotkeyBinding,
+        start: u64,
+        keys: &[(u32, bool)],
+    ) -> Vec<HotkeyIntent> {
+        let mut intents = Vec::new();
+        for (at, (vk, down)) in keys.iter().enumerate() {
+            if let Some(event) = keyboard.handle(*vk, *down, Some(binding), true, true).event {
+                intents.extend(
+                    processor
+                        .handle(event, Duration::from_millis(start + at as u64 * 400))
+                        .intents,
+                );
+            }
+        }
+        intents
+    }
+
+    #[test]
+    fn bare_release_survives_a_rebind_to_a_chord() {
+        // Before the fix the release went to the chord path: the grammar kept
+        // the key "down" forever and never applied another shortcut.
+        let _guard = CAPTURE_TEST_LOCK.lock().unwrap();
+        let mut keyboard = PhysicalKeyboard::default();
+        let bare = HotkeyBinding::Bare(HotkeyKey::RightControl);
+        assert_eq!(
+            keyboard.handle(RCTRL, true, Some(bare), false, false).event,
+            Some(HotkeyEvent::HotkeyDown)
+        );
+        assert_eq!(
+            keyboard
+                .handle(RCTRL, false, Some(BINDING), false, false)
+                .event,
+            Some(HotkeyEvent::HotkeyUp)
+        );
+        keyboard.handle(CTRL, true, Some(BINDING), false, false);
+        keyboard.handle(ALT, true, Some(BINDING), false, false);
+        assert_eq!(
+            keyboard.handle(E, true, Some(BINDING), false, false).event,
+            Some(HotkeyEvent::HotkeyDown)
+        );
+    }
+
+    #[test]
+    fn a_key_up_lost_to_the_lock_screen_is_forgotten() {
+        let _guard = CAPTURE_TEST_LOCK.lock().unwrap();
+        let mut keyboard = PhysicalKeyboard::default();
+        // Win+L: Windows switches to the secure desktop and the hook never sees Win go up.
+        keyboard.handle(LWIN, true, Some(BINDING), false, false);
+        keyboard.handle(0x4C, true, Some(BINDING), false, false);
+        keyboard.handle(0x4C, false, Some(BINDING), false, false);
+        keyboard.handle(CTRL, true, Some(BINDING), false, false);
+        keyboard.handle(ALT, true, Some(BINDING), false, false);
+        assert_eq!(
+            keyboard.handle(E, true, Some(BINDING), false, false).event,
+            None,
+            "the phantom Win blocks the chord"
+        );
+        keyboard.handle(E, false, Some(BINDING), false, false);
+        let held = |vk| vk == CTRL || vk == ALT;
+        assert_eq!(keyboard.forget_released(E, held), None);
+        assert_eq!(
+            keyboard.handle(E, true, Some(BINDING), false, false).event,
+            Some(HotkeyEvent::HotkeyDown)
+        );
+        // A bare key whose release was lost is released on the next keystroke.
+        let mut keyboard = PhysicalKeyboard::default();
+        let bare = HotkeyBinding::Bare(HotkeyKey::RightControl);
+        keyboard.handle(RCTRL, true, Some(bare), false, false);
+        assert_eq!(keyboard.forget_released(0x41, |vk| vk == RCTRL), None);
+        assert_eq!(
+            keyboard.forget_released(0x41, |_| false),
+            Some(HotkeyEvent::HotkeyUp)
+        );
+        // Swallowed keys never reach the async state, so they are kept.
+        let caps = HotkeyBinding::Bare(HotkeyKey::RightWin);
+        keyboard.handle(RWIN, true, Some(caps), false, false);
+        assert_eq!(keyboard.forget_released(0x41, |_| false), None);
+        assert!(keyboard.down[RWIN as usize]);
+    }
+
+    #[test]
+    fn modifier_only_chords_hold_toggle_and_repeat() {
+        let _guard = CAPTURE_TEST_LOCK.lock().unwrap();
+        for (binding, first, second) in [
+            (sided(0x800 | 0x2000), RALT, RSHIFT), // Alt droit + Maj droite
+            (sided(0x4000 | 0x400), LWIN, ALT),    // Windows gauche + Alt gauche
+            (sided(0x100 | 0x1000), CTRL, SHIFT),  // Ctrl gauche + Maj gauche
+        ] {
+            let mut keyboard = PhysicalKeyboard::default();
+            let mut processor = HotkeyProcessor::new();
+            let down = keyboard.handle(first, true, Some(binding), true, false);
+            assert_eq!(down, Decision::IGNORE);
+            let down = keyboard.handle(second, true, Some(binding), true, false);
+            assert_eq!(
+                down,
+                Decision::pass(HotkeyEvent::HotkeyDown),
+                "modifiers pass through"
+            );
+            assert_eq!(
+                keyboard.handle(second, true, Some(binding), true, false),
+                Decision::IGNORE,
+                "auto-repeat is not a new press"
+            );
+            assert_eq!(
+                processor
+                    .handle(HotkeyEvent::HotkeyDown, Duration::ZERO)
+                    .intents,
+                vec![HotkeyIntent::Begin]
+            );
+            let up = keyboard.handle(first, false, Some(binding), true, false);
+            assert_eq!(up, Decision::pass(HotkeyEvent::HotkeyUp));
+            assert_eq!(
+                processor
+                    .handle(HotkeyEvent::HotkeyUp, Duration::from_millis(900))
+                    .intents,
+                vec![HotkeyIntent::Finalize]
+            );
+            assert_eq!(
+                keyboard
+                    .handle(second, false, Some(binding), true, false)
+                    .event,
+                None
+            );
+            // Toggle: press/release starts, the next press stops.
+            processor.activation_mode = DictationActivationMode::Toggle;
+            let keys = [
+                (first, true),
+                (second, true),
+                (second, false),
+                (first, false),
+            ];
+            assert_eq!(
+                feed(&mut keyboard, &mut processor, binding, 2_000, &keys),
+                vec![HotkeyIntent::Begin, HotkeyIntent::LockIn]
+            );
+            assert_eq!(
+                feed(&mut keyboard, &mut processor, binding, 5_000, &keys),
+                vec![HotkeyIntent::Finalize]
+            );
+            assert!(!processor.is_session_active());
+        }
+    }
+
+    #[test]
+    fn modifier_only_chords_need_the_exact_keys_and_follow_the_bare_grammar() {
+        let _guard = CAPTURE_TEST_LOCK.lock().unwrap();
+        let binding = sided(0x800 | 0x2000);
+        let mut keyboard = PhysicalKeyboard::default();
+        // Left Shift instead of right, or an extra Ctrl, is not the shortcut.
+        keyboard.handle(RALT, true, Some(binding), true, true);
+        assert_eq!(
+            keyboard
+                .handle(SHIFT, true, Some(binding), true, true)
+                .event,
+            None
+        );
+        keyboard.handle(SHIFT, false, Some(binding), true, true);
+        keyboard.handle(CTRL, true, Some(binding), true, true);
+        assert_eq!(
+            keyboard
+                .handle(RSHIFT, true, Some(binding), true, true)
+                .event,
+            None
+        );
+        for vk in [RSHIFT, CTRL, RALT] {
+            keyboard.handle(vk, false, Some(binding), true, true);
+        }
+        // Held: Space locks (eaten), a typed key reads as an accidental chord (passed).
+        keyboard.handle(RALT, true, Some(binding), true, true);
+        keyboard.handle(RSHIFT, true, Some(binding), true, true);
+        assert_eq!(
+            keyboard.handle(VK_SPACE, true, Some(binding), true, true),
+            Decision::eat(HotkeyEvent::SpaceLock)
+        );
+        assert_eq!(
+            keyboard.handle(0x54, true, Some(binding), true, true),
+            Decision::pass(HotkeyEvent::OtherKeyDown)
+        );
+        assert_eq!(
+            keyboard.handle(VK_ESCAPE, true, Some(binding), true, true),
+            Decision::eat(HotkeyEvent::EscDown)
+        );
+        let mut processor = HotkeyProcessor::new();
+        processor.handle(HotkeyEvent::HotkeyDown, Duration::ZERO);
+        assert_eq!(
+            processor
+                .handle(HotkeyEvent::OtherKeyDown, Duration::from_millis(100))
+                .intents,
+            vec![HotkeyIntent::AbortAccidental]
+        );
+    }
+
+    #[test]
+    fn altgr_is_right_alt_alone_and_ctrl_alt_with_a_key() {
+        let _guard = CAPTURE_TEST_LOCK.lock().unwrap();
+        // Bare Right Alt on AZERTY: the fake Ctrl is a modifier, not "another key".
+        let bare = HotkeyBinding::Bare(HotkeyKey::RightAlt);
+        let mut keyboard = PhysicalKeyboard::default();
+        assert_eq!(
+            keyboard.handle(ALTGR_CTRL, true, Some(bare), true, false),
+            Decision::IGNORE
+        );
+        assert_eq!(
+            keyboard.handle(RALT, true, Some(bare), true, false).event,
+            Some(HotkeyEvent::HotkeyDown)
+        );
+        keyboard.handle(ALTGR_CTRL, false, Some(bare), true, false);
+        keyboard.handle(RALT, false, Some(bare), true, false);
+        // AltGr+E is what Windows calls Ctrl+Alt+E.
+        let mut keyboard = PhysicalKeyboard::default();
+        keyboard.handle(ALTGR_CTRL, true, Some(BINDING), true, false);
+        keyboard.handle(RALT, true, Some(BINDING), true, false);
+        assert_eq!(
+            keyboard.handle(E, true, Some(BINDING), true, false).event,
+            Some(HotkeyEvent::HotkeyDown)
+        );
+        // ...but never the physical left Ctrl of a modifier-only shortcut.
+        let mut keyboard = PhysicalKeyboard::default();
+        let binding = sided(0x100 | 0x800);
+        keyboard.handle(ALTGR_CTRL, true, Some(binding), true, false);
+        assert_eq!(
+            keyboard
+                .handle(RALT, true, Some(binding), true, false)
+                .event,
+            None
+        );
+    }
+
+    #[test]
+    fn system_shortcuts_are_never_swallowed() {
+        let _guard = CAPTURE_TEST_LOCK.lock().unwrap();
+        let tab = 0x09;
+        let f4 = 0x73;
+        let del = 0x2E;
+        let f12 = 0x7B;
+        let reserved: [&[u32]; 10] = [
+            &[LWIN, 0x4C],
+            &[LWIN, 0x44],
+            &[LWIN, 0x45],
+            &[LWIN, 0x52],
+            &[LWIN, tab],
+            &[ALT, tab],
+            &[ALT, f4],
+            &[CTRL, ALT, del],
+            &[f12],
+            &[LWIN, ALT, 0x52],
+        ];
+        for binding in [
+            HotkeyBinding::Bare(HotkeyKey::RightControl),
+            HotkeyBinding::Bare(HotkeyKey::RightWin),
+            BINDING,
+            HotkeyBinding::Chord(HotkeyChord {
+                modifiers: 6,
+                vk: D,
+            }),
+            sided(0x800 | 0x2000),
+            sided(0x4000 | 0x400),
+        ] {
+            for keys in reserved {
+                let mut keyboard = PhysicalKeyboard::default();
+                for (vk, down) in keys
+                    .iter()
+                    .map(|vk| (*vk, true))
+                    .chain(keys.iter().rev().map(|vk| (*vk, false)))
+                {
+                    assert!(
+                        !keyboard
+                            .handle(vk, down, Some(binding), false, false)
+                            .swallow,
+                        "{binding:?} swallowed {vk:#x} of {keys:x?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn capture_previews_live_and_records_every_shortcut_shape() {
+        let _guard = CAPTURE_TEST_LOCK.lock().unwrap();
+        let chord = |modifiers, vk| Some(Ok(HotkeyBinding::Chord(HotkeyChord { modifiers, vk })));
+        let bare = |key| Some(Ok(HotkeyBinding::Bare(key)));
+        let cases: [(&[u32], _); 9] = [
+            (&[RCTRL], bare(HotkeyKey::RightControl)),
+            (&[RWIN], bare(HotkeyKey::RightWin)),
+            (&[0x14], bare(HotkeyKey::CapsLock)),
+            (&[CTRL, SHIFT, D], chord(6, D)),
+            (&[RALT, RSHIFT], chord(0x800 | 0x2000, 0)),
+            (&[LWIN, ALT], chord(0x4000 | 0x400, 0)),
+            (&[RALT, VK_SPACE], chord(HotkeyChord::ALT, VK_SPACE)),
+            (&[ALTGR_CTRL, RALT], bare(HotkeyKey::RightAlt)),
+            (&[ALTGR_CTRL, RALT, E], chord(3, E)),
+        ];
+        // A modifier stuck from before the capture must not leak into it.
+        let mut keyboard = PhysicalKeyboard::default();
+        keyboard.handle(LWIN, true, Some(BINDING), false, false);
+        for (keys, expected) in cases {
+            start_capture();
+            for (index, vk) in keys.iter().enumerate() {
+                let decision = keyboard.handle(*vk, true, Some(BINDING), false, false);
+                assert!(
+                    decision.swallow && decision.event.is_none(),
+                    "capture never arms dictation"
+                );
+                if index == 0 && *vk != ALTGR_CTRL {
+                    assert!(
+                        captured_binding().is_some(),
+                        "live preview from the first key"
+                    );
+                }
+            }
+            assert_eq!(captured_binding(), expected, "{keys:x?}");
+            assert!(!capture_ready(), "not final while keys are held");
+            for vk in keys.iter().rev() {
+                keyboard.handle(*vk, false, Some(BINDING), false, false);
+            }
+            assert!(capture_ready(), "{keys:x?}");
+            assert_eq!(captured_binding(), expected);
+            stop_capture();
+        }
+        start_capture();
+        keyboard.handle(CTRL, true, Some(BINDING), false, false);
+        keyboard.handle(CTRL, false, Some(BINDING), false, false);
+        assert_eq!(
+            captured_binding(),
+            chord(0x100, 0),
+            "kept so the UI can explain it"
+        );
+        stop_capture();
     }
     #[test]
     fn capture_requires_confirmation_allows_keyboard_navigation_and_escape() {

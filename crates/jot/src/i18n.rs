@@ -141,13 +141,34 @@ pub fn hotkey(key: HotkeyKey) -> &'static str {
 }
 
 pub fn hotkey_binding(binding: HotkeyBinding) -> String {
-    let HotkeyBinding::Chord(chord) = binding else {
-        let HotkeyBinding::Bare(key) = binding else {
-            unreachable!()
-        };
-        return hotkey(key).to_string();
+    let chord = match binding {
+        HotkeyBinding::Bare(key) if key == HotkeyKey::default() => {
+            return LocalizedText::with(Msg::DefaultShortcutLabel, &[&hotkey(key)])
+                .render()
+                .to_string();
+        }
+        HotkeyBinding::Bare(key) => return hotkey(key).to_string(),
+        HotkeyBinding::Chord(chord) => chord,
     };
     let mut parts = Vec::new();
+    if chord.is_modifier_only() {
+        // Sided names: the side is part of a modifier-only shortcut.
+        for ((bit, _), name) in HotkeyChord::SIDES.iter().zip([
+            Msg::LeftCtrl,
+            Msg::RightCtrl,
+            Msg::LeftAlt,
+            Msg::RightAlt,
+            Msg::LeftShift,
+            Msg::RightShift,
+            Msg::LeftWin,
+            Msg::RightWin,
+        ]) {
+            if chord.modifiers & bit != 0 {
+                parts.push(tr(name).to_string());
+            }
+        }
+        return parts.join(" + ");
+    }
     if chord.modifiers & HotkeyChord::CTRL != 0 {
         parts.push("Ctrl".to_string());
     }
@@ -160,13 +181,50 @@ pub fn hotkey_binding(binding: HotkeyBinding) -> String {
     if chord.modifiers & HotkeyChord::WIN != 0 {
         parts.push("Windows".to_string());
     }
-    parts.push(match chord.vk {
-        0x20 => tr(Msg::SpaceKey).to_string(),
-        0x30..=0x39 | 0x41..=0x5A => char::from_u32(chord.vk).unwrap().to_string(),
-        0x70..=0x87 => format!("F{}", chord.vk - 0x6f),
-        _ => format!("VK {:02X}", chord.vk),
-    });
+    parts.push(key_name(chord.vk));
     parts.join(" + ")
+}
+
+fn key_name(vk: u32) -> String {
+    let fr = locale() == Locale::Fr;
+    let named = |en: &str, french: &str| if fr { french } else { en }.to_string();
+    match vk {
+        0x20 => tr(Msg::SpaceKey).to_string(),
+        0x21 => named("Page Up", "Page préc."),
+        0x22 => named("Page Down", "Page suiv."),
+        0x23 => named("End", "Fin"),
+        0x24 => named("Home", "Origine"),
+        0x25 => "←".into(),
+        0x26 => "↑".into(),
+        0x27 => "→".into(),
+        0x28 => "↓".into(),
+        0x2D => named("Insert", "Inser"),
+        0x2E => named("Delete", "Suppr"),
+        0x30..=0x39 | 0x41..=0x5A => char::from_u32(vk).unwrap().to_string(),
+        0x60..=0x69 => format!("{} {}", named("Num", "Pavé num."), vk - 0x60),
+        0x6A..=0x6F => format!(
+            "{} {}",
+            named("Num", "Pavé num."),
+            ["*", "+", "Sep", "-", ".", "/"][(vk - 0x6A) as usize]
+        ),
+        0x70..=0x87 => format!("F{}", vk - 0x6f),
+        _ => layout_char(vk).unwrap_or_else(|| format!("VK {vk:02X}")),
+    }
+}
+
+/// Punctuation keys move between layouts; show what this keyboard prints.
+#[cfg(target_os = "windows")]
+fn layout_char(vk: u32) -> Option<String> {
+    use windows::Win32::UI::Input::KeyboardAndMouse::{MAPVK_VK_TO_CHAR, MapVirtualKeyW};
+    let code = unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_CHAR) } & 0x7FFF;
+    char::from_u32(code)
+        .filter(|c| !c.is_control() && *c != '\0')
+        .map(|c| c.to_uppercase().to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn layout_char(_: u32) -> Option<String> {
+    None
 }
 
 #[cfg(test)]

@@ -24,7 +24,7 @@ use gpui::{AnyElement, Context, Entity, Role, SharedString, Window, div, prelude
 use jot_core::audio;
 use jot_core::credentials;
 use jot_core::gemini::KeyCheck;
-use jot_core::hotkey::{DictationActivationMode, HotkeyBinding, HotkeyKey};
+use jot_core::hotkey::{ChordProblem, DictationActivationMode, HotkeyBinding, HotkeyKey};
 use jot_core::local::{self, Download, Pack};
 use jot_core::settings::{
     LocalReformulation, LocalUnload, Settings, TranscriptionEngine, UiLanguage, UiTheme,
@@ -333,27 +333,57 @@ impl SettingsView {
     fn save_hotkey(&mut self, binding: HotkeyBinding, cx: &mut Context<Self>) {
         use crate::hotkey_hook::{self, BindError};
         let result = hotkey_hook::prepare_binding(binding);
-        self.hotkey_status = Some(match result {
-            Err(error) => (
+        self.hotkey_status = match result {
+            Err(error) => Some((
                 match error {
-                    BindError::Invalid => Msg::ShortcutInvalid,
+                    BindError::Invalid => {
+                        capture_problem(binding).unwrap_or(Msg::ShortcutUnsupportedKey)
+                    }
                     BindError::Conflict => Msg::ShortcutConflict,
                     BindError::Unavailable => Msg::ShortcutUnavailable,
                 },
                 StatusTone::Bad,
-            ),
+            )),
             Ok(()) => {
                 if self.services.settings.set_hotkey_binding(binding).is_err() {
                     let _ =
                         hotkey_hook::prepare_binding(self.services.settings.get().hotkey_binding());
-                    (Msg::ShortcutSaveFailed, StatusTone::Bad)
+                    Some((Msg::ShortcutSaveFailed, StatusTone::Bad))
                 } else {
                     self.cancel_hotkey_capture();
-                    (Msg::ShortcutSaved, StatusTone::Good)
+                    self.watch_hotkey(cx);
+                    None
                 }
             }
-        });
+        };
         cx.notify();
+    }
+
+    /// Repaint until the saved shortcut is really active (or failed): it waits
+    /// for the end of a dictation in flight.
+    fn watch_hotkey(&mut self, cx: &mut Context<Self>) {
+        let executor = cx.background_executor().clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                executor.timer(Duration::from_millis(200)).await;
+                let pending = this
+                    .update(cx, |this, cx| {
+                        cx.notify();
+                        let saved = this.services.settings.get().hotkey_binding();
+                        shortcut_state(
+                            saved,
+                            crate::hotkey_hook::active_binding(),
+                            crate::hotkey_hook::binding_error(),
+                        )
+                        .0 == Msg::ShortcutPending
+                    })
+                    .unwrap_or(false);
+                if !pending {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn delete_all(&mut self, cx: &mut Context<Self>) {
@@ -678,12 +708,13 @@ impl SettingsView {
                                     "record-hotkey",
                                     tr(Msg::RecordShortcut),
                                     ButtonKind::Secondary,
-                                    !self.capturing_hotkey
-                                        && matches!(
-                                            self.services.coordinator.state(),
-                                            jot_core::state_machine::DictationState::Idle
-                                                | jot_core::state_machine::DictationState::Done(_)
-                                        ),
+                                    // Cancelled and Failed persist until the next dictation:
+                                    // they must not lock the shortcut editor.
+                                    !self.capturing_hotkey && {
+                                        let state = self.services.coordinator.state();
+                                        state == jot_core::state_machine::DictationState::Idle
+                                            || state.is_terminal()
+                                    },
                                     theme,
                                     cx.listener(|this, _, _, cx| this.record_hotkey(cx)),
                                 ))
@@ -709,9 +740,26 @@ impl SettingsView {
                                     StatusTone::Neutral,
                                     theme,
                                 ))
-                                .when_some(self.captured_hotkey, |column, binding| {
-                                    column.child(div().child(crate::i18n::hotkey_binding(binding)))
-                                })
+                                .child(
+                                    div()
+                                        .id("captured-hotkey")
+                                        .text_size(theme::type_scale::BODY)
+                                        .child(match self.captured_hotkey {
+                                            Some(binding) => crate::i18n::hotkey_binding(binding),
+                                            None => tr(Msg::ShortcutWaitingKeys).to_string(),
+                                        }),
+                                )
+                                .when_some(
+                                    self.captured_hotkey.and_then(capture_note),
+                                    |column, (message, tone)| {
+                                        column.child(widgets::status_line(
+                                            "captured-hotkey-note",
+                                            tr(message),
+                                            tone,
+                                            theme,
+                                        ))
+                                    },
+                                )
                                 .child(
                                     div()
                                         .flex()
@@ -721,7 +769,10 @@ impl SettingsView {
                                             "confirm-hotkey",
                                             tr(Msg::ConfirmShortcut),
                                             ButtonKind::Primary,
-                                            self.captured_hotkey.is_some(),
+                                            crate::hotkey_hook::capture_ready()
+                                                && self
+                                                    .captured_hotkey
+                                                    .is_some_and(|b| capture_problem(b).is_none()),
                                             theme,
                                             cx.listener(|this, _, _, cx| {
                                                 if let Some(binding) = this.captured_hotkey {
@@ -750,13 +801,23 @@ impl SettingsView {
                                 theme,
                             ))
                         })
-                        .when(crate::hotkey_hook::binding_error().is_some(), |column| {
-                            column.child(widgets::status_line(
-                                "hotkey-inactive",
-                                tr(Msg::ShortcutInactive),
-                                StatusTone::Bad,
+                        .child({
+                            let saved = settings.hotkey_binding();
+                            let (message, tone) = shortcut_state(
+                                saved,
+                                crate::hotkey_hook::active_binding(),
+                                crate::hotkey_hook::binding_error(),
+                            );
+                            widgets::status_line(
+                                "hotkey-state",
+                                crate::i18n::LocalizedText::with(
+                                    message,
+                                    &[&crate::i18n::hotkey_binding(saved)],
+                                )
+                                .render(),
+                                tone,
                                 theme,
-                            ))
+                            )
                         })
                         .child(
                             div()
@@ -1782,6 +1843,53 @@ impl Render for SettingsView {
     }
 }
 
+/// Saved vs. really listening: a shortcut saved mid-dictation waits for its end.
+fn shortcut_state(
+    saved: HotkeyBinding,
+    active: Option<HotkeyBinding>,
+    error: Option<crate::hotkey_hook::BindError>,
+) -> (Msg, StatusTone) {
+    use crate::hotkey_hook::BindError;
+    match (active == Some(saved), error) {
+        (true, _) => (Msg::ShortcutActive, StatusTone::Good),
+        (false, Some(BindError::Unavailable)) => (Msg::ShortcutUnavailable, StatusTone::Bad),
+        (false, Some(_)) => (Msg::ShortcutInactive, StatusTone::Bad),
+        (false, None) => (Msg::ShortcutPending, StatusTone::Neutral),
+    }
+}
+
+fn capture_problem(binding: HotkeyBinding) -> Option<Msg> {
+    let HotkeyBinding::Chord(chord) = binding else {
+        return None;
+    };
+    chord.validate().err().map(|problem| match problem {
+        ChordProblem::NeedsModifier => Msg::ShortcutNeedsModifier,
+        ChordProblem::WindowsKey => Msg::ShortcutWindowsKey,
+        ChordProblem::UnsupportedKey => Msg::ShortcutUnsupportedKey,
+        ChordProblem::SystemMenu => Msg::ShortcutSystemMenu,
+        ChordProblem::Reserved => Msg::ShortcutReserved,
+        ChordProblem::NeedsTwoKeys => Msg::ShortcutNeedsTwoKeys,
+    })
+}
+
+/// What to say under a captured candidate: why it is refused, or a caveat.
+fn capture_note(binding: HotkeyBinding) -> Option<(Msg, StatusTone)> {
+    if let Some(problem) = capture_problem(binding) {
+        return Some((problem, StatusTone::Bad));
+    }
+    let HotkeyBinding::Chord(chord) = binding else {
+        return None;
+    };
+    if !chord.is_modifier_only() {
+        return Some((Msg::ShortcutBothSides, StatusTone::Neutral));
+    }
+    // Left Alt+Shift and Ctrl+Shift are the Windows layout-switch hotkeys.
+    let shift = chord.modifiers & 0x3000;
+    let other = chord.modifiers & !0x3000;
+    (shift.count_ones() == 1 && matches!(other, 0x100 | 0x200 | 0x400))
+        .then_some((Msg::ShortcutLayoutSwitch, StatusTone::Neutral))
+}
+
 impl Drop for SettingsView {
     fn drop(&mut self) {
         if self.capturing_hotkey {
@@ -1793,6 +1901,60 @@ impl Drop for SettingsView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shortcut_states_are_explicit() {
+        use crate::hotkey_hook::BindError;
+        let ctrl = HotkeyBinding::Bare(HotkeyKey::RightControl);
+        let alt = HotkeyBinding::Bare(HotkeyKey::RightAlt);
+        assert_eq!(
+            shortcut_state(ctrl, Some(ctrl), None).0,
+            Msg::ShortcutActive
+        );
+        assert_eq!(
+            shortcut_state(alt, Some(ctrl), None).0,
+            Msg::ShortcutPending
+        );
+        assert_eq!(
+            shortcut_state(alt, Some(ctrl), Some(BindError::Conflict)).0,
+            Msg::ShortcutInactive
+        );
+        assert_eq!(
+            shortcut_state(alt, None, Some(BindError::Unavailable)).0,
+            Msg::ShortcutUnavailable
+        );
+    }
+
+    #[test]
+    fn capture_notes_explain_refusals_and_layout_switches() {
+        use jot_core::hotkey::HotkeyChord;
+        let chord = |modifiers, vk| HotkeyBinding::Chord(HotkeyChord { modifiers, vk });
+        assert_eq!(
+            capture_note(chord(HotkeyChord::ALT, 0x20)).map(|n| n.0),
+            Some(Msg::ShortcutSystemMenu)
+        );
+        assert_eq!(
+            capture_note(chord(HotkeyChord::CTRL | HotkeyChord::WIN, 0x4C)).map(|n| n.0),
+            Some(Msg::ShortcutWindowsKey)
+        );
+        assert_eq!(
+            capture_note(chord(0x100, 0)).map(|n| n.0),
+            Some(Msg::ShortcutNeedsTwoKeys)
+        );
+        for layout_switch in [0x400 | 0x1000, 0x100 | 0x1000, 0x200 | 0x2000] {
+            assert_eq!(
+                capture_note(chord(layout_switch, 0)).map(|n| n.0),
+                Some(Msg::ShortcutLayoutSwitch)
+            );
+        }
+        assert_eq!(capture_note(chord(0x800 | 0x2000, 0)), None);
+        assert_eq!(capture_note(chord(0x4000 | 0x400, 0)), None);
+        assert_eq!(
+            capture_note(chord(HotkeyChord::CTRL | HotkeyChord::SHIFT, 0x44)).map(|n| n.0),
+            Some(Msg::ShortcutBothSides)
+        );
+        assert_eq!(capture_note(HotkeyBinding::Bare(HotkeyKey::RightWin)), None);
+    }
 
     #[test]
     fn local_state_never_reports_a_missing_editing_model_as_ready() {

@@ -762,6 +762,52 @@ mod hotkey_persistence_tests {
         );
     }
     #[test]
+    fn every_shortcut_shape_survives_a_restart_and_reset() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("settings.json");
+        let default = HotkeyBinding::Bare(HotkeyKey::default());
+        for binding in [
+            HotkeyBinding::Bare(HotkeyKey::RightWin),
+            HotkeyBinding::Chord(HotkeyChord {
+                modifiers: 6,
+                vk: 0x44,
+            }),
+            HotkeyBinding::Chord(HotkeyChord {
+                modifiers: 0x800 | 0x2000,
+                vk: 0,
+            }),
+            HotkeyBinding::Chord(HotkeyChord {
+                modifiers: 0x4000 | 0x400,
+                vk: 0,
+            }),
+        ] {
+            SettingsStore::open(path.clone())
+                .set_hotkey_binding(binding)
+                .unwrap();
+            assert_eq!(
+                SettingsStore::open(path.clone()).get().hotkey_binding(),
+                binding
+            );
+            SettingsStore::open(path.clone())
+                .set_hotkey_binding(default)
+                .unwrap();
+            assert_eq!(
+                SettingsStore::open(path.clone()).get().hotkey_binding(),
+                default
+            );
+        }
+        // Invalid shapes are refused before they reach disk.
+        let store = SettingsStore::open(path.clone());
+        for modifiers in [0x800, HotkeyChord::CTRL | 0x800] {
+            assert!(
+                store
+                    .set_hotkey_binding(HotkeyBinding::Chord(HotkeyChord { modifiers, vk: 0 }))
+                    .is_err()
+            );
+        }
+        assert_eq!(SettingsStore::open(path).get().hotkey_binding(), default);
+    }
+    #[test]
     fn binding_persistence_failure_keeps_previous_settings() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("settings.json");

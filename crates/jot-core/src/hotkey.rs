@@ -102,22 +102,102 @@ impl HotkeyChord {
     pub const CTRL: u32 = 2;
     pub const SHIFT: u32 = 4;
     pub const WIN: u32 = 8;
+    /// Sided bits, used only by modifier-only chords (`vk == 0`). Older builds
+    /// reject them as invalid instead of dropping the whole settings file.
+    pub const SIDED: u32 = 0xFF00;
+    /// (bit, virtual-key code) of each sided modifier, in display order.
+    pub const SIDES: [(u32, u32); 8] = [
+        (0x100, 0xA2),  // left Ctrl
+        (0x200, 0xA3),  // right Ctrl
+        (0x400, 0xA4),  // left Alt
+        (0x800, 0xA5),  // right Alt
+        (0x1000, 0xA0), // left Shift
+        (0x2000, 0xA1), // right Shift
+        (0x4000, 0x5B), // left Win
+        (0x8000, 0x5C), // right Win
+    ];
 
-    pub fn validate(self) -> Result<(), &'static str> {
-        // Windows-logo combinations belong to the OS; F12 belongs to the debugger.
+    pub fn sided_bit(vk: u32) -> Option<u32> {
+        Self::SIDES
+            .iter()
+            .find(|(_, side)| *side == vk)
+            .map(|(bit, _)| *bit)
+    }
+
+    pub fn is_modifier_only(self) -> bool {
+        self.vk == 0
+    }
+
+    pub fn validate(self) -> Result<(), ChordProblem> {
+        if self.is_modifier_only() {
+            if self.modifiers & !Self::SIDED != 0 {
+                return Err(ChordProblem::UnsupportedKey);
+            }
+            return match self.modifiers.count_ones() {
+                2 | 3 => Ok(()),
+                _ => Err(ChordProblem::NeedsTwoKeys),
+            };
+        }
+        // Windows-logo + key combinations belong to the OS.
+        if self.modifiers & Self::WIN != 0 {
+            return Err(ChordProblem::WindowsKey);
+        }
         if self.modifiers == 0 || self.modifiers & !7 != 0 {
-            return Err("use Ctrl, Alt or Shift with a normal key");
+            return Err(ChordProblem::NeedsModifier);
         }
-        if !matches!(self.vk, 0x20 | 0x30..=0x39 | 0x41..=0x5A | 0x70..=0x7A | 0x7C..=0x87) {
-            return Err("unsupported or reserved key");
+        // F12 belongs to the debugger; Tab/Esc/Enter/Backspace drive the OS and dialogs.
+        if !matches!(
+            self.vk,
+            0x20..=0x28
+                | 0x2D
+                | 0x2E
+                | 0x30..=0x39
+                | 0x41..=0x5A
+                | 0x60..=0x6F
+                | 0x70..=0x7A
+                | 0x7C..=0x87
+                | 0xBA..=0xC0
+                | 0xDB..=0xDF
+                | 0xE2
+        ) {
+            return Err(ChordProblem::UnsupportedKey);
         }
-        // OS/task switching, menus and secure-attention sequences are never bindings.
+        if self.modifiers == Self::ALT && self.vk == 0x20 {
+            return Err(ChordProblem::SystemMenu);
+        }
+        // Alt+F4 closes windows; Ctrl+Alt+Del (main or keypad) is the secure attention sequence.
+        let ctrl_alt = Self::CTRL | Self::ALT;
         if self.modifiers == Self::ALT && self.vk == 0x73
-            || self.modifiers == Self::ALT && self.vk == 0x20
+            || self.modifiers & ctrl_alt == ctrl_alt && matches!(self.vk, 0x2E | 0x6E)
         {
-            return Err("reserved shortcut");
+            return Err(ChordProblem::Reserved);
         }
         Ok(())
+    }
+}
+
+/// Why a shortcut cannot be a dictation binding; the UI explains each one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChordProblem {
+    NeedsModifier,
+    WindowsKey,
+    UnsupportedKey,
+    /// Alt+Space opens every window's system menu.
+    SystemMenu,
+    Reserved,
+    NeedsTwoKeys,
+}
+
+impl std::fmt::Display for ChordProblem {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::NeedsModifier => "use Ctrl, Alt or Shift with a normal key",
+            Self::WindowsKey => "Windows-key combinations with a normal key belong to Windows",
+            Self::UnsupportedKey => "unsupported key",
+            Self::SystemMenu => "Alt+Space opens the window menu",
+            Self::Reserved => "reserved shortcut",
+            Self::NeedsTwoKeys => "use two or three modifier keys",
+        })
     }
 }
 
@@ -679,6 +759,44 @@ mod chord_binding_tests {
             let binding = HotkeyBinding::Bare(key);
             assert_eq!(HotkeyBinding::decode(binding.encode()), Some(binding));
         }
+    }
+    #[test]
+    fn modifier_only_chords_and_wider_keys_validate_with_a_reason() {
+        let ok = |modifiers, vk| HotkeyChord { modifiers, vk }.validate();
+        // Alt droit + Maj droite, Win gauche + Alt gauche, Ctrl gauche + Maj gauche + Alt gauche.
+        assert_eq!(ok(0x800 | 0x2000, 0), Ok(()));
+        assert_eq!(ok(0x4000 | 0x400, 0), Ok(()));
+        assert_eq!(ok(0x100 | 0x1000 | 0x400, 0), Ok(()));
+        assert_eq!(ok(0x200, 0), Err(ChordProblem::NeedsTwoKeys));
+        assert_eq!(ok(0xF00, 0), Err(ChordProblem::NeedsTwoKeys));
+        assert_eq!(
+            ok(HotkeyChord::CTRL | 0x800, 0),
+            Err(ChordProblem::UnsupportedKey)
+        );
+        // Ctrl+Maj+D, punctuation, keypad, arrows.
+        for vk in [0x44, 0xBC, 0xDE, 0xE2, 0x60, 0x6B, 0x25, 0x2D] {
+            assert_eq!(
+                ok(HotkeyChord::CTRL | HotkeyChord::SHIFT, vk),
+                Ok(()),
+                "{vk:#x}"
+            );
+        }
+        assert_eq!(ok(HotkeyChord::ALT, 0x20), Err(ChordProblem::SystemMenu));
+        assert_eq!(ok(HotkeyChord::ALT, 0x73), Err(ChordProblem::Reserved));
+        assert_eq!(ok(7, 0x2E), Err(ChordProblem::Reserved));
+        assert_eq!(ok(3, 0x6E), Err(ChordProblem::Reserved));
+        assert_eq!(
+            ok(HotkeyChord::WIN | 2, 0x4C),
+            Err(ChordProblem::WindowsKey)
+        );
+        for vk in [0x09, 0x0D, 0x08, 0x1B, 0x7B, 0x2C] {
+            assert_eq!(ok(2, vk), Err(ChordProblem::UnsupportedKey), "{vk:#x}");
+        }
+        let binding = HotkeyBinding::Chord(HotkeyChord {
+            modifiers: 0x4000 | 0x400,
+            vk: 0,
+        });
+        assert_eq!(HotkeyBinding::decode(binding.encode()), Some(binding));
     }
     #[test]
     fn chord_hold_finalizes_even_when_released_quickly() {
