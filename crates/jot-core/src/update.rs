@@ -481,7 +481,8 @@ async fn download_from(
     let sums = asset("SHA256SUMS.txt").ok_or(DownloadError::NoSums)?;
     let tag = format!("{allowed}v{}/", update.version);
     for a in [installer, sums] {
-        if !a.browser_download_url.starts_with(&tag) {
+        // Exact, not a prefix: « v1.7.1/../v1.7.0/ » would start with the tag.
+        if a.browser_download_url != format!("{tag}{}", a.name) {
             return Err(DownloadError::UnexpectedSource);
         }
     }
@@ -759,6 +760,7 @@ mod tests {
             "https://github.com/someone/Jot/releases/download/",
             "http://github.com/tadikwa/Jot/releases/download/",
             "https://github.com/tadikwa/Jot/releases/download/v1.7.0/../",
+            "https://github.com/tadikwa/Jot/releases/download/v1.7.1/../",
         ] {
             assert_eq!(
                 with_base(foreign),
