@@ -1816,8 +1816,8 @@ pub(super) fn rescue_toggle(
             "Expérimental : sauver les longues reformulations par parties",
         ),
         ui(
-            "On by default. Local mode only, for dictations of 60 words or more. When the safety check refuses the whole rewrite, Jot retries it sentence group by sentence group, checks each part and the whole again, and keeps raw any part that fails. At most 8 extra calls and 60 seconds per dictation, all on this PC.",
-            "Activé par défaut. Mode local uniquement, pour les dictées de 60 mots ou plus. Quand le contrôle refuse la reformulation entière, Jot la retente par groupes de phrases, vérifie chaque partie puis l’ensemble, et garde brute toute partie refusée. Au plus 8 appels supplémentaires et 60 secondes par dictée, tout sur ce PC.",
+            "Off by default: in tests the rescued text often lost nuance, so reread it. Local mode only, for dictations of 60 words or more. When the safety check refuses the whole rewrite, Jot retries it sentence group by sentence group, checks each part and the whole again, and keeps raw any part that fails. At most 8 extra calls and 60 seconds per dictation, all on this PC.",
+            "Désactivé par défaut : en test, le texte sauvé perdait souvent des nuances, relisez-le. Mode local uniquement, pour les dictées de 60 mots ou plus. Quand le contrôle refuse la reformulation entière, Jot la retente par groupes de phrases, vérifie chaque partie puis l’ensemble, et garde brute toute partie refusée. Au plus 8 appels supplémentaires et 60 secondes par dictée, tout sur ce PC.",
         ),
         on,
         theme,

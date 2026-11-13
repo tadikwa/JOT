@@ -11,7 +11,7 @@
 
 use crate::dictionary::DictionaryStore;
 use crate::gemini::TranscriptionError;
-use crate::settings::{LocalReformulation, SettingsStore};
+use crate::settings::{LocalReformulation, Settings, SettingsStore};
 use crate::transcription::{DictationContext, TranscriptionResult, TranscriptionServicing};
 use crate::{file_layout, timeout, validation};
 use async_trait::async_trait;
@@ -1325,10 +1325,7 @@ impl TranscriptionServicing for LocalTranscriptionService {
 
         // Only a refusal or a timeout may do better on smaller pieces; a server
         // that did not start or answer will not.
-        let rescue = if settings.local_partial_rescue
-            && (refused.is_some() || outcome == "timeout")
-            && raw.split_whitespace().count() >= crate::rescue::MIN_WORDS
-        {
+        let rescue = if wants_rescue(&settings, refused.is_some(), &outcome, &raw) {
             Some(self.engine.rescue(pack, &raw, &vocabulary).await)
         } else {
             None
@@ -1443,9 +1440,34 @@ mod platform {
     }
 }
 
+/// Off (the default since 1.7.1): never a rescue call, the 1.6 pipeline.
+fn wants_rescue(settings: &Settings, refused: bool, outcome: &str, raw: &str) -> bool {
+    settings.local_partial_rescue
+        && (refused || outcome == "timeout")
+        && raw.split_whitespace().count() >= crate::rescue::MIN_WORDS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_disabled_rescue_is_never_attempted() {
+        let long = "mot ".repeat(crate::rescue::MIN_WORDS);
+        let off = Settings::default();
+        assert!(!off.local_partial_rescue);
+        let on = Settings {
+            local_partial_rescue: true,
+            ..Settings::default()
+        };
+        for (refused, outcome) in [(true, "rejected/numbers"), (false, "timeout")] {
+            assert!(!wants_rescue(&off, refused, outcome, &long));
+            assert!(wants_rescue(&on, refused, outcome, &long), "{outcome}");
+        }
+        // On, but nothing to rescue or too short: unchanged 1.7.0 behaviour.
+        assert!(!wants_rescue(&on, false, "unavailable", &long));
+        assert!(!wants_rescue(&on, true, "rejected/numbers", "court"));
+    }
 
     #[test]
     fn asr_gets_the_vocabulary_as_context_only_when_there_is_one() {

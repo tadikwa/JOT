@@ -219,8 +219,11 @@ pub struct Settings {
     pub keep_rejected_reformulations: bool,
     /// Days before those diagnostics are deleted (the dictation itself stays).
     pub rejected_reformulation_retention_days: i64,
-    /// Experimental, on by default: when the local rewrite of a long dictation
-    /// is refused or too slow, rewrite it again piece by piece (`rescue`).
+    /// Experimental, off by default since 1.7.1 (1.7.0 shipped it on and lost
+    /// nuance in 8 of 10 rescued texts): when the local rewrite of a long
+    /// dictation is refused or too slow, rewrite it again piece by piece
+    /// (`rescue`). A saved `true` is kept: 1.7.0 wrote every field, so a choice
+    /// and the old default cannot be told apart.
     pub local_partial_rescue: bool,
     /// On by default: for 30 s after an insertion, watch only the field that
     /// received it and offer what the user corrected there as dictionary
@@ -262,7 +265,7 @@ impl Default for Settings {
             local_unload: LocalUnload::FiveMinutes,
             keep_rejected_reformulations: false,
             rejected_reformulation_retention_days: 7,
-            local_partial_rescue: true,
+            local_partial_rescue: false,
             learn_from_app_corrections: true,
             check_updates: true,
             include_prereleases: false,
@@ -596,6 +599,27 @@ mod tests {
         assert!(!settings.double_tap_lock);
         assert_eq!(settings.audio_retention_days, 7);
         assert_eq!(settings.hotkey_key, HotkeyKey::RightControl);
+    }
+
+    #[test]
+    fn partial_rescue_is_off_for_new_and_1_6_profiles_and_a_saved_choice_is_kept() {
+        assert!(!Settings::default().local_partial_rescue);
+        // 1.6.0 never wrote the field.
+        let v16: Settings =
+            serde_json::from_str(r#"{"transcriptionEngine":"local","audioRetentionDays":30}"#)
+                .unwrap();
+        assert!(!v16.local_partial_rescue);
+        // 1.7.0 wrote it; `true` may be a choice or its old default: kept.
+        let v17: Settings =
+            serde_json::from_str(r#"{"transcriptionEngine":"local","localPartialRescue":true}"#)
+                .unwrap();
+        assert!(v17.local_partial_rescue);
+        let (temp, store) = store();
+        for on in [true, false] {
+            store.update(Some("localPartialRescue"), |s| s.local_partial_rescue = on);
+            let reopened = SettingsStore::open(temp.path().join("settings.json")).get();
+            assert_eq!(reopened.local_partial_rescue, on);
+        }
     }
 
     #[test]
