@@ -166,11 +166,20 @@ impl Download {
 
 pub const CANCELLED: &str = "cancelled";
 
+static INSTALLING: AtomicUsize = AtomicUsize::new(0);
+
+/// A model download is running: quitting now would leave it half done.
+pub fn installing() -> bool {
+    INSTALLING.load(Ordering::Acquire) > 0
+}
+
 /// Downloads what `pack` is missing, verifying each file. Resumable only in the
 /// sense that finished files are skipped.
 // shortcut: no HTTP Range resume of a half-downloaded file; add it if users on slow links ask.
 pub async fn install(pack: Pack, progress: Arc<Download>) {
+    INSTALLING.fetch_add(1, Ordering::AcqRel);
     let result = install_inner(pack, &progress).await;
+    INSTALLING.fetch_sub(1, Ordering::AcqRel);
     if let Err(error) = result {
         *progress.error.lock() = Some(error);
     }

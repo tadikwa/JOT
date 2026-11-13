@@ -19,21 +19,19 @@ pub mod dictionary;
 pub mod history;
 pub mod onboarding;
 pub mod settings;
+pub mod updates;
 pub mod widgets;
 
-use crate::i18n::{Msg, tf, tr};
+use crate::i18n::{Msg, tr};
 use crate::services::Services;
 use crate::theme::{self, Theme};
-use crate::views::widgets::StatusTone;
 use gpui::{
     AnyWindowHandle, App, Bounds, Context, Entity, Render, Role, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, div, prelude::*, px, relative, size,
+    WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
-use jot_core::update::{CheckError, Outcome};
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use std::time::Duration;
 
 /// Open tool windows, so a second request focuses the existing one instead of
 /// stacking duplicates on top of each other.
@@ -104,14 +102,16 @@ pub enum Route {
     History,
     Dictionary,
     Settings,
+    Updates,
 }
 
 impl Route {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Dashboard,
         Self::History,
         Self::Dictionary,
         Self::Settings,
+        Self::Updates,
     ];
 
     fn label(self) -> Msg {
@@ -120,6 +120,7 @@ impl Route {
             Self::History => Msg::History,
             Self::Dictionary => Msg::Dictionary,
             Self::Settings => Msg::Settings,
+            Self::Updates => Msg::About,
         }
     }
 }
@@ -157,6 +158,7 @@ struct WorkspaceView {
     history: Option<Entity<history::HistoryView>>,
     dictionary: Option<Entity<dictionary::DictionaryView>>,
     settings: Option<Entity<settings::SettingsView>>,
+    updates: Option<Entity<updates::UpdatesView>>,
 }
 
 impl WorkspaceView {
@@ -168,6 +170,7 @@ impl WorkspaceView {
             history: None,
             dictionary: None,
             settings: None,
+            updates: None,
         };
         view.navigate(route, cx);
         view
@@ -204,7 +207,7 @@ impl WorkspaceView {
                         view.update(cx, settings::SettingsView::dismiss_confirmations);
                     }
                 }
-                Route::Dictionary => {}
+                Route::Dictionary | Route::Updates => {}
             }
         }
         match route {
@@ -235,6 +238,11 @@ impl WorkspaceView {
                     cx.new(|cx| settings::SettingsView::new(self.services.clone(), cx))
                 });
             }
+            Route::Updates => {
+                self.updates.get_or_insert_with(|| {
+                    cx.new(|cx| updates::UpdatesView::new(self.services.clone(), cx))
+                });
+            }
         }
         self.route = route;
         cx.notify();
@@ -260,6 +268,7 @@ impl Render for WorkspaceView {
             Route::History => self.history.as_ref().unwrap().clone().into_any_element(),
             Route::Dictionary => self.dictionary.as_ref().unwrap().clone().into_any_element(),
             Route::Settings => self.settings.as_ref().unwrap().clone().into_any_element(),
+            Route::Updates => self.updates.as_ref().unwrap().clone().into_any_element(),
         };
 
         div()
@@ -326,7 +335,7 @@ fn route_tabs(
 
 pub fn refresh_language(cx: &mut App) {
     let windows = OPEN_WINDOWS.lock();
-    for (key, title) in [("onboarding", Msg::Setup), ("about", Msg::About)] {
+    for (key, title) in [("onboarding", Msg::Setup)] {
         if let Some(handle) = windows.get(key) {
             let _ = handle.update(cx, |_, window, _| window.set_window_title(tr(title)));
         }
@@ -344,165 +353,6 @@ pub fn open_onboarding(services: &Services, cx: &mut App) {
         cx,
         move |_, cx| cx.new(|cx| onboarding::OnboardingView::new(services, cx)),
     );
-}
-
-pub fn open_about(cx: &mut App) {
-    open_tool_window(
-        "about",
-        tr(Msg::About),
-        (480.0, 380.0),
-        Some((380.0, 320.0)),
-        cx,
-        |_, cx| cx.new(AboutView::new),
-    );
-}
-
-/// About, which is also where Jot asks whether it is out of date.
-///
-/// The check runs here rather than at startup on purpose: opening this window
-/// is a deliberate act, so the one request Jot makes to anything other than the
-/// Gemini API stays something the user asked for.
-pub struct AboutView {
-    update: UpdateState,
-    scroll: widgets::PageScroll,
-}
-
-enum UpdateState {
-    Checking,
-    Done(Result<jot_core::update::Outcome, jot_core::update::CheckError>),
-}
-
-impl AboutView {
-    fn new(cx: &mut gpui::Context<Self>) -> Self {
-        cx.spawn(async move |this, cx| {
-            let prereleases = jot_core::settings::SettingsStore::global()
-                .get()
-                .include_prereleases;
-            // Opening About is a request to look, but not ten times a minute.
-            let outcome = jot_core::runtime::spawn(jot_core::update::check(
-                env!("CARGO_PKG_VERSION"),
-                prereleases,
-                Duration::from_secs(600),
-            ))
-            .await;
-            let state =
-                UpdateState::Done(outcome.unwrap_or(Err(jot_core::update::CheckError::BadReply)));
-            this.update(cx, |this, cx| {
-                this.update = state;
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-
-        Self {
-            update: UpdateState::Checking,
-            scroll: widgets::PageScroll::new(),
-        }
-    }
-
-    fn update_element(&self, theme: Theme) -> gpui::AnyElement {
-        match &self.update {
-            UpdateState::Checking => widgets::status_line(
-                "update",
-                tr(Msg::UpdateChecking),
-                StatusTone::Neutral,
-                theme,
-            )
-            .into_any_element(),
-            UpdateState::Done(Ok(Outcome::UpToDate)) => {
-                widgets::status_line("update", tr(Msg::UpdateCurrent), StatusTone::Good, theme)
-                    .into_any_element()
-            }
-            UpdateState::Done(Ok(Outcome::NoRelease)) => widgets::status_line(
-                "update",
-                tr(Msg::UpdateNoRelease),
-                StatusTone::Neutral,
-                theme,
-            )
-            .into_any_element(),
-            UpdateState::Done(Err(error)) => {
-                let message = match error {
-                    CheckError::Offline => tr(Msg::UpdateUnknown).to_string(),
-                    CheckError::RateLimited { .. } => tr(Msg::UpdateRateLimited).to_string(),
-                    other => tf(Msg::UpdateFailed, &[&other.to_string()]),
-                };
-                widgets::status_line("update", message, StatusTone::Neutral, theme)
-                    .into_any_element()
-            }
-            UpdateState::Done(Ok(Outcome::Available(update))) => {
-                let page = update.page.clone();
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .child(widgets::status_line(
-                        "update",
-                        tf(
-                            if update.prerelease {
-                                Msg::UpdatePrerelease
-                            } else {
-                                Msg::UpdateAvailable
-                            },
-                            &[&update.version],
-                        ),
-                        StatusTone::Good,
-                        theme,
-                    ))
-                    .child(widgets::hug(widgets::button(
-                        "open-release",
-                        tr(Msg::UpdateDownload),
-                        widgets::ButtonKind::Primary,
-                        true,
-                        theme,
-                        move |_, _, cx| cx.open_url(&page),
-                    )))
-                    .into_any_element()
-            }
-        }
-    }
-}
-
-impl Render for AboutView {
-    fn render(
-        &mut self,
-        window: &mut gpui::Window,
-        _cx: &mut gpui::Context<Self>,
-    ) -> impl IntoElement {
-        let theme = Theme::ui(window);
-        let update = self.update_element(theme);
-        widgets::page(
-            "about",
-            theme,
-            &self.scroll,
-            vec![
-                div()
-                    .id("heading")
-                    .role(Role::Heading)
-                    .aria_level(1)
-                    .text_size(theme::type_scale::HEADLINE)
-                    .font_weight(theme::weight::MEDIUM)
-                    .line_height(relative(theme::line_height::TIGHT))
-                    .child("Jot")
-                    .into_any_element(),
-                div()
-                    .text_size(theme::type_scale::BODY)
-                    .text_color(theme.on_surface_variant)
-                    .child(tf(Msg::Version, &[&env!("CARGO_PKG_VERSION")]))
-                    .into_any_element(),
-                update,
-                div()
-                    .text_size(theme::type_scale::BODY)
-                    .child(tr(Msg::AboutDescription))
-                    .into_any_element(),
-                div()
-                    .text_size(theme::type_scale::LABEL)
-                    .text_color(theme.on_surface_variant)
-                    .child(tr(Msg::AboutLicense))
-                    .into_any_element(),
-            ],
-        )
-    }
 }
 
 #[cfg(test)]

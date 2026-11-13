@@ -56,8 +56,13 @@ DisableDirPage=auto
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 ; Jot holds this mutex while it runs (single_instance.rs): setup and uninstall
-; ask the user to quit it instead of replacing a running executable.
+; ask the user to quit it instead of replacing a running executable. Setup first
+; asks this folder's Jot to close itself (InitializeSetup, below); the mutex stays
+; as the guarantee that a running jot.exe is never replaced.
 AppMutex=Local\com.ammaar.jot.dictation
+; Never let Restart Manager close or restart Jot: only Jot decides to quit.
+CloseApplications=no
+RestartApplications=no
 SetupIconFile={#SourcePath}\..\..\crates\jot\assets\jot.ico
 UninstallDisplayIcon={app}\jot.exe
 UninstallDisplayName={#AppName}
@@ -79,6 +84,12 @@ french.ForeignRunEntry=Une entrée de démarrage nommée « Jot » existe déjà
 english.ForeignRunEntry=A startup entry named "Jot" already exists and does not launch jot.exe. It was left untouched; you can turn on start with Windows from Jot's settings.
 french.PurgeQuestion=Jot a été désinstallé. Vos données ont été conservées :%n%n%1%n(historique, dictionnaire, réglages, modèles locaux)%n%nVoulez-vous aussi les supprimer définitivement, ainsi que la clé API Gemini enregistrée ?%n%nCette suppression est irréversible. Les copies portables de Jot utilisent le même dossier.
 english.PurgeQuestion=Jot was uninstalled. Your data was kept:%n%n%1%n(history, dictionary, settings, local models)%n%nDo you also want to delete it permanently, along with the saved Gemini API key?%n%nThis cannot be undone. Portable copies of Jot use the same folder.
+french.JotRunningAsk=Jot est encore ouvert. Le fermer pour lancer l'installation ?%n%nJot se fermera normalement ; vos réglages, votre historique, votre dictionnaire et vos modèles sont conservés.
+english.JotRunningAsk=Jot is still open. Close it to start the installation?%n%nJot will close normally; your settings, history, dictionary and models are kept.
+french.JotBusy=Jot ne s'est pas fermé : une dictée, un téléchargement ou un chargement de modèle est sans doute en cours.%n%nLaissez-le se terminer puis cliquez sur Réessayer, ou fermez Jot vous-même (clic droit sur son icône près de l'horloge > Quitter Jot).
+english.JotBusy=Jot did not close: a dictation, a download or a model loading is probably in progress.%n%nLet it finish and click Retry, or close Jot yourself (right-click its icon near the clock > Quit Jot).
+french.JotManualClose=Jot est en cours d'exécution et ne peut pas être fermé par l'installation (version antérieure à 1.7, ou copie lancée depuis un autre dossier).%n%nFermez-le vous-même (clic droit sur son icône près de l'horloge > Quitter Jot), puis cliquez sur Réessayer.
+english.JotManualClose=Jot is running and cannot be closed by setup (a version before 1.7, or a copy started from another folder).%n%nClose it yourself (right-click its icon near the clock > Quit Jot), then click Retry.
 #ifdef TestBuild
 french.PurgeQuestionTest=Version de test désinstallée. Supprimer aussi son profil isolé ?%n%n%1
 english.PurgeQuestionTest=Test build uninstalled. Also delete its isolated profile?%n%n%1
@@ -109,6 +120,16 @@ const
   RunKey = '{#RunKey}';
   RunName = 'Jot';
   CredentialTarget = 'gemini-api-key.com.ammaar.jot';
+
+  DictationMutex = 'Local\com.ammaar.jot.dictation';
+  EVENT_MODIFY_STATE = $0002;
+
+function OpenEventW(Access: Cardinal; Inherit: BOOL; Name: String): THandle;
+  external 'OpenEventW@kernel32.dll stdcall';
+function SetEvent(Event: THandle): BOOL;
+  external 'SetEvent@kernel32.dll stdcall';
+function CloseHandle(Handle: THandle): BOOL;
+  external 'CloseHandle@kernel32.dll stdcall';
 
 function JotExe(): String;
 begin
@@ -142,6 +163,86 @@ begin
 #else
   Result := ExpandConstant('{localappdata}\Jot');
 #endif
+end;
+
+{ Same recipe as jot_core::update::quit_event_name: one event per folder, so
+  setup only ever asks the copy it is about to replace. }
+function QuitEventName(Dir: String): String;
+begin
+  Result := 'Local\com.ammaar.jot.quit.' +
+    Copy(GetSHA256OfUnicodeString(Lowercase(RemoveBackslash(Dir))), 1, 16);
+end;
+
+{ True when the Jot installed here listens for requests and was sent one.
+  Jot 1.6 and copies run from elsewhere have no listener: False. }
+function AskJotToClose(): Boolean;
+var
+  Dir: String;
+  Event: THandle;
+begin
+  Result := False;
+  if not RegQueryStringValue(HKCU,
+       'Software\Microsoft\Windows\CurrentVersion\Uninstall\' +
+       Copy('{#AppId}', 2, MaxInt) + '_is1', 'InstallLocation', Dir) or (Dir = '') then
+    Exit;
+  Event := OpenEventW(EVENT_MODIFY_STATE, False, QuitEventName(Dir));
+  if Event = 0 then
+    Exit;
+  Result := SetEvent(Event);
+  CloseHandle(Event);
+  Log('Asked the Jot in ' + Dir + ' to close');
+end;
+
+function WaitForJotToClose(Seconds: Integer): Boolean;
+var
+  I: Integer;
+begin
+  for I := 1 to Seconds * 4 do
+  begin
+    if not CheckForMutexes(DictationMutex) then
+    begin
+      Result := True;
+      Exit;
+    end;
+    Sleep(250);
+  end;
+  Result := not CheckForMutexes(DictationMutex);
+end;
+
+{ Runs before the AppMutex check. Jot is only ever asked to close, never
+  killed: if it stays open, the user decides. }
+function InitializeSetup(): Boolean;
+var
+  Asked: Boolean;
+  Prompt: String;
+begin
+  Result := True;
+  if not CheckForMutexes(DictationMutex) then
+    Exit;
+  { Started by Jot after the user confirmed there: it is already closing. }
+  if HasParam('/JOTWAIT') and WaitForJotToClose(20) then
+    Exit;
+  if SuppressibleMsgBox(CustomMessage('JotRunningAsk'), mbConfirmation, MB_OKCANCEL,
+       IDOK) <> IDOK then
+  begin
+    Result := False;
+    Exit;
+  end;
+  repeat
+    Asked := AskJotToClose();
+    if Asked and WaitForJotToClose(15) then
+      Exit;
+    if Asked then
+      Prompt := CustomMessage('JotBusy')
+    else
+      Prompt := CustomMessage('JotManualClose');
+    if SuppressibleMsgBox(Prompt, mbError, MB_RETRYCANCEL, IDCANCEL) <> IDRETRY then
+    begin
+      Log('Jot still running; setup cancelled');
+      Result := False;
+      Exit;
+    end;
+  until not CheckForMutexes(DictationMutex);
 end;
 
 procedure EnableAutostart();

@@ -131,6 +131,13 @@ pub fn notify(title: String, body: String) {
     let _ = (title, body);
 }
 
+/// Takes the icon out of the notification area now. At exit the tray thread
+/// never reaches its own cleanup, and Windows would keep a ghost icon.
+pub fn remove() {
+    #[cfg(windows)]
+    platform::remove();
+}
+
 pub fn install() -> UnboundedReceiver<TrayCommand> {
     let (tx, rx) = unbounded_channel();
     let _ = COMMANDS.set(tx);
@@ -193,10 +200,10 @@ mod platform {
     use windows::Win32::UI::WindowsAndMessaging::{
         AppendMenuW, CreateIconFromResourceEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
         DestroyMenu, DispatchMessageW, FindWindowW, GetCursorPos, GetMessageW, GetSystemMetrics,
-        HICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, MSG, PostMessageW, PostQuitMessage,
-        RegisterClassW, SM_CXSMICON, SetForegroundWindow, TPM_BOTTOMALIGN, TPM_RIGHTALIGN,
-        TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_EX_STYLE, WM_APP, WM_COMMAND, WM_DESTROY,
-        WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+        GetWindowThreadProcessId, HICON, LR_DEFAULTCOLOR, MF_SEPARATOR, MF_STRING, MSG,
+        PostMessageW, PostQuitMessage, RegisterClassW, SM_CXSMICON, SetForegroundWindow,
+        TPM_BOTTOMALIGN, TPM_RIGHTALIGN, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_EX_STYLE, WM_APP,
+        WM_COMMAND, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
     };
     use windows::core::{PCWSTR, w};
 
@@ -208,6 +215,26 @@ mod platform {
 
     /// The balloon waiting for the tray thread to show it.
     static BALLOON: std::sync::Mutex<Option<(String, String)>> = std::sync::Mutex::new(None);
+
+    pub fn remove() {
+        unsafe {
+            let Ok(hwnd) = FindWindowW(w!("JotTrayHost"), None) else {
+                return;
+            };
+            let mut owner = 0;
+            GetWindowThreadProcessId(hwnd, Some(&mut owner));
+            if owner != std::process::id() {
+                return;
+            }
+            let data = NOTIFYICONDATAW {
+                cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+                hWnd: hwnd,
+                uID: ICON_ID,
+                ..Default::default()
+            };
+            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
+        }
+    }
 
     pub fn notify(title: String, body: String) {
         *BALLOON.lock().unwrap_or_else(|e| e.into_inner()) = Some((title, body));

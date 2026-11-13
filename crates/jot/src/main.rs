@@ -29,6 +29,8 @@ mod hotkey_hook;
 mod hud_validation;
 mod i18n;
 mod pill;
+#[cfg(target_os = "windows")]
+mod quit_request;
 mod recovery;
 mod services;
 #[cfg(target_os = "windows")]
@@ -136,6 +138,10 @@ fn main() -> Result<()> {
     sound::start();
     let hotkey_events = hotkey_hook::install(settings.hotkey_binding());
     let tray_commands = tray::install();
+    #[cfg(target_os = "windows")]
+    let quit_requests = quit_request::listen();
+    #[cfg(not(target_os = "windows"))]
+    let quit_requests = None;
 
     runtime.spawn(run_hotkey_grammar(
         hotkey_events,
@@ -153,6 +159,7 @@ fn main() -> Result<()> {
         views::widgets::install_keyboard_navigation(cx);
         // Closing the workspace leaves the tray icon and dictation running.
         cx.set_quit_mode(gpui::QuitMode::Explicit);
+        cx.on_app_quit(|_| async { tray::remove() }).detach();
 
         let hud = match open_hud(cx) {
             Ok(hud) => hud,
@@ -166,6 +173,9 @@ fn main() -> Result<()> {
         drive_pill(hud, app_services.clone(), cx);
         run_clock(hud, cx);
         handle_tray(tray_commands, hud, app_services.clone(), cx);
+        if let Some(requests) = quit_requests {
+            handle_quit_requests(requests, app_services.clone(), cx);
+        }
 
         if test_settings {
             views::open_workspace(views::Route::Settings, &app_services, cx);
@@ -204,7 +214,11 @@ async fn announce_update(include_prereleases: bool) {
                 tf(Msg::UpdateNoticeBody, &[&found.version]),
             );
         }
-        Ok(outcome) => tracing::info!(?outcome, "update check"),
+        // Never the release notes: someone else's text has no place in the log.
+        Ok(Outcome::Available(found) | Outcome::UpToDate(found)) => {
+            tracing::info!(newest = %found.version, "update check")
+        }
+        Ok(Outcome::NoRelease) => tracing::info!("update check: no release"),
         Err(error) => tracing::info!(%error, "update check failed"),
     }
 }
@@ -471,9 +485,27 @@ fn handle_tray(
                     views::open_workspace(views::Route::Settings, &services, cx)
                 }
                 TrayCommand::OpenOnboarding => views::open_onboarding(&services, cx),
-                TrayCommand::About => views::open_about(cx),
+                TrayCommand::About => views::open_workspace(views::Route::Updates, &services, cx),
                 TrayCommand::Quit => cx.quit(),
             });
+        }
+    })
+    .detach();
+}
+
+/// This copy's setup asked it to close: quit the normal way, so the tray, the
+/// keyboard hook and llama-server all stop, unless work in progress would be
+/// lost. Then the setup keeps waiting and tells the user why.
+fn handle_quit_requests(mut requests: UnboundedReceiver<()>, services: Services, cx: &mut App) {
+    cx.spawn(async move |cx| {
+        while requests.recv().await.is_some() {
+            match services.close_blocker() {
+                None => {
+                    tracing::info!("closing at the setup's request");
+                    cx.update(|cx| cx.quit());
+                }
+                Some(reason) => tracing::info!(reason, "the setup asked to close; staying open"),
+            }
         }
     })
     .detach();

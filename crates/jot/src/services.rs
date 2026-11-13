@@ -172,6 +172,30 @@ impl Services {
         })
     }
 
+    /// Why Jot should not close right now, or None when it can: a dictation
+    /// still being recorded or processed, a model download, or a model loading.
+    /// Queued retries are not a reason: they stay in History for next launch.
+    pub fn close_blocker(&self) -> Option<&'static str> {
+        let fr = matches!(crate::i18n::locale(), crate::i18n::Locale::Fr);
+        let pick = |en, french| Some(if fr { french } else { en });
+        let state = self.coordinator.state();
+        if !matches!(state, DictationState::Idle) && !state.is_terminal() {
+            pick(
+                "a dictation is still being recorded or processed",
+                "une dictée est encore en cours d’enregistrement ou de traitement",
+            )
+        } else if jot_core::local::installing() {
+            pick(
+                "a model is downloading",
+                "un modèle est en cours de téléchargement",
+            )
+        } else if self.local_engine.status().loading {
+            pick("a model is loading", "un modèle est en cours de chargement")
+        } else {
+            None
+        }
+    }
+
     /// Launch work that must not block the first key press: crash recovery, the
     /// offline drain, and audio retention.
     pub fn start_background_work(&self) {

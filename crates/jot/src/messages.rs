@@ -3,7 +3,7 @@ messages! {
     Settings => "Settings", "Paramètres";
     History => "History", "Historique";
     Dictionary => "Dictionary", "Dictionnaire";
-    About => "About Jot", "À propos de Jot";
+    About => "Updates and About", "Mises à jour et À propos";
     Setup => "Set up Jot", "Configurer Jot";
     SetupGuide => "Setup guide…", "Guide de configuration…";
     StartDictation => "Start dictation", "Démarrer la dictée";
@@ -26,8 +26,6 @@ messages! {
     CheckUpdatesHint => "At most once a day, at startup, Jot asks GitHub for the list of published versions. Only the app version is sent; nothing is downloaded or installed for you.", "Une fois par jour au plus, au démarrage, Jot demande à GitHub la liste des versions publiées. Seule la version de l’application est transmise ; rien n’est téléchargé ni installé à votre place.";
     Prereleases => "Include prereleases", "Inclure les préversions";
     PrereleasesHint => "Also announce test versions, which are less proven.", "Annonce aussi les versions de test, moins éprouvées.";
-    UpdateDownload => "Open the download page", "Ouvrir la page de téléchargement";
-    Version => "Version {0}", "Version {0}";
     AboutDescription => "Use your shortcut to dictate in any app. Jot sends the recording directly to the Gemini API with your key.", "Utilisez votre raccourci pour dicter dans n’importe quelle application. Jot envoie l’enregistrement directement à l’API Gemini avec votre clé.";
     AboutLicense => "Jot is distributed under Apache 2.0. The bundled fonts are licensed under SIL OFL 1.1. Google does not officially support Jot.", "Jot est distribué sous licence Apache 2.0. Les polices fournies sont sous licence SIL OFL 1.1. Jot ne bénéficie pas d’une assistance officielle de Google.";
     General => "General", "Général";
