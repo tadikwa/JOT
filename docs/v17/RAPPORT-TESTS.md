@@ -11,7 +11,7 @@ Branche locale `claude/v17`, base v1.6.0 (`b070742`). Rien n'a été poussé, ta
 | ccd3494 | Chantier 1 : page Mises à jour et À propos, installation vérifiée au clic, fermeture accompagnée |
 | bec5c39 | Version 1.7.0, texte À propos (modes local et Gemini) |
 | 11f34ad | Chantier 2 : sauvetage partiel expérimental, désactivé par défaut |
-| (suivant) | Les deux options activées par défaut et proposées dans l'assistant de configuration |
+| 416aa20 | Les deux options activées par défaut et proposées dans l'assistant de configuration |
 
 Tests automatiques : 386 réussis, 0 échec :
 - `jot-core` : 258, plus 4 ignorés qui demandent les vrais modèles ;
