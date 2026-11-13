@@ -219,10 +219,10 @@ pub struct Settings {
     pub keep_rejected_reformulations: bool,
     /// Days before those diagnostics are deleted (the dictation itself stays).
     pub rejected_reformulation_retention_days: i64,
-    /// Experimental, off by default: when the local rewrite of a long dictation
+    /// Experimental, on by default: when the local rewrite of a long dictation
     /// is refused or too slow, rewrite it again piece by piece (`rescue`).
     pub local_partial_rescue: bool,
-    /// Off by default: for 30 s after an insertion, watch only the field that
+    /// On by default: for 30 s after an insertion, watch only the field that
     /// received it and offer what the user corrected there as dictionary
     /// suggestions (never active before review). See `app_learning`.
     pub learn_from_app_corrections: bool,
@@ -262,8 +262,8 @@ impl Default for Settings {
             local_unload: LocalUnload::FiveMinutes,
             keep_rejected_reformulations: false,
             rejected_reformulation_retention_days: 7,
-            local_partial_rescue: false,
-            learn_from_app_corrections: false,
+            local_partial_rescue: true,
+            learn_from_app_corrections: true,
             check_updates: true,
             include_prereleases: false,
             gate_trips: Vec::new(),

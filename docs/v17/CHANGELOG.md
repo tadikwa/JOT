@@ -24,7 +24,7 @@ Base : v1.6.0 (`b070742`). Candidat de test, non publié.
   - Aucun processus n'est tué : jamais de `taskkill`, de `TerminateProcess` ni d'arrêt par nom.
   - `AppMutex` reste le garde-fou contre le remplacement de l'exécutable actif.
 - **À propos** : le texte décrit désormais les deux modes, local (tout sur ce PC) et Gemini (votre clé, envoi direct à l'API).
-- **Expérimental, désactivé par défaut : sauvetage partiel des longues reformulations locales.**
+- **Expérimental, activé par défaut : sauvetage partiel des longues reformulations locales.**
   - Il se déclenche seulement si le contrôle refuse la reformulation entière, ou si elle dépasse le délai, sur une dictée de 60 mots ou plus.
   - Jot retente alors la reformulation par groupes de phrases :
     - il ne coupe qu'entre deux phrases autonomes, jamais au milieu d'une négation, d'un « si… alors », d'un « non, plutôt », d'une citation, d'une adresse IP, d'un chemin ou d'un nombre suivi de son unité ;
@@ -33,7 +33,7 @@ Base : v1.6.0 (`b070742`). Candidat de test, non publié.
   - Le sauvetage est borné à 8 appels, 60 s et deux fois le nombre de mots de la dictée.
   - L'Historique indique « complet », « partiel » ou la transcription brute conservée.
   - Le détail par partie ne va que dans le diagnostic local optionnel, avec sa durée de conservation. Les journaux ne contiennent jamais le texte.
-  - Voir le rapport : la fidélité mesurée ne justifie pas de l'activer par défaut.
+  - Activé par défaut sur décision produit, malgré une fidélité mesurée inférieure au brut (voir le rapport). Se désactive dans Paramètres → Confidentialité ou dans l'assistant de configuration.
 
 ## Corrections
 
@@ -43,10 +43,10 @@ Base : v1.6.0 (`b070742`). Candidat de test, non publié.
   - Les paragraphes et les espaces insécables des éditeurs web ne cassent plus l'ancrage.
   - Une nouvelle faute d'un terme connu (« Jiotte → Jot ») est proposée comme variante à valider.
 - L'icône de la barre des tâches disparaît bien à la fermeture.
+- **Assistant de configuration** : la dernière étape propose de cocher ou décocher « Apprendre de mes corrections après une dictée » (activé par défaut) et, hors mode Gemini seul, le sauvetage partiel (activé par défaut). Un profil existant garde le choix qu'il avait enregistré pour l'apprentissage.
 
 ## Inchangé
 
-- Comportement par défaut de la reformulation : identique à 1.6.0.
 - Réglages, Historique, modèles, presse-papiers et raccourci sont conservés à la mise à jour.
 - Les téléchargements de modèles restent séparés des mises à jour.
 - Aucun réseau pendant une dictée locale.

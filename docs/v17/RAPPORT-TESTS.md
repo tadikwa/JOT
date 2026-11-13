@@ -11,6 +11,7 @@ Branche locale `claude/v17`, base v1.6.0 (`b070742`). Rien n'a été poussé, ta
 | ccd3494 | Chantier 1 : page Mises à jour et À propos, installation vérifiée au clic, fermeture accompagnée |
 | bec5c39 | Version 1.7.0, texte À propos (modes local et Gemini) |
 | 11f34ad | Chantier 2 : sauvetage partiel expérimental, désactivé par défaut |
+| (suivant) | Les deux options activées par défaut et proposées dans l'assistant de configuration |
 
 Tests automatiques : 386 réussis, 0 échec :
 - `jot-core` : 258, plus 4 ignorés qui demandent les vrais modèles ;
@@ -82,7 +83,9 @@ Seuls 2 textes sur 10 sont fidèles. Sur CPU, les sorties diffèrent légèremen
 - **Gain** : sur les longues dictées refusées en bloc, la part reformulée passe de 0/9 à 9/9, au moins partiellement.
 - **Coût** : 8 textes sur 10 perdent une nuance, une condition ou le sens que le brut gardait. La fidélité est donc **dégradée** par rapport au brut inséré par 1.6.0. Sur CPU, l'attente atteint jusqu'à environ 40 s.
 
-**Le sauvetage reste désactivé par défaut.** Il reste disponible comme essai réglable, dans Paramètres → Confidentialité : « Expérimental : sauver les longues reformulations par parties ». Désactivé, le comportement est identique à 1.6.0 : mêmes appels, même texte inséré.
+Recommandation issue de la mesure : ne pas l'activer par défaut.
+
+**Décision produit retenue : activé par défaut**, à la demande du mainteneur. Il est proposé, coché, à la dernière étape de l'assistant de configuration, et reste réglable dans Paramètres → Confidentialité : « Expérimental : sauver les longues reformulations par parties ». Décoché, le comportement est identique à 1.6.0 : mêmes appels, même texte inséré. Le risque mesuré ci-dessus s'applique donc par défaut, sur les dictées locales de 60 mots ou plus refusées en bloc.
 
 Les défauts relevés viennent surtout du contrôle de fidélité, pas du découpage. Le contrôle ne connaît pas :
 - « je crois » ni « je trouve » ;

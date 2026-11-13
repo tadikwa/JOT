@@ -1468,53 +1468,12 @@ impl SettingsView {
                     },
                 )
                 .into_any_element(),
-                widgets::toggle(
-                    "local-partial-rescue",
-                    ui(
-                        "Experimental: rescue long rewrites in parts",
-                        "Expérimental : sauver les longues reformulations par parties",
-                    ),
-                    ui(
-                        "Off by default. Local mode only, for dictations of 60 words or more. When the safety check refuses the whole rewrite, Jot retries it sentence group by sentence group, checks each part and the whole again, and keeps raw any part that fails. At most 8 extra calls and 60 seconds per dictation, all on this PC.",
-                        "Désactivé par défaut. Mode local uniquement, pour les dictées de 60 mots ou plus. Quand le contrôle refuse la reformulation entière, Jot la retente par groupes de phrases, vérifie chaque partie puis l’ensemble, et garde brute toute partie refusée. Au plus 8 appels supplémentaires et 60 secondes par dictée, tout sur ce PC.",
-                    ),
-                    settings.local_partial_rescue,
-                    theme,
-                    {
-                        let store = self.services.settings.clone();
-                        move |_, _, cx| {
-                            store.update(Some("localPartialRescue"), |s| {
-                                s.local_partial_rescue = !s.local_partial_rescue
-                            });
-                            cx.refresh_windows();
-                        }
-                    },
-                )
-                .into_any_element(),
-                widgets::toggle(
-                    "learn-from-app-corrections",
-                    ui(
-                        "Learn from my corrections after a dictation",
-                        "Apprendre de mes corrections après une dictée",
-                    ),
-                    ui(
-                        "Off by default. For 30 seconds after Jot inserts a dictation, Jot reads only the text field that received it, near the cursor, through Windows accessibility. If you correct a word there, Jot proposes it in the Dictionary; nothing applies before you accept it. Never password fields, no screenshots, no keystrokes or window titles stored: only the word pair and the date. Some apps do not allow this; nothing is observed there. Turning it off stops at once and keeps the entries you accepted.",
-                        "Désactivé par défaut. Pendant 30 secondes après l’insertion d’une dictée, Jot lit uniquement le champ qui l’a reçue, autour du curseur, via l’accessibilité Windows. Si vous y corrigez un mot, Jot le propose dans le Dictionnaire ; rien ne s’applique avant votre accord. Jamais les champs de mot de passe, aucune capture d’écran, ni frappes ni titres de fenêtre enregistrés : seulement la paire de mots et la date. Certaines applications ne le permettent pas ; rien n’y est observé. Désactiver arrête immédiatement et conserve les entrées acceptées.",
-                    ),
+                rescue_toggle(&self.services.settings, settings.local_partial_rescue, theme)
+                    .into_any_element(),
+                learning_toggle(
+                    &self.services.settings,
                     settings.learn_from_app_corrections,
                     theme,
-                    {
-                        let store = self.services.settings.clone();
-                        move |_, _, cx| {
-                            store.update(Some("learnFromAppCorrections"), |s| {
-                                s.learn_from_app_corrections = !s.learn_from_app_corrections
-                            });
-                            if !store.get().learn_from_app_corrections {
-                                jot_core::app_learning::stop(false);
-                            }
-                            cx.refresh_windows();
-                        }
-                    },
                 )
                 .into_any_element(),
                 widgets::field_row(
@@ -1841,6 +1800,64 @@ impl SettingsView {
         )
         .into_any_element()
     }
+}
+
+/// Shared with the setup guide, which offers the same two choices.
+pub(super) fn rescue_toggle(
+    store: &Arc<jot_core::settings::SettingsStore>,
+    on: bool,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let store = store.clone();
+    widgets::toggle(
+        "local-partial-rescue",
+        ui(
+            "Experimental: rescue long rewrites in parts",
+            "Expérimental : sauver les longues reformulations par parties",
+        ),
+        ui(
+            "On by default. Local mode only, for dictations of 60 words or more. When the safety check refuses the whole rewrite, Jot retries it sentence group by sentence group, checks each part and the whole again, and keeps raw any part that fails. At most 8 extra calls and 60 seconds per dictation, all on this PC.",
+            "Activé par défaut. Mode local uniquement, pour les dictées de 60 mots ou plus. Quand le contrôle refuse la reformulation entière, Jot la retente par groupes de phrases, vérifie chaque partie puis l’ensemble, et garde brute toute partie refusée. Au plus 8 appels supplémentaires et 60 secondes par dictée, tout sur ce PC.",
+        ),
+        on,
+        theme,
+        move |_, _, cx| {
+            store.update(Some("localPartialRescue"), |s| {
+                s.local_partial_rescue = !s.local_partial_rescue
+            });
+            cx.refresh_windows();
+        },
+    )
+}
+
+pub(super) fn learning_toggle(
+    store: &Arc<jot_core::settings::SettingsStore>,
+    on: bool,
+    theme: Theme,
+) -> gpui::Stateful<gpui::Div> {
+    let store = store.clone();
+    widgets::toggle(
+        "learn-from-app-corrections",
+        ui(
+            "Learn from my corrections after a dictation",
+            "Apprendre de mes corrections après une dictée",
+        ),
+        ui(
+            "On by default. For 30 seconds after Jot inserts a dictation, Jot reads only the text field that received it, near the cursor, through Windows accessibility. If you correct a word there, Jot proposes it in the Dictionary; nothing applies before you accept it. Never password fields, no screenshots, no keystrokes or window titles stored: only the word pair and the date. Some apps do not allow this; nothing is observed there. Turning it off stops at once and keeps the entries you accepted.",
+            "Activé par défaut. Pendant 30 secondes après l’insertion d’une dictée, Jot lit uniquement le champ qui l’a reçue, autour du curseur, via l’accessibilité Windows. Si vous y corrigez un mot, Jot le propose dans le Dictionnaire ; rien ne s’applique avant votre accord. Jamais les champs de mot de passe, aucune capture d’écran, ni frappes ni titres de fenêtre enregistrés : seulement la paire de mots et la date. Certaines applications ne le permettent pas ; rien n’y est observé. Désactiver arrête immédiatement et conserve les entrées acceptées.",
+        ),
+        on,
+        theme,
+        move |_, _, cx| {
+            store.update(Some("learnFromAppCorrections"), |s| {
+                s.learn_from_app_corrections = !s.learn_from_app_corrections
+            });
+            if !store.get().learn_from_app_corrections {
+                jot_core::app_learning::stop(false);
+            }
+            cx.refresh_windows();
+        },
+    )
 }
 
 fn choices<T: Copy + PartialEq + 'static, const N: usize>(

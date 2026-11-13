@@ -689,6 +689,18 @@ impl OnboardingView {
                     theme,
                 ))
                 .child(paragraph(tr(Msg::SetupDoneGuide), theme))
+                .child(super::settings::learning_toggle(
+                    &self.services.settings,
+                    settings.learn_from_app_corrections,
+                    theme,
+                ))
+                .when(self.choice != Some(Choice::Gemini), |done| {
+                    done.child(super::settings::rescue_toggle(
+                        &self.services.settings,
+                        settings.local_partial_rescue,
+                        theme,
+                    ))
+                })
                 .child(widgets::hug(widgets::button(
                     "finish",
                     tr(Msg::Done),
