@@ -283,7 +283,12 @@ impl DictionaryStore {
         }
         self.mutate(|file| {
             let mut added = 0;
-            for candidate in candidates {
+            for mut candidate in candidates {
+                if candidate.term_only
+                    && another_spelling_of_a_known_term(&file.entries, &candidate)
+                {
+                    candidate.term_only = false;
+                }
                 if let Some(existing) = file.suggestions.iter_mut().find(|s| {
                     case_key(&s.wrong) == case_key(&candidate.wrong)
                         && case_key(&s.term) == case_key(&candidate.term)
@@ -575,6 +580,24 @@ impl DictionaryStore {
 fn suggested_entry(suggestion: &DictionarySuggestion) -> DictionaryEntry {
     let misspelling = (!suggestion.term_only).then(|| suggestion.wrong.clone());
     DictionaryEntry::new(&suggestion.term, misspelling)
+}
+
+/// "Jiotte" fixed to "Jot" when Jot is already a term: offered as the term
+/// alone it would be a duplicate and dropped, so the one useful suggestion is
+/// a new misspelling of it (still reviewed before it rewrites anything). Only
+/// one heard word sharing the term's first letter, without an elision:
+/// "les mieux → Lumio" and "d'ocker → Docker" stay term-only.
+fn another_spelling_of_a_known_term(
+    entries: &[DictionaryEntry],
+    suggestion: &DictionarySuggestion,
+) -> bool {
+    use unicode_segmentation::UnicodeSegmentation;
+    let first = |text: &str| text.chars().next().map(|c| c.to_lowercase().to_string());
+    suggestion.wrong.unicode_words().count() == 1
+        && suggestion.wrong.chars().count() >= 3
+        && !suggestion.wrong.contains(['\'', '’', ' '])
+        && first(&suggestion.wrong) == first(&suggestion.term)
+        && entries.iter().any(|e| e.term == suggestion.term)
 }
 
 fn case_key(text: &str) -> String {
@@ -910,6 +933,62 @@ mod tests {
             serde_json::from_str(r#"{"dictationId":"x","correctedAt":"2026-01-01T00:00:00Z"}"#)
                 .unwrap();
         assert_eq!(legacy.origin, LearningOrigin::History);
+    }
+
+    /// Reported on 1.6: "Jot" known, "Jiotte" fixed by hand in the app, and
+    /// nothing was suggested (the term-only suggestion was a duplicate).
+    #[test]
+    fn a_new_misspelling_of_a_known_term_becomes_a_reviewed_rule() {
+        let (_temp, store) = store();
+        assert!(store.add("Jot", None));
+        let fix = app_fix("d1", "Le projet Jiotte avance.", "Le projet Jot avance.");
+        assert_eq!(store.learn_from_app_correction(&fix).unwrap(), 1);
+        let suggestion = store.suggestions()[0].clone();
+        assert_eq!(
+            (
+                suggestion.wrong.as_str(),
+                suggestion.term.as_str(),
+                suggestion.term_only
+            ),
+            ("Jiotte", "Jot", false)
+        );
+        // Not active before review.
+        assert_eq!(store.correct("Jiotte avance"), "Jiotte avance");
+        // Seen again: one suggestion, two sources.
+        store
+            .learn_from_app_correction(&app_fix("d2", "Jiotte encore.", "Jot encore."))
+            .unwrap();
+        assert_eq!(store.suggestions().len(), 1);
+        assert_eq!(store.suggestions()[0].sources.len(), 2);
+        store.accept_suggestion(suggestion.id).unwrap();
+        assert_eq!(store.correct("Jiotte avance"), "Jot avance");
+        assert_eq!(
+            store.entries().iter().filter(|e| e.term == "Jot").count(),
+            2
+        );
+        // Once the rule exists, the same fix suggests nothing more.
+        store
+            .learn_from_app_correction(&app_fix("d3", "Le Jiotte.", "Le Jot."))
+            .unwrap();
+        assert_eq!(store.suggestions().len(), 1);
+        // A phonetic run of words for a known term stays out: no rule
+        // "les mieux → Lumio" rewriting ordinary French.
+        assert!(store.add("Lumio", None));
+        let lumio = app_fix("d4", "J’ai testé les mieux hier.", "J’ai testé Lumio hier.");
+        assert_eq!(store.learn_from_app_correction(&lumio).unwrap(), 0);
+        // An unknown term is still offered as a term only.
+        let unknown = app_fix(
+            "d5",
+            "J’ai testé bio nique hier.",
+            "J’ai testé Pyonix hier.",
+        );
+        assert_eq!(store.learn_from_app_correction(&unknown).unwrap(), 1);
+        assert!(
+            store
+                .suggestions()
+                .iter()
+                .any(|s| s.term == "Pyonix" && s.term_only)
+        );
     }
 
     #[test]

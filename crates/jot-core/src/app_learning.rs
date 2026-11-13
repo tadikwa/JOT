@@ -6,8 +6,10 @@
 //!             inserted text (that is the insertion receipt); keep ≤48 chars of
 //!             context on each side, never the document
 //!   observe ─► same focused element only, every 500 ms, for 30 s at most:
-//!             re-find the segment between the two contexts in a bounded window
-//!             around the caret; ambiguous or missing → nothing learned
+//!             re-find the segment between the two contexts in a window around
+//!             the caret sized to the segment (tight around it, one wider read
+//!             of at most its own length on each side when the caret jumped);
+//!             ambiguous or missing → nothing learned
 //!   finish ─► last edited segment + at least one real key press since the
 //!             insertion → one `Correction` for the existing extractor
 //! ```
@@ -24,9 +26,10 @@ use uuid::Uuid;
 
 /// How long a field is watched after an insertion.
 pub const OBSERVATION: Duration = Duration::from_secs(30);
-/// Longer insertions are not watched: the window read around the caret grows
-/// with them, and a long dictation corrected in one word is still one word.
-pub const MAX_INSERTED_CHARS: usize = 1000;
+/// Longer insertions are not watched. About five minutes of speech: a long
+/// dictation fixed in one word must still teach that word, and the reads stay
+/// sized to the segment, not to the page (see [`tick`]).
+pub const MAX_INSERTED_CHARS: usize = 6000;
 const CONTEXT: usize = 48;
 const TICK: Duration = Duration::from_millis(500);
 const ANCHOR_RETRY: Duration = Duration::from_millis(100);
@@ -37,8 +40,13 @@ const ANCHOR_WAIT: Duration = Duration::from_millis(1500);
 const ANCHOR_WAIT_PER_CHAR: Duration = Duration::from_millis(50);
 
 fn anchor_wait(inserted: &str) -> Duration {
-    let chars = inserted.chars().count().min(crate::win32::MAX_TYPED_CHARS) as u32;
-    ANCHOR_WAIT + ANCHOR_WAIT_PER_CHAR * chars
+    let chars = inserted.chars().count();
+    // Longer text is always pasted: waiting for it to be typed only delayed
+    // the verdict by 12 s on long dictations.
+    if chars > crate::win32::MAX_TYPED_CHARS {
+        return ANCHOR_WAIT;
+    }
+    ANCHOR_WAIT + ANCHOR_WAIT_PER_CHAR * chars as u32
 }
 
 static KEY_DOWNS: AtomicU64 = AtomicU64::new(0);
@@ -54,9 +62,17 @@ fn key_downs() -> u64 {
     KEY_DOWNS.load(Ordering::Relaxed)
 }
 
-/// Line endings differ between controls (`\r` in RichEdit, `\r\n` in Edit).
+/// Line endings differ between controls (`\r` in RichEdit, `\r\n` in Edit),
+/// and a web editor turns pasted blank lines into paragraphs and keeps runs of
+/// spaces as no-break spaces: what is compared is the text, not its layout.
 pub fn normalize(text: &str) -> String {
-    text.replace("\r\n", "\n").replace('\r', "\n")
+    static BREAKS: std::sync::LazyLock<regex::Regex> =
+        std::sync::LazyLock::new(|| regex::Regex::new(r"[ \t]*\n[ \t\n]*").unwrap());
+    let text = text
+        .replace("\r\n", "\n")
+        .replace(['\r', '\u{2028}', '\u{2029}'], "\n")
+        .replace('\u{a0}', " ");
+    BREAKS.replace_all(&text, "\n").into_owned()
 }
 
 /// Where the inserted text sits, as context strings rather than offsets:
@@ -115,7 +131,16 @@ pub fn anchor(
 /// [`anchor`]). None when the contexts are gone (edited, scrolled away) or
 /// match more than one place.
 pub fn locate(anchor: &Anchor, window: &str, at_start: bool, at_end: bool) -> Option<String> {
-    let window = normalize(window);
+    locate_at(anchor, &normalize(window), at_start, at_end).map(|(_, segment)| segment)
+}
+
+/// [`locate`] on an already normalized window, with the segment's byte offset.
+fn locate_at(
+    anchor: &Anchor,
+    window: &str,
+    at_start: bool,
+    at_end: bool,
+) -> Option<(usize, String)> {
     let starts: Vec<usize> = if anchor.at_start {
         (at_start && window.starts_with(&anchor.prefix))
             .then_some(anchor.prefix.len())
@@ -128,7 +153,7 @@ pub fn locate(anchor: &Anchor, window: &str, at_start: bool, at_end: bool) -> Op
             .collect()
     };
     let limit = anchor.inserted.len() * 2 + 256;
-    let mut found: Option<&str> = None;
+    let mut found: Option<(usize, &str)> = None;
     for start in starts {
         let rest = &window[start..];
         let end = if anchor.at_end {
@@ -141,12 +166,12 @@ pub fn locate(anchor: &Anchor, window: &str, at_start: bool, at_end: bool) -> Op
         };
         // Two different candidates, or one swallowing far more than was
         // inserted (the suffix matched much further on): not provable.
-        if segment.len() > limit || found.is_some_and(|f| f != segment) {
+        if segment.len() > limit || found.is_some_and(|(_, f)| f != segment) {
             return None;
         }
-        found = Some(segment);
+        found = Some((start, segment));
     }
-    found.map(str::to_string)
+    found.map(|(start, segment)| (start, segment.to_string()))
 }
 
 /// What a finished observation hands to the dictionary, if anything.
@@ -233,6 +258,9 @@ struct Observation<E> {
     deadline: std::time::Instant,
     /// Consecutive ticks the field was [`Unread::Changing`].
     changing: u32,
+    /// Characters from the segment's start to the caret at the last reading,
+    /// so the next one reads just the segment and its contexts.
+    caret: usize,
 }
 
 /// Why a field could not be read.
@@ -263,19 +291,24 @@ trait Field {
     ) -> Result<CaretText, Unread>;
 }
 
-/// Tries to anchor once. None: not (yet) provably inserted here.
-fn try_anchor<F: Field>(field: &F, watch: &Watch) -> Option<(F::Element, Anchor)> {
-    let element = field.focused(watch.target_pid)?;
+/// Tries to anchor once. Err: not (yet) provably inserted here, and why.
+fn try_anchor<F: Field>(field: &F, watch: &Watch) -> Result<(F::Element, Anchor), &'static str> {
+    let element = field
+        .focused(watch.target_pid)
+        .ok_or("no readable text field focused")?;
     let length = watch.inserted.chars().count();
-    let text = field.read(&element, length + CONTEXT, CONTEXT).ok()?;
+    let text = field
+        .read(&element, length + CONTEXT, CONTEXT)
+        .map_err(|_| "field unreadable")?;
     let anchor = anchor(
         &watch.inserted,
         &text.before,
         &text.after,
         text.at_start,
         text.at_end,
-    )?;
-    Some((element, anchor))
+    )
+    .ok_or("inserted text not found before the caret")?;
+    Ok((element, anchor))
 }
 
 /// One observation tick. Err: the observation is over, and why (logged).
@@ -293,24 +326,50 @@ fn tick<F: Field>(
     if !field.same(&focused, &observation.element) {
         return Err("focus moved to another element");
     }
-    let reach = observation.anchor.inserted.chars().count() * 2 + 2 * CONTEXT + 64;
-    // Focus was just checked to be this field, so a stale range means the
-    // field is mid-edit: skip the tick (nothing counts as seen) a few times.
-    let text = match field.read(&observation.element, reach, reach) {
-        Ok(text) => text,
-        Err(Unread::Changing) if observation.changing < CHANGING_TICKS => {
-            observation.changing += 1;
-            return Ok(());
+    let length = observation
+        .seen
+        .as_ref()
+        .unwrap_or(&observation.anchor.inserted)
+        .chars()
+        .count();
+    // Room for the contexts and for what an edit adds to the segment.
+    let slack = CONTEXT + 64 + length / 8;
+    let caret = observation.caret.min(length);
+    // Tight first: the segment around where the caret was. If the caret
+    // jumped (Ctrl+Home, a click), one read of the whole segment from
+    // wherever it is now; never more than the segment's length beyond it.
+    let mut found = None;
+    for (back, forward) in [
+        (caret + slack, length - caret + slack),
+        (length + slack, length + slack),
+    ] {
+        // Focus was just checked to be this field, so a stale range means the
+        // field is mid-edit: skip the tick (nothing counts as seen) a few times.
+        let text = match field.read(&observation.element, back, forward) {
+            Ok(text) => text,
+            Err(Unread::Changing) if observation.changing < CHANGING_TICKS => {
+                observation.changing += 1;
+                return Ok(());
+            }
+            Err(_) => return Err("field unreadable"),
+        };
+        observation.changing = 0;
+        let caret_chars = normalize(&text.before).chars().count();
+        let window = normalize(&format!("{}{}", text.before, text.after));
+        if let Some((start, segment)) =
+            locate_at(&observation.anchor, &window, text.at_start, text.at_end)
+        {
+            let start_chars = window[..start].chars().count();
+            found = Some((segment, caret_chars.saturating_sub(start_chars)));
+            break;
         }
-        Err(_) => return Err("field unreadable"),
-    };
-    observation.changing = 0;
-    let window = format!("{}{}", text.before, text.after);
+    }
     // The contexts are gone (edited, caret moved far away): stop, keeping only
     // the last stable reading.
-    let Some(segment) = locate(&observation.anchor, &window, text.at_start, text.at_end) else {
+    let Some((segment, caret)) = found else {
         return Err("segment context lost");
     };
+    observation.caret = caret;
     if observation.seen.as_ref() == Some(&segment) {
         observation.edited = (segment != observation.anchor.inserted).then(|| segment.clone());
     }
@@ -358,6 +417,16 @@ fn run_with<F: Field>(field: &F, rx: std::sync::mpsc::Receiver<Command>) {
                 if let Some(observation) = active.take() {
                     finish(observation, "new dictation");
                 }
+                let chars = watch.inserted.chars().count();
+                if chars > MAX_INSERTED_CHARS {
+                    pending = None;
+                    tracing::info!(
+                        chars,
+                        limit = MAX_INSERTED_CHARS,
+                        "correction watch: dictation too long — nothing observed"
+                    );
+                    continue;
+                }
                 let started = std::time::Instant::now();
                 pending = Some((watch, started, key_downs()));
             }
@@ -375,7 +444,7 @@ fn run_with<F: Field>(field: &F, rx: std::sync::mpsc::Receiver<Command>) {
         }
         if let Some((watch, started, keys_at_start)) = pending.take() {
             match try_anchor(field, &watch) {
-                Some((element, anchor)) => {
+                Ok((element, anchor)) => {
                     tracing::info!(
                         after_ms = started.elapsed().as_millis() as u64,
                         "correction watch: anchored"
@@ -383,18 +452,25 @@ fn run_with<F: Field>(field: &F, rx: std::sync::mpsc::Receiver<Command>) {
                     active = Some(Observation {
                         watch,
                         element,
-                        anchor,
                         keys_at_start,
                         seen: None,
                         edited: None,
                         deadline: started + OBSERVATION,
                         changing: 0,
+                        caret: anchor.inserted.chars().count(),
+                        anchor,
                     });
                 }
-                None if started.elapsed() < anchor_wait(&watch.inserted) => {
+                Err(_) if started.elapsed() < anchor_wait(&watch.inserted) => {
                     pending = Some((watch, started, keys_at_start))
                 }
-                None => tracing::info!("correction watch: field not compatible — nothing observed"),
+                // Never the text: the step that failed, so "not a text field"
+                // and "not found" read apart from "too long" in the log.
+                Err(why) => tracing::info!(
+                    why,
+                    chars = watch.inserted.chars().count(),
+                    "correction watch: field not compatible — nothing observed"
+                ),
             }
             continue;
         }
@@ -759,6 +835,8 @@ mod tests {
         caret: usize,
         focus: Option<u32>,
         changing_reads: u32,
+        /// The longest read asked for, either side of the caret.
+        widest: usize,
     }
 
     #[derive(Clone, Default)]
@@ -788,6 +866,7 @@ mod tests {
                 state.changing_reads -= 1;
                 return Err(Unread::Changing);
             }
+            state.widest = state.widest.max(back).max(forward);
             let (text, caret) = (state.text.clone(), state.caret);
             let chars: Vec<char> = text.chars().collect();
             let start = caret.saturating_sub(back);
@@ -815,8 +894,18 @@ mod tests {
         text: &str,
         script: impl FnOnce(&Fake, &std::sync::mpsc::Sender<Command>),
     ) -> Vec<Correction> {
+        run_case_with(INSERTED, text, text.chars().count(), script).0
+    }
+
+    /// [`run_case`] for any inserted text and caret; also returns the widest read.
+    fn run_case_with(
+        inserted: &str,
+        text: &str,
+        caret: usize,
+        script: impl FnOnce(&Fake, &std::sync::mpsc::Sender<Command>),
+    ) -> (Vec<Correction>, usize) {
         let fake = Fake::default();
-        fake.set(text, text.chars().count(), Some(1));
+        fake.set(text, caret, Some(1));
         let learned = Arc::new(Mutex::new(Vec::new()));
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = {
@@ -826,7 +915,7 @@ mod tests {
         let sink = learned.clone();
         tx.send(Command::Start(Watch {
             dictation_id: Uuid::nil(),
-            inserted: INSERTED.into(),
+            inserted: inserted.into(),
             target_pid: None,
             sink: Box::new(move |c| sink.lock().push(c)),
         }))
@@ -836,7 +925,114 @@ mod tests {
         tx.send(Command::Stop { learn: true }).unwrap();
         drop(tx);
         worker.join().unwrap();
-        learned.lock().clone()
+        let widest = fake.0.lock().widest;
+        (learned.lock().clone(), widest)
+    }
+
+    /// About two minutes of speech (≈ 2,000 characters, several paragraphs),
+    /// no two sentences alike, with "Loustream" at the start, middle and end.
+    fn long_dictation() -> String {
+        let mut text = String::from("Loustream démarre le matin. ");
+        for i in 1..=36 {
+            text.push_str(&format!(
+                "Point {i} : le service numéro {i} redémarre puis PowerShell relance la file {i}. "
+            ));
+            if i == 12 || i == 24 {
+                text.push_str("\n\n");
+            }
+            if i == 18 {
+                text.push_str("Ensuite Loustream reprend la main. ");
+            }
+        }
+        text.push_str("Enfin on ferme Loustream.");
+        text
+    }
+
+    /// The Brave/ChatGPT case of 1.6: a long dictation fixed in one word is
+    /// learned wherever the word is, and every read stays sized to the
+    /// dictation, never to the page around it.
+    #[test]
+    fn a_long_dictation_fixed_in_one_word_is_learned_at_start_middle_and_end() {
+        let inserted = long_dictation();
+        assert!(inserted.chars().count() > 2_000 && inserted.chars().count() < MAX_INSERTED_CHARS);
+        let page_head: String = (0..200)
+            .map(|i| format!("Message précédent {i} de la conversation. "))
+            .collect();
+        let page_tail: String = (0..200)
+            .map(|i| format!(" Suggestion {i} du site."))
+            .collect();
+        let document = |body: &str| format!("{page_head}{body}{page_tail}");
+        let segment_start = page_head.chars().count();
+        let length = inserted.chars().count();
+        let occurrences: Vec<usize> = inserted
+            .match_indices("Loustream")
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(occurrences.len(), 3);
+        for (place, byte) in occurrences.into_iter().enumerate() {
+            let fixed = format!("{}Loostream{}", &inserted[..byte], &inserted[byte + 9..]);
+            // The user clicked into the word: the caret jumps there.
+            let caret = segment_start + inserted[..byte].chars().count() + 4;
+            let (found, widest) = run_case_with(
+                &inserted,
+                &document(&inserted),
+                segment_start + length,
+                |fake, _| {
+                    fake.set(&document(&fixed), caret, Some(1));
+                    note_key_down();
+                    wait(1600);
+                },
+            );
+            assert_eq!(found.len(), 1, "place {place}");
+            assert_eq!(found[0].after, normalize(&fixed), "place {place}");
+            let learned = crate::dictionary::app_suggestions(&found[0]);
+            assert_eq!(
+                learned
+                    .iter()
+                    .map(|s| (s.wrong.as_str(), s.term.as_str()))
+                    .collect::<Vec<_>>(),
+                [("Loustream", "Loostream")],
+                "place {place}"
+            );
+            // One segment plus its contexts and slack, whatever the page holds.
+            assert!(
+                widest <= length + length / 8 + CONTEXT + 64 + 32,
+                "read {widest} chars around a {length}-char dictation"
+            );
+        }
+    }
+
+    #[test]
+    fn a_dictation_over_the_limit_is_not_watched_and_says_so() {
+        let inserted = "Loustream. ".repeat(MAX_INSERTED_CHARS / 10);
+        let (found, widest) =
+            run_case_with(&inserted, &inserted, inserted.chars().count(), |fake, _| {
+                fake.set(&inserted.replacen("Loustream", "Loostream", 1), 3, Some(1));
+                note_key_down();
+                wait(600);
+            });
+        assert!(found.is_empty());
+        assert_eq!(widest, 0, "a too long dictation is never read");
+    }
+
+    /// A web editor shows pasted blank lines as paragraphs and keeps double
+    /// spaces as no-break spaces; the receipt must still hold.
+    #[test]
+    fn paragraphs_and_no_break_spaces_still_anchor() {
+        let inserted = "Premier paragraphe.\n\nDeuxième  paragraphe avec Loustream.";
+        let shown = "Premier paragraphe.\nDeuxième\u{a0} paragraphe avec Loustream.";
+        let a = anchor(inserted, shown, "", true, true).unwrap();
+        assert_eq!(
+            locate(&a, &shown.replace("Loustream", "Loostream"), true, true).as_deref(),
+            Some("Premier paragraphe.\nDeuxième  paragraphe avec Loostream.")
+        );
+    }
+
+    #[test]
+    fn a_pasted_dictation_is_not_waited_for_as_if_typed() {
+        let long = "x".repeat(crate::win32::MAX_TYPED_CHARS + 1);
+        assert_eq!(anchor_wait(&long), ANCHOR_WAIT);
+        assert!(anchor_wait("court") > ANCHOR_WAIT);
     }
 
     #[test]

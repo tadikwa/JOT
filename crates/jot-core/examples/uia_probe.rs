@@ -4,7 +4,9 @@
 //!
 //! Scenarios: fix (Loustream → Loostream inside the segment), outside (an
 //! edit before the segment only), none (no edit), long (≈700 chars, several
-//! lines, then the same fix), timeout (fix, then let the 30 s window expire).
+//! lines, then the same fix), long-start / long-middle / long-end (≈2,000
+//! chars, about two minutes of speech with paragraphs, fixed in one word at
+//! that place), timeout (fix, then let the 30 s window expire).
 //! Prints the field's UIA identity, the insertion outcome, how long the
 //! insertion receipt took, read latency, CPU used and what would be learned.
 //! Never prints the field's text. Synthetic keys stand in for the user, so the
@@ -40,7 +42,7 @@ mod win {
     use windows::Win32::UI::Input::KeyboardAndMouse::{
         INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
         KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_END,
-        VK_HOME, VK_LEFT, VK_RCONTROL, VK_RETURN, VK_SHIFT,
+        VK_HOME, VK_LEFT, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_SHIFT,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, EnumWindows, GetForegroundWindow, GetWindowTextW,
@@ -58,6 +60,34 @@ mod win {
             text.push('\n');
         }
         text.push_str(SHORT);
+        text
+    }
+
+    /// About two minutes of speech, no two sentences alike, "Loustream" at the
+    /// start, middle and end. Paragraphs only before the middle one, so the
+    /// arrows counted back from the end never cross a paragraph boundary.
+    fn two_minutes() -> String {
+        let mut text = String::from("Loustream démarre le matin. ");
+        for i in 1..=24 {
+            text.push_str(&format!(
+                "Point {i} : le service numéro {i} redémarre puis PowerShell relance la file {i}. "
+            ));
+            if i == 6 {
+                text.push_str(
+                    "
+
+",
+                );
+            }
+            if i == 12 {
+                text.push_str(
+                    "
+
+Ensuite Loustream reprend la main. ",
+                );
+            }
+        }
+        text.push_str("Enfin on ferme Loustream.");
         text
     }
 
@@ -205,6 +235,8 @@ mod win {
 
         let text = if scenario == "long" {
             long_text()
+        } else if scenario.starts_with("long-") {
+            two_minutes()
         } else {
             SHORT.to_string()
         };
@@ -300,6 +332,24 @@ mod win {
                 // Caret after "Lou" in "Loustream.", replace the "u" by an "o".
                 for _ in 0..7 {
                     key(VK_LEFT);
+                }
+                key(VK_BACK);
+                type_char('o');
+                (0..9).for_each(|_| app_learning::note_key_down());
+            }
+            // Caret after "Lou" of the chosen "Loustream", replace the "u" by an "o".
+            "long-start" | "long-middle" | "long-end" => {
+                if scenario == "long-start" {
+                    chord(VK_CONTROL, VK_HOME);
+                    (0..3).for_each(|_| key(VK_RIGHT));
+                } else {
+                    let at = if scenario == "long-middle" {
+                        text.find("Loustream reprend").unwrap()
+                    } else {
+                        text.rfind("Loustream").unwrap()
+                    };
+                    chord(VK_CONTROL, VK_END);
+                    (0..text[at + 3..].chars().count()).for_each(|_| key(VK_LEFT));
                 }
                 key(VK_BACK);
                 type_char('o');
