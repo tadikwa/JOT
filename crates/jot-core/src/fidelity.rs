@@ -20,6 +20,11 @@ pub fn check(raw: &str, cleaned: &str) -> Result<(), &'static str> {
     if !said.is_subset(&raw_numbers) {
         return Err("number_changed");
     }
+    // Same values in another order: 192.168.1.50 is not 192.168.50.1.
+    let raw_dotted = dotted(raw);
+    if dotted(cleaned).iter().any(|seq| !raw_dotted.contains(seq)) {
+        return Err("number_changed");
+    }
     // A spoken « deux points » may be the colon (« C deux-points antislash ») or
     // a quantity: its 2 is allowed in the output, not required.
     let required = numbers(&COLON.replace_all(raw, " : "));
@@ -71,10 +76,17 @@ pub fn explain(raw: &str, cleaned: &str, reason: &str) -> Option<String> {
     };
     let values = |set: BTreeSet<u64>| set.iter().map(u64::to_string).collect::<Vec<_>>();
     let (what, terms) = match reason {
-        "number_changed" => (
-            "nombre absent du brut",
-            values(&numbers(&LIST_MARKER.replace_all(cleaned, "")) - &numbers(raw)),
-        ),
+        "number_changed" => ("nombre absent du brut", {
+            let raw_dotted = dotted(raw);
+            let mut terms = values(&numbers(&LIST_MARKER.replace_all(cleaned, "")) - &numbers(raw));
+            terms.extend(
+                dotted(cleaned)
+                    .into_iter()
+                    .filter(|seq| !raw_dotted.contains(seq))
+                    .map(|seq| seq.iter().map(u64::to_string).collect::<Vec<_>>().join(".")),
+            );
+            terms
+        }),
         "number_lost" => (
             "nombre du brut absent de la reformulation",
             values(
@@ -352,9 +364,194 @@ pub fn numbers(text: &str) -> BTreeSet<u64> {
     found
 }
 
+/// The single value `words` spell (« cent soixante-huit », « 168 »), if they
+/// spell exactly one.
+fn one_value(words: &[&str]) -> Option<u64> {
+    if let [w] = words
+        && w.bytes().all(|b| b.is_ascii_digit())
+    {
+        return w.parse().ok();
+    }
+    let mut spoken = Spoken::default();
+    let mut found = BTreeSet::new();
+    for w in words {
+        for (i, part) in w.split('-').enumerate() {
+            if part == "et" && matches!(spoken.last, Some((_, Kind::Tens))) {
+                continue;
+            }
+            let (value, kind) = word(part)?;
+            spoken.push(value, kind, i > 0, &mut found);
+            if !found.is_empty() {
+                return None;
+            }
+        }
+    }
+    spoken.flush(&mut found);
+    found.pop_first()
+}
+
+/// Numbers joined by « . » or a spoken « point », in order: versions (1.7.1)
+/// and addresses (192.168.1.50), whose order [`numbers`] cannot see. A « point »
+/// without a number on each side (« qu'un point à discuter ») joins nothing.
+/// shortcut: « , » and « virgule » are read as decimals, not joins; add them if
+/// a version dictated that way shows up.
+fn dotted(text: &str) -> Vec<Vec<u64>> {
+    static DOT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(\d)\.(\d)").unwrap());
+    static GLUED: LazyLock<Regex> =
+        LazyLock::new(|| Regex::new(r"(\p{L})(\d)|(\d)(\p{L})").unwrap());
+    let mut text = text.to_lowercase();
+    // Twice: the matches of « 1.7.1 » overlap.
+    for _ in 0..2 {
+        text = DOT.replace_all(&text, "$1 point $2").into_owned();
+    }
+    let text = GLUED.replace_all(&text, "$1$3 $2$4");
+    let tokens: Vec<&str> = text
+        .split(|c: char| !(c.is_alphanumeric() || c == '-'))
+        .filter(|t| !t.is_empty())
+        .collect();
+    let segments: Vec<&[&str]> = tokens.split(|t| *t == "point").collect();
+    let tail = |s: &[&str]| (0..s.len()).find_map(|i| one_value(&s[i..]));
+    let head = |s: &[&str]| (1..=s.len()).rev().find_map(|j| one_value(&s[..j]));
+    let mut found = Vec::new();
+    let mut k = 0;
+    while k + 1 < segments.len() {
+        let (Some(first), Some(second)) = (tail(segments[k]), head(segments[k + 1])) else {
+            k += 1;
+            continue;
+        };
+        let mut seq = vec![first, second];
+        k += 1;
+        while k + 1 < segments.len() && one_value(segments[k]).is_some() {
+            let Some(next) = head(segments[k + 1]) else {
+                break;
+            };
+            seq.push(next);
+            k += 1;
+        }
+        found.push(seq);
+    }
+    found
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dotted_numbers_keep_their_order() {
+        let none = Vec::<Vec<u64>>::new();
+        assert_eq!(
+            dotted(
+                "Mon adresse est cent quatre-vingt-douze point cent soixante-huit point un point cinquante."
+            ),
+            vec![vec![192, 168, 1, 50]]
+        );
+        assert_eq!(
+            dotted("Mon adresse est 192.168.1.50."),
+            vec![vec![192, 168, 1, 50]]
+        );
+        assert_eq!(
+            dotted("Jot un point sept point un, puis la v2.0 et Python 3 point 12."),
+            vec![vec![1, 7, 1], vec![2, 0], vec![3, 12]]
+        );
+        assert_eq!(dotted("Il n'y a qu'un point à discuter."), none);
+        assert_eq!(
+            dotted("Voici mon premier point et mon deuxième point. Un point important."),
+            none
+        );
+        assert_eq!(dotted("1. Branche le câble.\n2. Ouvre."), none);
+        assert_eq!(
+            dotted("la un point six et deux deux point trois"),
+            vec![vec![1, 6], vec![2, 3]]
+        );
+    }
+
+    #[test]
+    fn spoken_numbers_written_in_digits_pass_and_altered_ones_do_not() {
+        let ip = "Mon adresse est cent quatre-vingt-douze point cent soixante-huit point un point cinquante.";
+        let ok = [
+            (
+                "J'utilise la version un point sept de Jot.",
+                "J'utilise la version 1.7 de Jot.",
+            ),
+            (
+                "L'ancienne vidéo parle de Jot un point cinq.",
+                "L'ancienne vidéo parle de Jot 1.5.",
+            ),
+            (
+                "Il faudra publier Jot un point sept point un.",
+                "Il faudra publier Jot 1.7.1.",
+            ),
+            (
+                "Nous sommes en deux mille vingt-six.",
+                "Nous sommes en 2026.",
+            ),
+            (
+                "Le prix est de vingt dollars.",
+                "Le prix est de 20 dollars.",
+            ),
+            ("Le prix est de vingt dollars.", "Le prix est de 20 $."),
+            (
+                "Le serveur a seize gigas de RAM et quatre processeurs virtuels.",
+                "Le serveur a 16 Go de RAM et 4 processeurs virtuels.",
+            ),
+            (ip, "Mon adresse est 192.168.1.50."),
+            (
+                "Ce n'est pas la version un point sept, non, c'est la version un point cinq.",
+                "Ce n'est pas la version 1.7, c'est la version 1.5.",
+            ),
+            (
+                "Ce n'est pas la version un point sept, non, c'est la version un point cinq.",
+                "C'est la version 1.5.",
+            ),
+            (
+                "Il n'y a qu'un point à discuter.",
+                "Il n'y a qu'un point à discuter.",
+            ),
+            (
+                "Voici mon premier point et mon deuxième point.",
+                "Voici mon premier point et mon deuxième point.",
+            ),
+        ];
+        for (raw, cleaned) in ok {
+            assert_eq!(check(raw, cleaned), Ok(()), "{cleaned}");
+        }
+        let bad = [
+            (
+                "J'utilise la version un point sept de Jot.",
+                "J'utilise la version 1.8 de Jot.",
+            ),
+            (
+                "J'utilise la version un point sept de Jot.",
+                "J'utilise la version 7.1 de Jot.",
+            ),
+            (
+                "Le prix est de vingt dollars.",
+                "Le prix est de 200 dollars.",
+            ),
+            (ip, "Mon adresse est 192.168.50.1."),
+            (
+                "Mon adresse est 192.168.1.50.",
+                "Mon adresse est 192.168.50.1.",
+            ),
+            (
+                "Il faudra publier Jot un point sept point un.",
+                "Il faudra publier Jot 1.1.7.",
+            ),
+        ];
+        for (raw, cleaned) in bad {
+            assert_eq!(check(raw, cleaned), Err("number_changed"), "{cleaned}");
+        }
+        assert_eq!(
+            explain(
+                "Mon adresse est 192.168.1.50.",
+                "Mon adresse est 192.168.50.1.",
+                "number_changed"
+            )
+            .as_deref(),
+            Some("nombre absent du brut : « 192.168.50.1 »")
+        );
+    }
 
     fn set(values: &[u64]) -> BTreeSet<u64> {
         values.iter().copied().collect()
