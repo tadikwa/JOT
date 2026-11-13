@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const CURRENT: &str = env!("CARGO_PKG_VERSION");
-const RELEASES_PAGE: &str = "https://github.com/tadikwa/JOT/releases";
+const RELEASES_PAGE: &str = "https://github.com/tadikwa/Jot/releases";
 
 fn fr() -> bool {
     matches!(crate::i18n::locale(), crate::i18n::Locale::Fr)

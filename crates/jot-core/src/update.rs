@@ -42,12 +42,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// The JSON API is the only place prereleases and "no release yet" can be told
 /// apart (`/releases/latest` hides both). Its 60 requests per hour per IP are
 /// plenty for one request a day; the ETag makes repeats free.
-const RELEASES: &str =
-    "https://api.github.com/repos/tadikwa/JOT/releases?per_page=30";
+const RELEASES: &str = "https://api.github.com/repos/tadikwa/Jot/releases?per_page=30";
 
 /// Where this fork's release files live; any other URL in a reply is refused.
-const DOWNLOADS: &str =
-    "https://github.com/tadikwa/JOT/releases/download/";
+const DOWNLOADS: &str = "https://github.com/tadikwa/Jot/releases/download/";
 
 /// The sums file lists two or three lines; anything bigger is not it.
 const MAX_SUMS_BYTES: u64 = 64 * 1024;
@@ -716,12 +714,137 @@ mod tests {
     fn official_update_endpoints_use_current_repository() {
         assert_eq!(
             RELEASES,
-            "https://api.github.com/repos/tadikwa/JOT/releases?per_page=30"
+            "https://api.github.com/repos/tadikwa/Jot/releases?per_page=30"
         );
         assert_eq!(
             DOWNLOADS,
-            "https://github.com/tadikwa/JOT/releases/download/"
+            "https://github.com/tadikwa/Jot/releases/download/"
         );
+    }
+
+    #[test]
+    fn only_the_exact_current_repository_is_trusted_for_assets() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let with_base = |base: &str| {
+            // Size 0 fails right after the origin check, before any request.
+            let mut update = candidate(base, 0, true);
+            update.version = "1.7.1".into();
+            for a in &mut update.assets {
+                a.name = a.name.replace("1.7.0", "1.7.1");
+                a.browser_download_url = format!("{base}v1.7.1/{}", a.name);
+            }
+            let progress = Download::default();
+            runtime.block_on(download_from(
+                &update,
+                "1.7.0",
+                &progress,
+                DOWNLOADS,
+                temp.path(),
+            ))
+        };
+        // The URLs GitHub really returns for this repository pass the origin check.
+        assert_eq!(
+            with_base("https://github.com/tadikwa/Jot/releases/download/"),
+            Err(DownloadError::SizeMismatch)
+        );
+        for foreign in [
+            "https://github.com/tadikwa/JOT/releases/download/",
+            "https://github.com/tadikwa/jot/releases/download/",
+            "https://github.com/tadikwa/jot-gemini-transcribe-Windows/releases/download/",
+            "https://github.com/ubranch/jot-gemini-transcribe-Windows/releases/download/",
+            "https://github.com/someone/Jot/releases/download/",
+            "http://github.com/tadikwa/Jot/releases/download/",
+            "https://github.com/tadikwa/Jot/releases/download/v1.7.0/../",
+        ] {
+            assert_eq!(
+                with_base(foreign),
+                Err(DownloadError::UnexpectedSource),
+                "{foreign}"
+            );
+        }
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_1_7_0_cache_is_refetched_without_its_etag_and_keeps_the_notice() {
+        let _guard = file_layout::TEST_ROOT_LOCK.lock();
+        let temp = tempfile::tempdir().unwrap();
+        file_layout::set_override_root(Some(temp.path().to_path_buf()));
+        // What 1.7.0 wrote: schema 2, fresh, with the old repository's URLs.
+        let old = serde_json::json!({
+            "schema": 2, "checkedAt": now(), "etag": "\"old\"", "notified": "1.7.0",
+            "releases": [{
+                "tag_name": "v1.7.0",
+                "html_url": "https://github.com/tadikwa/jot-gemini-transcribe-Windows/releases/tag/v1.7.0",
+                "assets": [{"name": "Jot-1.7.0-setup.exe", "size": 1,
+                    "browser_download_url": "https://github.com/tadikwa/jot-gemini-transcribe-Windows/releases/download/v1.7.0/Jot-1.7.0-setup.exe"}]
+            }]
+        });
+        std::fs::write(cache_path(), old.to_string()).unwrap();
+        assert_eq!(
+            cached("1.7.0", false),
+            None,
+            "a stale schema is never shown"
+        );
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let body = serde_json::json!([{
+            "tag_name": "v1.7.1",
+            "html_url": "https://github.com/tadikwa/Jot/releases/tag/v1.7.1",
+            "assets": [{"name": "Jot-1.7.1-setup.exe", "size": 1,
+                "browser_download_url": "https://github.com/tadikwa/Jot/releases/download/v1.7.1/Jot-1.7.1-setup.exe"}]
+        }])
+        .to_string();
+        let seen = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let replies = [
+                format!(
+                    "HTTP/1.1 200 OK\r\netag: \"new\"\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                ),
+                "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    .to_string(),
+            ];
+            let mut requests = Vec::new();
+            for reply in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buffer = [0u8; 4096];
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                requests.push(String::from_utf8_lossy(&buffer[..read]).to_lowercase());
+                let _ = stream.write_all(reply.as_bytes());
+            }
+            requests
+        });
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let url = format!("http://127.0.0.1:{port}/releases");
+        // Fresh by age, but the schema forces a request anyway.
+        let first = runtime.block_on(check_at(&url, "1.7.0", false, DAILY));
+        let Ok(Outcome::Available(update)) = first else {
+            panic!("{first:?}")
+        };
+        assert!(
+            update.assets[0]
+                .browser_download_url
+                .starts_with(&format!("{DOWNLOADS}v1.7.1/"))
+        );
+        // An unchanged list (304) keeps what the 200 stored.
+        let second = runtime.block_on(check_at(&url, "1.7.0", false, Duration::ZERO));
+        assert_eq!(second, Ok(Outcome::Available(update)));
+        let requests = seen.join().unwrap();
+        assert!(!requests[0].contains("if-none-match"), "old ETag dropped");
+        assert!(requests[1].contains("if-none-match: \"new\""));
+        let cache = read_cache();
+        assert_eq!(cache.schema, CACHE_SCHEMA);
+        assert_eq!(cache.notified.as_deref(), Some("1.7.0"), "notice kept");
+        file_layout::set_override_root(None);
     }
 
     fn release(tag: &str, prerelease: bool, draft: bool) -> Release {

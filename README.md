@@ -4,8 +4,8 @@
 Transcription par Gemini ou **entièrement sur votre PC**, reformulation intelligente, historique et
 raccourcis personnalisables. Gratuit, open source (Apache 2.0), écrit en Rust avec [GPUI](https://www.gpui.rs).
 
-**[Télécharger Jot 1.7.0](https://github.com/tadikwa/JOT/releases/latest)** :
-installateur ou version portable, Windows 10/11 64 bits. La [page de la version 1.5.0](https://github.com/tadikwa/JOT/releases/tag/v1.5.0)
+**[Télécharger Jot 1.7.0](https://github.com/tadikwa/Jot/releases/latest)** :
+installateur ou version portable, Windows 10/11 64 bits. La [page de la version 1.5.0](https://github.com/tadikwa/Jot/releases/tag/v1.5.0)
 contient une vidéo de démonstration d’une minute.
 
 <p align="center">
@@ -80,7 +80,7 @@ Chaque dictée est conservée dans l’historique, avec sa transcription brute e
 
 ## Installation
 
-Téléchargez depuis la [page des versions](https://github.com/tadikwa/JOT/releases/latest) :
+Téléchargez depuis la [page des versions](https://github.com/tadikwa/Jot/releases/latest) :
 
 - **`Jot-1.7.0-setup.exe`** : installateur pour votre seul compte, **sans droits administrateur**,
   dans `%LOCALAPPDATA%\Programs\Jot`. Raccourci dans le menu Démarrer, raccourci sur le bureau en
@@ -193,8 +193,8 @@ Prérequis : la chaîne Rust indiquée dans `rust-toolchain.toml` et les outils 
 [Inno Setup 6](https://jrsoftware.org/isinfo.php).
 
 ```powershell
-git clone https://github.com/tadikwa/JOT
-cd JOT
+git clone https://github.com/tadikwa/Jot
+cd Jot
 cargo build --release -p jot --locked
 .\target\release\jot.exe
 ```
@@ -229,7 +229,7 @@ pour Qwen3-ASR et Qwen3.5.
 - Application d’origine : [Jot pour macOS](https://github.com/google-gemini/jot-gemini-transcribe-macOS),
   par Ammaar Reshi.
 - Portage Windows en Rust/GPUI : [ubranch/jot-gemini-transcribe-Windows](https://github.com/ubranch/jot-gemini-transcribe-Windows).
-- Ce fork, [tadikwa/JOT](https://github.com/tadikwa/JOT),
+- Ce fork, [tadikwa/Jot](https://github.com/tadikwa/Jot),
   ajoute notamment l’interface française, le mode local, la reformulation intelligente, le mode Toggle,
   l’historique avancé, le tableau de bord, le dictionnaire intelligent et les raccourcis personnalisables.
 
