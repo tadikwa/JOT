@@ -1059,7 +1059,7 @@ Objectif : le même message, tel que son auteur l'aurait écrit, fluide et direc
 const PROMPT_LISTS: &str = r#"Listes : seulement quand la dictée est essentiellement une énumération. Des étapes à suivre deviennent une liste numérotée (1., 2., 3.), une étape par ligne, dans l'ordre que l'auteur a finalement voulu : s'il se reprend (« attends, avant ça… »), l'étape va là où il le dit. Des éléments sans ordre (achats, points à aborder) deviennent une liste à puces (« - »), un élément par ligne. Un élément que l'auteur retire (« ah non, pas de fromage ») n'apparaît pas. L'introduction de l'auteur (« pour installer le serveur », « pour samedi il faut ») est une information : garde-la avant la liste, terminée par « : ». Moins de deux étapes ou éléments ne font pas une liste. Tout le reste reste en phrases et en paragraphes : récit, compte rendu, avis, explication, question, et la demande d'une liste (« fais-moi une liste de… »).
 
 "#;
-const PROMPT_MIDDLE: &str = r#"À corriger : ponctuation, majuscules, orthographe, grammaire ; phrases hachées reliées ; heures et quantités en chiffres (10 h, 4 Go). Une dictée sans hésitation, répétition ni reprise ne reçoit que ces corrections.
+const PROMPT_MIDDLE: &str = r#"À corriger : ponctuation, majuscules, orthographe, grammaire ; phrases hachées reliées ; heures, dates, années, prix, quantités et mesures en chiffres (10 h, 12 mars, 2026, 20 dollars, 16 Go) ; numéros de version et adresses en chiffres séparés par des points (version 2.4.1, 10.0.0.1), sans changer un chiffre ni ajouter d'unité ; « un » article et « un point » sans nombre restent en lettres. Une dictée sans hésitation, répétition ni reprise ne reçoit que ces corrections.
 
 Exemple 1 :
 <dictee>Bon alors en fait j'ai, j'ai testé la nouvelle version. En fait ça marche. Ça marche bien, voilà. Par contre, euh, l'export PDF il plante encore, je crois.</dictee>
@@ -1588,8 +1588,8 @@ mod tests {
             let system = value["system"].as_str().unwrap().to_string();
             (system, value["user"].as_str().unwrap().replace("{}", "x"))
         };
-        let prose = variant(include_str!("../../../docs/v151/bench/variants/v151j.json"));
-        let lists = variant(include_str!("../../../docs/v151/bench/variants/v151n.json"));
+        let prose = variant(include_str!("../../../docs/v171/bench/variants/v171j.json"));
+        let lists = variant(include_str!("../../../docs/v171/bench/variants/v171n.json"));
         assert_eq!(system_prompt(&[], false), prose.0);
         assert_eq!(system_prompt(&[], true), lists.0);
         assert_eq!(user_message("x", false), prose.1);
