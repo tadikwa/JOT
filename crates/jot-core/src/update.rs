@@ -712,6 +712,18 @@ fn compare_pre(a: &str, b: &str) -> Ordering {
 mod tests {
     use super::*;
 
+    #[test]
+    fn official_update_endpoints_use_current_repository() {
+        assert_eq!(
+            RELEASES,
+            "https://api.github.com/repos/tadikwa/JOT/releases?per_page=30"
+        );
+        assert_eq!(
+            DOWNLOADS,
+            "https://github.com/tadikwa/JOT/releases/download/"
+        );
+    }
+
     fn release(tag: &str, prerelease: bool, draft: bool) -> Release {
         Release {
             tag_name: tag.into(),
