@@ -1,0 +1,7 @@
+Jot 1.7.0 — build Draft local (non publié, non signé), commit 11f34ad, scripts/package.ps1
+SHA-256 vérifié deux fois (Get-FileHash dans package.ps1, puis sha256sum) :
+
+7f8e5f024bde3913b90cd5ca3b16babb92f230654e01d216810814796cc0e72d  Jot-1.7.0-setup.exe      (9 980 501 octets)
+158520ee49ae85915b1b2d357e3cb3aa4fc8e177b060da08d7772149fe7a47a2  Jot-1.7.0-portable.zip   (11 485 517 octets)
+
+Version de fichier de jot.exe et du setup : 1.7.0. Signature Authenticode : aucune.
