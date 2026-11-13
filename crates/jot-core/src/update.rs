@@ -43,11 +43,11 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 /// apart (`/releases/latest` hides both). Its 60 requests per hour per IP are
 /// plenty for one request a day; the ETag makes repeats free.
 const RELEASES: &str =
-    "https://api.github.com/repos/tadikwa/jot-gemini-transcribe-Windows/releases?per_page=30";
+    "https://api.github.com/repos/tadikwa/JOT/releases?per_page=30";
 
 /// Where this fork's release files live; any other URL in a reply is refused.
 const DOWNLOADS: &str =
-    "https://github.com/tadikwa/jot-gemini-transcribe-Windows/releases/download/";
+    "https://github.com/tadikwa/JOT/releases/download/";
 
 /// The sums file lists two or three lines; anything bigger is not it.
 const MAX_SUMS_BYTES: u64 = 64 * 1024;
@@ -135,9 +135,9 @@ pub struct Asset {
     pub browser_download_url: String,
 }
 
-/// Bumped when [`Release`] gains fields: an older cache's ETag would otherwise
-/// keep answering 304 for a list stored without them.
-const CACHE_SCHEMA: u32 = 2;
+/// Bump when [`Release`] gains fields or the canonical repository moves:
+/// stale cached asset URLs must not fail the trusted-origin check.
+const CACHE_SCHEMA: u32 = 3;
 
 /// What the last successful check saw, so a restart within the day costs
 /// nothing and an unchanged list costs a free 304.
