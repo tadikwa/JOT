@@ -58,3 +58,24 @@ Le téléchargement n'exécute jamais rien. L'installation reste un clic sépar�
 | Désactivé : appel de sauvetage | aucun (`a_disabled_rescue_is_never_attempted`) |
 | Assistant, dernière étape (mode local) | la case affiche `settings.local_partial_rescue`, donc décochée sur un profil neuf ; libellé « Expérimental » et avertissement de fidélité (lu dans le code, pas encore vu à l'écran) |
 | Mode Gemini seul | option absente de l'assistant, comme en 1.7.0 |
+
+## Installation 1.7.0 → 1.7.1, profil isolé
+
+Le test utilise les variantes de test des installateurs (`-TestBuild`) :
+
+- autre identifiant d'application, dossier `Programs\Jot-test` ;
+- données dans `Jot-test\profile` ;
+- clé de démarrage factice.
+
+La 1.7.0 de test est construite depuis le tag `v1.7.0`. L'installation personnelle a été fermée pour l'essai, avec l'accord de l'utilisateur, par sa demande de fermeture normale, puis relancée. Son `jot.exe`, son `settings.json` et sa clé de démarrage sont identiques avant et après.
+
+| Étape | Résultat |
+|---|---|
+| Installation 1.7.0-test, puis lancement | Code 0. 1.7.0 vérifie le vrai GitHub et écrit un cache de schéma 2 |
+| Profil 1.7.0 | `settings.json` par défaut de 1.7.0 (`localPartialRescue: true`) et un fichier témoin |
+| Setup 1.7.1-test lancé pendant que 1.7.0-test tourne | 1.7.0 se ferme de lui-même (« closing at the setup's request »). Setup code 0 en 1 s. Registre et `jot.exe` en 1.7.1 |
+| Après installation | Réglages, cache et fichier témoin identiques octet pour octet |
+| Premier lancement de 1.7.1 | Cache relu et réécrit en schéma 3 (« update check newest=1.7.0 »), adresses `tadikwa/Jot`. `localPartialRescue` reste `true`, comme prévu pour un profil 1.7.0 |
+| Désinstallation | Code 0. Dossier, entrée de registre et clé de test supprimés |
+
+Non vérifié à l'écran : l'assistant et la page Mises à jour. Il n'y avait pas de contrôle de l'écran dans cette session. Sur un profil neuf, `settings.json` n'est écrit qu'à la fin de l'assistant ; la valeur `false` vient donc de `Settings::default`, couverte par les tests unitaires.
