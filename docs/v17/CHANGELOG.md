@@ -1,6 +1,6 @@
 # Jot 1.7.0 — changelog candidat
 
-Base : v1.6.0 (`b070742`). Candidat de test, non publié.
+Base : v1.6.0 (`b070742`).
 
 ## Nouveautés
 
@@ -8,7 +8,7 @@ Base : v1.6.0 (`b070742`). Candidat de test, non publié.
   - la version installée et la dernière version publiée ;
   - le canal et la date de la dernière vérification ;
   - les notes de version, en texte simple.
-- La vérification ne se fait que sur demande. Les cas hors ligne, limite GitHub, cache et « à jour » sont indiqués explicitement.
+- La page vérifie sur demande. Les cas hors ligne, limite GitHub, cache et « à jour » sont indiqués explicitement. L’annonce au lancement (au plus une fois par jour, désactivable) est inchangée.
 - **Téléchargement vérifié** : seul `Jot-<version>-setup.exe` de la release est récupéré. Sa taille et son SHA-256 sont comparés à `SHA256SUMS.txt` de la même release. Le téléchargement est refusé si :
   - le fichier provient d'un autre hôte ;
   - `SHA256SUMS.txt` est absent ;

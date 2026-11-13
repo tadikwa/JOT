@@ -1,6 +1,6 @@
 # Jot 1.7.0 (candidat) — rapport de tests comparatif
 
-Branche locale `claude/v17`, base v1.6.0 (`b070742`). Rien n'a été poussé, tagué ni publié. Le tag v1.6.0, sa release, l'installation réelle et le profil réel n'ont pas été touchés. Tous les essais d'installation ont utilisé la variante isolée `/DTestBuild` :
+Branche `claude/v17`, base v1.6.0 (`b070742`). Pendant les essais, rien n'a été poussé, tagué ni publié. Le tag v1.6.0, sa release, l'installation réelle et le profil réel n'ont pas été touchés. Tous les essais d'installation ont utilisé la variante isolée `/DTestBuild` :
 - un autre AppId ;
 - le dossier `%LOCALAPPDATA%\Programs\Jot-test` ;
 - un profil dans `{app}\profile`.

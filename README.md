@@ -4,9 +4,9 @@
 Transcription par Gemini ou **entièrement sur votre PC**, reformulation intelligente, historique et
 raccourcis personnalisables. Gratuit, open source (Apache 2.0), écrit en Rust avec [GPUI](https://www.gpui.rs).
 
-**[Télécharger Jot 1.5.0](https://github.com/tadikwa/jot-gemini-transcribe-Windows/releases/latest)** :
-installateur ou version portable, Windows 10/11 64 bits. La [page de la version](https://github.com/tadikwa/jot-gemini-transcribe-Windows/releases/tag/v1.5.0)
-contient aussi une vidéo de démonstration d’une minute.
+**[Télécharger Jot 1.7.0](https://github.com/tadikwa/jot-gemini-transcribe-Windows/releases/latest)** :
+installateur ou version portable, Windows 10/11 64 bits. La [page de la version 1.5.0](https://github.com/tadikwa/jot-gemini-transcribe-Windows/releases/tag/v1.5.0)
+contient une vidéo de démonstration d’une minute.
 
 <p align="center">
   <img src="./assets/readme/accueil.png" width="900"
@@ -82,13 +82,13 @@ Chaque dictée est conservée dans l’historique, avec sa transcription brute e
 
 Téléchargez depuis la [page des versions](https://github.com/tadikwa/jot-gemini-transcribe-Windows/releases/latest) :
 
-- **`Jot-1.5.0-setup.exe`** : installateur pour votre seul compte, **sans droits administrateur**,
+- **`Jot-1.7.0-setup.exe`** : installateur pour votre seul compte, **sans droits administrateur**,
   dans `%LOCALAPPDATA%\Programs\Jot`. Raccourci dans le menu Démarrer, raccourci sur le bureau en
   option, démarrage automatique **désactivé** par défaut. Une nouvelle version s’installe par-dessus
   l’ancienne en conservant vos données.
-- **`Jot-1.5.0-portable.zip`** : à décompresser où vous voulez, puis lancer `jot.exe`.
+- **`Jot-1.7.0-portable.zip`** : à décompresser où vous voulez, puis lancer `jot.exe`.
 - **`SHA256SUMS.txt`** : empreintes pour vérifier le téléchargement, par exemple
-  `Get-FileHash .\Jot-1.5.0-setup.exe -Algorithm SHA256`.
+  `Get-FileHash .\Jot-1.7.0-setup.exe -Algorithm SHA256`.
 
 > **Les exécutables ne sont pas signés.** Windows SmartScreen affichera probablement « Windows a
 > protégé votre ordinateur » au premier lancement. Si vous faites confiance à ce dépôt, vérifiez
@@ -150,11 +150,18 @@ Ce qui suit décrit le comportement du code de ce dépôt ; vérifiez-le si c’
 - **Vérification des mises à jour** : au plus une fois par jour, au lancement, Jot demande à l’API
   GitHub la liste des versions publiées de ce dépôt, sans aucune donnée personnelle. Une nouvelle
   version est annoncée une seule fois. Désactivable dans *Paramètres → Confidentialité et conservation*.
+  Le téléchargement d’une mise à jour ne se fait que sur votre clic, depuis *Paramètres → Mises à jour et
+  À propos*, et l’installateur n’est lancé qu’après vérification de sa taille et de son SHA-256.
 - **Aucun serveur intermédiaire**, aucun compte Jot, aucune télémétrie, aucun enregistrement des
   frappes clavier.
 - Sur votre PC : l’audio est conservé 7 jours par défaut (durée réglable), les transcriptions jusqu’à
   ce que vous les supprimiez. Les journaux ne contiennent jamais le texte dicté.
 - Le dictionnaire intelligent analyse vos corrections **localement**, sans appel réseau.
+- **Apprendre de mes corrections** (activé par défaut) : pendant 30 secondes après une insertion, Jot
+  relit uniquement le champ qui a reçu le texte, par l’accessibilité de Windows, pour proposer vos
+  corrections au dictionnaire. Ni capture d’écran, ni frappes, ni champs de mot de passe ; rien ne
+  s’applique sans votre accord. Désactivable dans l’assistant de configuration ou dans
+  *Paramètres → Confidentialité et conservation*.
 
 ## Démarrage automatique
 
