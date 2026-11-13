@@ -194,7 +194,7 @@ Prérequis : la chaîne Rust indiquée dans `rust-toolchain.toml` et les outils 
 
 ```powershell
 git clone https://github.com/tadikwa/JOT
-cd jot-gemini-transcribe-Windows
+cd JOT
 cargo build --release -p jot --locked
 .\target\release\jot.exe
 ```
