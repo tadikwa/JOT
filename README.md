@@ -4,7 +4,7 @@
 Transcription par Gemini ou **entièrement sur votre PC**, reformulation intelligente, historique et
 raccourcis personnalisables. Gratuit, open source (Apache 2.0), écrit en Rust avec [GPUI](https://www.gpui.rs).
 
-**[Télécharger Jot 1.7.0](https://github.com/tadikwa/Jot/releases/latest)** :
+**[Télécharger Jot 1.7.1](https://github.com/tadikwa/Jot/releases/latest)** :
 installateur ou version portable, Windows 10/11 64 bits. La [page de la version 1.5.0](https://github.com/tadikwa/Jot/releases/tag/v1.5.0)
 contient une vidéo de démonstration d’une minute.
 
@@ -82,13 +82,13 @@ Chaque dictée est conservée dans l’historique, avec sa transcription brute e
 
 Téléchargez depuis la [page des versions](https://github.com/tadikwa/Jot/releases/latest) :
 
-- **`Jot-1.7.0-setup.exe`** : installateur pour votre seul compte, **sans droits administrateur**,
+- **`Jot-1.7.1-setup.exe`** : installateur pour votre seul compte, **sans droits administrateur**,
   dans `%LOCALAPPDATA%\Programs\Jot`. Raccourci dans le menu Démarrer, raccourci sur le bureau en
   option, démarrage automatique **désactivé** par défaut. Une nouvelle version s’installe par-dessus
   l’ancienne en conservant vos données.
-- **`Jot-1.7.0-portable.zip`** : à décompresser où vous voulez, puis lancer `jot.exe`.
+- **`Jot-1.7.1-portable.zip`** : à décompresser où vous voulez, puis lancer `jot.exe`.
 - **`SHA256SUMS.txt`** : empreintes pour vérifier le téléchargement, par exemple
-  `Get-FileHash .\Jot-1.7.0-setup.exe -Algorithm SHA256`.
+  `Get-FileHash .\Jot-1.7.1-setup.exe -Algorithm SHA256`.
 
 > **Les exécutables ne sont pas signés.** Windows SmartScreen affichera probablement « Windows a
 > protégé votre ordinateur » au premier lancement. Si vous faites confiance à ce dépôt, vérifiez
