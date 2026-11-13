@@ -30,6 +30,9 @@ pub struct RejectedReformulation {
     /// What Jot inserted instead: the raw transcript after dictionary replacements.
     pub inserted: String,
     pub reformulation_ms: u64,
+    /// The partial rescue's pieces, when it ran.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pieces: Vec<crate::rescue::PieceReport>,
 }
 
 impl RejectedReformulation {
@@ -116,6 +119,7 @@ mod tests {
             model_response: None,
             inserted: "vingt de temps".into(),
             reformulation_ms: 364,
+            pieces: Vec::new(),
         }
         .write(&folder);
         folder

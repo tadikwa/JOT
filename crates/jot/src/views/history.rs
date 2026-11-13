@@ -1782,6 +1782,30 @@ fn engine_label(model_id: &str) -> String {
     }
     // 1.5.0 stored a bare "rejected"; 1.5.1 adds the check that failed.
     let (outcome, reason) = outcome.split_once('/').unwrap_or((outcome, ""));
+    // 1.7.0's partial rescue: "rescued/3-of-3" or "partial/2-of-3".
+    let parts = reason.replace("-of-", "/");
+    match outcome {
+        "rescued" => {
+            return format!(
+                "{head} → {model} · {} ({parts})",
+                ui(
+                    "rewritten in parts: complete",
+                    "reformulé par parties : complet"
+                )
+            );
+        }
+        "partial" => {
+            return format!(
+                "{head} → {model} · {} ({parts}, {})",
+                ui(
+                    "rewritten in parts: partial",
+                    "reformulé par parties : partiel"
+                ),
+                ui("the rest kept raw", "le reste brut")
+            );
+        }
+        _ => {}
+    }
     let why = match (outcome, reason) {
         ("rejected", "hedge_lost") => ui(
             "rejected: a nuance (maybe, I think…) was lost",
@@ -1945,6 +1969,13 @@ mod tests {
             engine_label("local/qwen3-asr-1.7b+qwen3.5-4b:error")
         );
         assert!(!missing.contains("→"), "{missing}");
+        let rescued = engine_label("local/qwen3-asr-1.7b+qwen3.5-4b:rescued/3-of-3");
+        let partial = engine_label("local/qwen3-asr-1.7b+qwen3.5-4b:partial/2-of-3");
+        assert!(
+            rescued.contains("→") && rescued.contains("(3/3)"),
+            "{rescued}"
+        );
+        assert!(partial.contains("(2/3,") && partial != rescued, "{partial}");
         // Every way the raw text was kept reads differently, and says so.
         let kept: Vec<String> = [
             "rejected",

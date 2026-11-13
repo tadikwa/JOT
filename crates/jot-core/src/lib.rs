@@ -35,6 +35,7 @@ pub mod meta;
 pub mod prompt;
 pub mod recovery;
 pub mod replacement;
+pub mod rescue;
 pub mod runtime;
 pub mod settings;
 pub mod state_machine;

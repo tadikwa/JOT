@@ -1469,6 +1469,29 @@ impl SettingsView {
                 )
                 .into_any_element(),
                 widgets::toggle(
+                    "local-partial-rescue",
+                    ui(
+                        "Experimental: rescue long rewrites in parts",
+                        "Expérimental : sauver les longues reformulations par parties",
+                    ),
+                    ui(
+                        "Off by default. Local mode only, for dictations of 60 words or more. When the safety check refuses the whole rewrite, Jot retries it sentence group by sentence group, checks each part and the whole again, and keeps raw any part that fails. At most 8 extra calls and 60 seconds per dictation, all on this PC.",
+                        "Désactivé par défaut. Mode local uniquement, pour les dictées de 60 mots ou plus. Quand le contrôle refuse la reformulation entière, Jot la retente par groupes de phrases, vérifie chaque partie puis l’ensemble, et garde brute toute partie refusée. Au plus 8 appels supplémentaires et 60 secondes par dictée, tout sur ce PC.",
+                    ),
+                    settings.local_partial_rescue,
+                    theme,
+                    {
+                        let store = self.services.settings.clone();
+                        move |_, _, cx| {
+                            store.update(Some("localPartialRescue"), |s| {
+                                s.local_partial_rescue = !s.local_partial_rescue
+                            });
+                            cx.refresh_windows();
+                        }
+                    },
+                )
+                .into_any_element(),
+                widgets::toggle(
                     "learn-from-app-corrections",
                     ui(
                         "Learn from my corrections after a dictation",

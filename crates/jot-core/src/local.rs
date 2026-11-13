@@ -867,6 +867,38 @@ impl LocalEngine {
         raw: &str,
         vocabulary: &[String],
     ) -> Result<String, Failure> {
+        let lists = looks_enumerated(raw);
+        self.rewrite(pack, raw, user_message(raw, lists), lists, vocabulary)
+            .await
+    }
+
+    /// One piece of a partial rescue: never the list rules (a piece is not the
+    /// whole dictation), and the end of the piece before as read-only context.
+    async fn reformulate_piece(
+        &self,
+        pack: Pack,
+        piece: &str,
+        context: Option<&str>,
+        vocabulary: &[String],
+    ) -> Result<String, Failure> {
+        let mut user = user_message(piece, false);
+        if let Some(context) = context {
+            user = format!(
+                "Contexte, la fin du passage précédent, à ne pas réécrire ni recopier : « {} »\n\n{user}",
+                sanitize(context)
+            );
+        }
+        self.rewrite(pack, piece, user, false, vocabulary).await
+    }
+
+    async fn rewrite(
+        &self,
+        pack: Pack,
+        raw: &str,
+        user: String,
+        lists: bool,
+        vocabulary: &[String],
+    ) -> Result<String, Failure> {
         let started = Instant::now();
         let port = self
             .llm_port(pack, vocabulary)
@@ -874,9 +906,7 @@ impl LocalEngine {
             .map_err(Failure::Start)?;
         let start_ms = started.elapsed().as_millis() as u64;
         let words = raw.split_whitespace().count() as u64;
-        let lists = looks_enumerated(raw);
         let system = system_prompt(vocabulary, lists);
-        let user = user_message(raw, lists);
         let cached = self.cached_system.lock().as_deref() == Some(system.as_str());
         let uncached = approx_tokens(&user) + if cached { 0 } else { approx_tokens(&system) };
         // Measured: the output runs 1.1–1.3 tokens per input word.
@@ -1180,6 +1210,30 @@ impl LocalTranscriptionService {
     }
 }
 
+impl LocalEngine {
+    /// Logs counts and timings only, never the text.
+    async fn rescue(&self, pack: Pack, raw: &str, vocabulary: &[String]) -> crate::rescue::Rescue {
+        let started = Instant::now();
+        let rescue = crate::rescue::rescue(raw, |piece, context| async move {
+            self.reformulate_piece(pack, &piece, context.as_deref(), vocabulary)
+                .await
+                .map(|reply| tidy_single_item_list(&validation::strip_artifacts(&reply)))
+                .map_err(|error| error.class().to_string())
+        })
+        .await;
+        tracing::info!(
+            status = ?rescue.status,
+            pieces = rescue.pieces.len(),
+            rewritten = rescue.rewritten,
+            calls = rescue.calls,
+            global_refusal = rescue.global_refusal.as_deref(),
+            ms = started.elapsed().as_millis() as u64,
+            "local partial rescue"
+        );
+        rescue
+    }
+}
+
 #[async_trait]
 impl TranscriptionServicing for LocalTranscriptionService {
     async fn warm(&self) {
@@ -1240,62 +1294,85 @@ impl TranscriptionServicing for LocalTranscriptionService {
         }
 
         let reformulation_started = Instant::now();
-        let cleaned = match self.engine.reformulate(pack, &raw, &vocabulary).await {
+        let settings = self.settings.get();
+        // What the global attempt left: its outcome for `model_id`, and the
+        // refusal (reason, model answer, cleaned answer) if the check refused it.
+        let (outcome, refused) = match self.engine.reformulate(pack, &raw, &vocabulary).await {
             Ok(response) => {
                 let cleaned = tidy_single_item_list(&validation::strip_artifacts(&response));
                 match reformulation_verdict(&raw, &cleaned) {
-                    Ok(()) => self.dictionary.correct(&cleaned),
+                    Ok(()) => {
+                        return Ok(TranscriptionResult {
+                            cleaned_transcript: self.dictionary.correct(&cleaned),
+                            raw_transcript: raw,
+                            model_id,
+                        });
+                    }
                     Err(reason) => {
-                        tracing::warn!(reason, "local reformulation rejected — inserting raw");
-                        model_id.push_str(":rejected/");
-                        model_id.push_str(&reason.replace(' ', "_"));
-                        let inserted = self.dictionary.correct(&raw);
-                        let settings = self.settings.get();
-                        if settings.keep_rejected_reformulations
-                            && let Some(folder) = audio_path.parent().map(Path::to_path_buf)
-                        {
-                            let diagnostic = crate::diagnostic::RejectedReformulation {
-                                recorded_at: time::OffsetDateTime::now_utc(),
-                                model_id: model_id.clone(),
-                                detail: crate::fidelity::explain(&raw, &cleaned, &reason),
-                                reason,
-                                raw_transcript: raw.clone(),
-                                model_response: (response != cleaned).then_some(response),
-                                proposed: cleaned,
-                                inserted: inserted.clone(),
-                                reformulation_ms: reformulation_started.elapsed().as_millis()
-                                    as u64,
-                            };
-                            let keep_days = settings.rejected_reformulation_retention_days;
-                            // Off the insertion path; the sweep keeps retention
-                            // honest in a session that runs for days.
-                            crate::runtime::spawn_blocking(move || {
-                                diagnostic.write(&folder);
-                                if let Some(root) = folder.parent() {
-                                    crate::diagnostic::purge(
-                                        root,
-                                        Some(keep_days),
-                                        time::OffsetDateTime::now_utc(),
-                                    );
-                                }
-                            });
-                        }
-                        inserted
+                        tracing::warn!(reason, "local reformulation rejected");
+                        let outcome = format!("rejected/{}", reason.replace(' ', "_"));
+                        (outcome, Some((reason, response, cleaned)))
                     }
                 }
             }
             // The transcript is already good: a slow or broken second model
             // never costs the dictation.
             Err(error) => {
-                tracing::info!(?error, "local reformulation unavailable — inserting raw");
-                model_id.push(':');
-                model_id.push_str(error.class());
-                self.dictionary.correct(&raw)
+                tracing::info!(?error, "local reformulation unavailable");
+                (error.class().to_string(), None)
             }
         };
+
+        // Only a refusal or a timeout may do better on smaller pieces; a server
+        // that did not start or answer will not.
+        let rescue = if settings.local_partial_rescue
+            && (refused.is_some() || outcome == "timeout")
+            && raw.split_whitespace().count() >= crate::rescue::MIN_WORDS
+        {
+            Some(self.engine.rescue(pack, &raw, &vocabulary).await)
+        } else {
+            None
+        };
+        let (inserted, label) = match &rescue {
+            Some(r) if let Some(label) = r.label() => (self.dictionary.correct(&r.text), label),
+            _ => (self.dictionary.correct(&raw), outcome),
+        };
+        model_id.push(':');
+        model_id.push_str(&label);
+
+        if settings.keep_rejected_reformulations
+            && let Some((reason, response, cleaned)) = refused
+            && let Some(folder) = audio_path.parent().map(Path::to_path_buf)
+        {
+            let diagnostic = crate::diagnostic::RejectedReformulation {
+                recorded_at: time::OffsetDateTime::now_utc(),
+                model_id: model_id.clone(),
+                detail: crate::fidelity::explain(&raw, &cleaned, &reason),
+                reason,
+                raw_transcript: raw.clone(),
+                model_response: (response != cleaned).then_some(response),
+                proposed: cleaned,
+                inserted: inserted.clone(),
+                reformulation_ms: reformulation_started.elapsed().as_millis() as u64,
+                pieces: rescue.map(|r| r.pieces).unwrap_or_default(),
+            };
+            let keep_days = settings.rejected_reformulation_retention_days;
+            // Off the insertion path; the sweep keeps retention honest in a
+            // session that runs for days.
+            crate::runtime::spawn_blocking(move || {
+                diagnostic.write(&folder);
+                if let Some(root) = folder.parent() {
+                    crate::diagnostic::purge(
+                        root,
+                        Some(keep_days),
+                        time::OffsetDateTime::now_utc(),
+                    );
+                }
+            });
+        }
         Ok(TranscriptionResult {
             raw_transcript: raw,
-            cleaned_transcript: cleaned,
+            cleaned_transcript: inserted,
             model_id,
         })
     }
@@ -1809,12 +1886,41 @@ mod tests {
                         }
                         Err(error) => (String::new(), Err(format!("{error:?}"))),
                     };
+                    // JOT_RESCUE=1: what the partial rescue would do where 1.6.0 kept raw.
+                    let retryable = verdict.as_ref().err().is_some_and(|reason| {
+                        !reason.starts_with("Start(") && !reason.starts_with("Engine(")
+                    });
+                    let rescue = if std::env::var("JOT_RESCUE").as_deref() == Ok("1")
+                        && retryable
+                        && crate::rescue::words(raw) >= crate::rescue::MIN_WORDS
+                    {
+                        let started = Instant::now();
+                        let rescue = engine.rescue(pack, raw, &vocabulary).await;
+                        Some((rescue, started.elapsed().as_secs_f64()))
+                    } else {
+                        None
+                    };
                     // What Jot inserts with this vocabulary and no rules.
+                    let chosen = match &rescue {
+                        _ if verdict.is_ok() => llm.as_str(),
+                        Some((rescue, _)) => rescue.text.as_str(),
+                        None => raw,
+                    };
                     let inserted = crate::replacement::repair_elisions(
                         vocabulary.iter().map(String::as_str),
-                        if verdict.is_ok() { &llm } else { raw },
+                        chosen,
                     );
+                    let rescue = rescue.map(|(rescue, seconds)| {
+                        serde_json::json!({
+                            "status": rescue.label(),
+                            "ms": (seconds * 1000.0).round(),
+                            "calls": rescue.calls,
+                            "globalRefusal": rescue.global_refusal,
+                            "pieces": rescue.pieces,
+                        })
+                    });
                     let line = serde_json::json!({
+                        "rescue": rescue,
                         "id": case["id"],
                         "model": pack.model_name(),
                         "inserted": inserted,
